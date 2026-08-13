@@ -552,7 +552,3 @@ func newJFS(endpoint, accessKey, secretKey, token string) (object.ObjectStorage,
 	}
 	return &juiceFS{object.DefaultObjectStorage{}, format.Name, uint16(utils.GetUmask()), jfs}, nil
 }
-
-func init() {
-	object.Register("jfs", newJFS)
-}

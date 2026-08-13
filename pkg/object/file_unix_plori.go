@@ -1,8 +1,8 @@
-//go:build !windows && !plori
-// +build !windows,!plori
+//go:build !windows && plori
+// +build !windows,plori
 
 /*
- * JuiceFS, Copyright 2020 Juicedata, Inc.
+ * JuiceFS, Copyright 2026 Juicedata, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,20 +25,13 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
-	"github.com/pkg/sftp"
 )
 
 func getOwnerGroup(info os.FileInfo) (string, string) {
-	var owner, group string
-	switch st := info.Sys().(type) {
-	case *syscall.Stat_t:
-		owner = utils.UserName(int(st.Uid))
-		group = utils.GroupName(int(st.Gid))
-	case *sftp.FileStat:
-		owner = utils.UserName(int(st.UID))
-		group = utils.GroupName(int(st.GID))
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return utils.UserName(int(st.Uid)), utils.GroupName(int(st.Gid))
 	}
-	return owner, group
+	return "", ""
 }
 
 func (d *filestore) Chtimes(key string, mtime time.Time) error {

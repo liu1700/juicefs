@@ -19,6 +19,8 @@ package version
 import "testing"
 
 func TestVersion(t *testing.T) {
+	version = ""
+	t.Cleanup(func() { version = "" })
 	ver = Semver{
 		major: 1,
 		minor: 0,
@@ -62,5 +64,20 @@ func TestVersion(t *testing.T) {
 		if r, _ := CompareVersions(&ver, Parse(c.vs)); r != c.expect {
 			t.Fatalf("Failed case: %+v", c)
 		}
+	}
+}
+
+func TestInjectedVersion(t *testing.T) {
+	version = "1.5.0-plori.1"
+	t.Cleanup(func() { version = "" })
+	if got := Version(); got != version {
+		t.Fatalf("Version() = %q, want %q", got, version)
+	}
+	if got := GetVersion(); got.major != 1 || got.minor != 5 || got.patch != 0 || got.preRelease != "plori.1" {
+		t.Fatalf("GetVersion() = %+v, want 1.5.0-plori.1", got)
+	}
+	SetVersion("2.0.0")
+	if got := Version(); got != "2.0.0+" {
+		t.Fatalf("Version() after SetVersion = %q, want 2.0.0+", got)
 	}
 }

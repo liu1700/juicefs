@@ -197,7 +197,3 @@ func newMem(endpoint, accesskey, secretkey, token string) (ObjectStorage, error)
 	store.objects = make(map[string]*mobj)
 	return store, nil
 }
-
-func init() {
-	Register("mem", newMem)
-}

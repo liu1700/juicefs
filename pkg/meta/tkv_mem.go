@@ -1,3 +1,6 @@
+//go:build !plori
+// +build !plori
+
 /*
  * JuiceFS, Copyright 2021 Juicedata, Inc.
  *
@@ -96,26 +99,6 @@ func (tx *memTxn) scan(begin, end []byte, keysOnly bool, handler func(k, v []byt
 		tx.observed[it.key] = it.ver
 		return handler(key, it.value)
 	})
-}
-
-func nextKey(key []byte) []byte {
-	if len(key) == 0 {
-		return nil
-	}
-	next := make([]byte, len(key))
-	copy(next, key)
-	p := len(next) - 1
-	for {
-		next[p]++
-		if next[p] != 0 {
-			break
-		}
-		p--
-		if p < 0 {
-			panic("can't scan keys for 0xFF")
-		}
-	}
-	return next
 }
 
 func (tx *memTxn) exist(prefix []byte) bool {

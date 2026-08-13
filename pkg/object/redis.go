@@ -1,5 +1,5 @@
-//go:build !noredis
-// +build !noredis
+//go:build !noredis && !plori
+// +build !noredis,!plori
 
 /*
  * JuiceFS, Copyright 2020 Juicedata, Inc.

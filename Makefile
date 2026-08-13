@@ -5,12 +5,16 @@ all: juicefs
 REVISION := $(shell git rev-parse --short HEAD 2>/dev/null)
 REVISIONDATE := $(shell git log -1 --pretty=format:'%cd' --date short 2>/dev/null)
 PKG := github.com/juicedata/juicefs/pkg/version
+PLORI_TAGS := plori,nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd,nocifs,nostorj,noqiniu,notos,noks3
 GCFLAGS =
 LDFLAGS =
 BUILD ?= release
 ifneq ($(strip $(REVISION)),) # Use git clone
 	LDFLAGS += -X $(PKG).revision=$(REVISION) \
 		   -X $(PKG).revisionDate=$(REVISIONDATE)
+endif
+ifneq ($(strip $(VERSION)),)
+	LDFLAGS += -X $(PKG).version=$(VERSION)
 endif
 
 ifeq ($(BUILD),release)
@@ -38,6 +42,18 @@ juicefs.cover: Makefile cmd/*.go pkg/*/*.go go.*
 juicefs.lite: Makefile cmd/*.go pkg/*/*.go
 	go build -tags nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd,nocifs,nostorj,noqiniu,notos,noks3 \
 		-gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.lite .
+
+juicefs.plori: Makefile cmd/*.go pkg/*/*.go go.*
+	go version
+	go build -trimpath -buildvcs=true -tags "$(PLORI_TAGS)" \
+		-gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.plori .
+
+juicefs.plori.scan: Makefile cmd/*.go pkg/*/*.go go.*
+	go build -trimpath -buildvcs=true -tags "$(PLORI_TAGS)" \
+		-gcflags="$(GCFLAGS)" -ldflags="$(filter-out -s -w,$(LDFLAGS))" -o juicefs.plori.scan .
+
+test.plori.profile:
+	go run -tags "$(PLORI_TAGS)" ./hack/plori-profile
 
 juicefs.ceph: Makefile cmd/*.go pkg/*/*.go
 	go build -tags ceph -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.ceph .
@@ -84,7 +100,11 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test
+.PHONY: snapshot release debug test test.plori.profile plori.tags
+
+plori.tags:
+	@printf '%s\n' "$(PLORI_TAGS)"
+
 snapshot:
 	docker run --rm --privileged \
 		-e REVISIONDATE=$(REVISIONDATE) \

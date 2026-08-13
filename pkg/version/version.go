@@ -24,6 +24,7 @@ import (
 )
 
 var (
+	version      string          // value is assigned for release builds
 	revision     = "$Format:%h$" // value is assigned in Makefile
 	revisionDate = "$Format:%as$"
 	ver          = Semver{
@@ -52,14 +53,23 @@ func (s *Semver) String() string {
 }
 
 func Version() string {
+	if version != "" {
+		return version
+	}
 	return ver.String()
 }
 
 func SetVersion(v string) {
+	version = ""
 	ver = *Parse(v)
 }
 
 func GetVersion() Semver {
+	if version != "" {
+		if injected := Parse(version); injected != nil {
+			return *injected
+		}
+	}
 	return ver
 }
 

@@ -561,7 +561,3 @@ func newDisk(root, accesskey, secretkey, token string) (ObjectStorage, error) {
 	}
 	return &filestore{root: root}, nil
 }
-
-func init() {
-	Register("file", newDisk)
-}
