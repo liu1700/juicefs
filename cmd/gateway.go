@@ -22,7 +22,6 @@ package cmd
 import (
 	"context"
 	"errors"
-	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path"

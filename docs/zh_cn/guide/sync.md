@@ -441,9 +441,9 @@ juicefs sync --traffic-control-url http://10.0.0.1:8080/token s3://src/ s3://dst
 * 以上手段均未能获得有效排查信息，则需要对 `sync` 进程采集 goroutine，结合源码分析排查：
 
    ```shell
-   # 将 <PID> 替换为卡死的 sync 命令的 PID，记下 pprof 监听端口
+   # 启动 sync 时添加 --debug-agent=127.0.0.1:6061
+   # 将 <PID> 替换为卡死的 sync 命令 PID
    lsof -p <PID> | grep TCP | grep LISTEN
-   # pprof 端口一般是 6061，如果已经被占用，则需要递增，需要根据实际情况修改
    curl -s localhost:6061/debug/pprof/goroutine?debug=1
    ```
 

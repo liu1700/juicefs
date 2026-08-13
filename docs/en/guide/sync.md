@@ -436,11 +436,9 @@ If you notice the progress bar is not changing, use the methods below for monito
 * If none of the above methods provide useful debug information, please collect its goroutine and send it to Juicedata engineers:
 
     ```shell
+    # Start the sync process with --debug-agent=127.0.0.1:6061.
     # Replace <PID> with the actual PID of the stuck sync process
-    # This command will print its pprof listen port
     lsof -p <PID> | grep TCP | grep LISTEN
-    # pprof port is typically 6061, but in the face of port conflict,
-    # port number will be automatically increased
     curl -s localhost:6061/debug/pprof/goroutine?debug=1
     ```
 

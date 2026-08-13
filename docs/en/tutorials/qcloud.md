@@ -120,7 +120,8 @@ GLOBAL OPTIONS:
    --verbose, --debug, -v  enable debug log (default: false)
    --quiet, -q             only warning and errors (default: false)
    --trace                 enable trace log (default: false)
-   --no-agent              disable pprof (:6060) agent (default: false)
+   --no-agent              disable pprof agent (deprecated; disabled by default) (default: false)
+   --debug-agent value     enable pprof on a loopback address (for example, 127.0.0.1:6060)
    --help, -h              show help (default: false)
    --version, -V           print only the version (default: false)
 

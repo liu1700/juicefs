@@ -241,7 +241,15 @@ juicefs profile /tmp/juicefs.accesslog --uid 12345
 
 ## 用 pprof 获取运行时信息 {#runtime-information}
 
-JuiceFS 客户端默认会通过 [pprof](https://pkg.go.dev/net/http/pprof) 在本地监听一个 TCP 端口用以获取运行时信息，如 Goroutine 堆栈信息、CPU 性能统计、内存分配统计。你可以通过挂载点下的 `.config` 文件查看当前 JuiceFS 客户端监听的具体端口号：
+JuiceFS 客户端默认不启动 [pprof](https://pkg.go.dev/net/http/pprof) 监听器。需要诊断运行时信息时，请临时显式指定回环地址，例如：
+
+```bash
+juicefs --debug-agent=127.0.0.1:6060 mount redis://localhost /jfs
+```
+
+该地址必须是回环地址。端点没有 HTTP 身份验证，因此不要通过 host network、代理、端口转发或 sidecar 暴露它。CPU 和 trace profile 最长 120 秒，同一时间只允许一个高开销 profile。诊断完成后请删除 `--debug-agent`。旧的 `--no-agent` 选项仍可使用，并且在两个选项同时出现时优先生效。
+
+对于挂载客户端，可以通过挂载点下的 `.config` 文件查看当前地址：
 
 ```shell
 # 假设挂载点是 /jfs
@@ -249,7 +257,7 @@ $ cat /jfs/.config | grep 'DebugAgent'
   "DebugAgent": "127.0.0.1:6064",
 ```
 
-默认 pprof 监听的端口号范围是从 6060 开始至 6099 结束，从上面的示例中可以看到实际的端口号是 6064。在获取到监听端口号以后就可以通过 `http://localhost:<port>/debug/pprof` 地址查看所有可供查询的运行时信息，一些重要的运行时信息如下：
+获取配置的端口后，可以通过 `http://localhost:<port>/debug/pprof` 查看运行时信息，重要端点如下：
 
 - Goroutine 堆栈信息：`http://localhost:<port>/debug/pprof/goroutine?debug=1`
 - CPU 性能统计：`http://localhost:<port>/debug/pprof/profile?seconds=30`
@@ -270,7 +278,7 @@ curl 'http://localhost:<port>/debug/pprof/heap' > juicefs.heap.pb.gz
 ```
 
 :::tip 建议
-你也可以使用 `juicefs debug` 命令自动收集这些运行时信息并保存到本地，默认保存到当前目录下的 `debug` 目录中，例如：
+目标客户端以 `--debug-agent` 启动时，也可以使用 `juicefs debug` 命令采集这些运行时信息；未启用监听器时，该命令会跳过 pprof，并继续采集其他诊断数据。默认保存到当前目录下的 `debug` 目录中，例如：
 
 ```bash
 juicefs debug /mnt/jfs
