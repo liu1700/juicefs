@@ -73,6 +73,8 @@ The JuiceFS client logs will be mixed into the logs of processes using JuiceFS H
 
 Each JuiceFS client has an access log that records all operations on the file system in detail, such as operation type, user ID, group ID, file inodes and time cost. Access logs can be used for various purposes such as performance analysis, auditing, and troubleshooting.
 
+Access-log files configured with `--access-log` or an SDK option are created with owner-only permissions (`0600`) on POSIX systems. JuiceFS refuses symbolic links, non-regular files, files owned by another user, and files with multiple hard links; an unsafe configured log prevents the client from starting. Existing owner-only permissions are preserved, while older group- or world-accessible logs are tightened to `0600`. Rotation keeps writing through an already-open file descriptor and reports failures without truncating the log.
+
 ### Access log format
 
 An example format of an access log is as follows:

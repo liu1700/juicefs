@@ -26,7 +26,6 @@ import (
 	"path"
 	"runtime/trace"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -220,17 +219,15 @@ func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore, registry *
 		}
 	}
 
-	go fs.cleanupCache()
 	if conf.AccessLog != "" {
-		f, err := os.OpenFile(conf.AccessLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		f, err := OpenAccessLog(conf.AccessLog)
 		if err != nil {
-			logger.Errorf("Open access log %s: %s", conf.AccessLog, err)
-		} else {
-			_ = os.Chmod(conf.AccessLog, 0666)
-			fs.logBuffer = make(chan string, 1024)
-			go fs.flushLog(f, fs.logBuffer, conf.AccessLog)
+			return nil, fmt.Errorf("open access log %s: %w", conf.AccessLog, err)
 		}
+		fs.logBuffer = make(chan string, 1024)
+		go fs.flushLog(f, fs.logBuffer, conf.AccessLog)
 	}
+	go fs.cleanupCache()
 	return fs, nil
 }
 
@@ -314,7 +311,7 @@ func (fs *FileSystem) log(ctx LogContext, format string, args ...interface{}) {
 	}
 }
 
-func (fs *FileSystem) flushLog(f *os.File, logBuffer chan string, path string) {
+func (fs *FileSystem) flushLog(f *AccessLog, logBuffer chan string, path string) {
 	buf := make([]byte, 0, 128<<10)
 	var lastcheck = time.Now()
 	defer func() {
@@ -349,32 +346,8 @@ func (fs *FileSystem) flushLog(f *os.File, logBuffer chan string, path string) {
 			continue
 		}
 		lastcheck = time.Now()
-		var fi os.FileInfo
-		fi, err = f.Stat()
-		if err == nil && fi.Size() > fs.rotateAccessLog {
-			_ = f.Close()
-			fi, err = os.Stat(path)
-			if err == nil && fi.Size() > fs.rotateAccessLog {
-				tmp := fmt.Sprintf("%s.%p", path, fs)
-				if os.Rename(path, tmp) == nil {
-					for i := 6; i > 0; i-- {
-						_ = os.Rename(path+"."+strconv.Itoa(i), path+"."+strconv.Itoa(i+1))
-					}
-					_ = os.Rename(tmp, path+".1")
-				} else {
-					fi, err = os.Stat(path)
-					if err == nil && fi.Size() > fs.rotateAccessLog*7 {
-						logger.Infof("can't rename %s, truncate it", path)
-						_ = os.Truncate(path, 0)
-					}
-				}
-			}
-			f, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-			if err != nil {
-				logger.Errorf("open %s: %s", path, err)
-				break
-			}
-			_ = os.Chmod(path, 0666)
+		if _, err = f.Rotate(fs.rotateAccessLog, 7); err != nil {
+			logger.Errorf("rotate access log %s: %s; continuing with the open log file", path, err)
 		}
 	}
 }

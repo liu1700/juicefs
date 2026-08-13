@@ -195,7 +195,7 @@ make win
 |---------------------------|--------------|-------------------------------------------------------------------------------------------------------------|
 | `juicefs.bucket`          |              | 为对象存储指定跟格式化时不同的访问地址                                                                                         |
 | `juicefs.debug`           | `false`      | 是否开启 debug 日志                                                                                               |
-| `juicefs.access-log`      |              | 访问日志的路径。需要所有应用都有写权限，可以配置为 `/tmp/juicefs.access.log`。该文件会自动轮转，保留最近 7 个文件。                                    |
+| `juicefs.access-log`      |              | 访问日志路径，例如 `/tmp/juicefs-${user.name}.access.log`。POSIX 系统上的日志仅允许属主访问，因此不同用户运行的应用应使用不同路径。该文件会自动轮转，保留最近 7 个文件。 |
 | `juicefs.superuser`       | `hdfs`       | 超级用户                                                                                                        |
 | `juicefs.supergroup`      | `supergroup` | 超级用户组                                                                                                       |
 | `juicefs.users`           | `null`       | 用户名以及 UID 列表文件的地址，比如 `jfs://name/etc/users`。文件格式为 `<username>:<UID>`，一行一个用户。                                |
