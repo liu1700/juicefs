@@ -7,6 +7,7 @@ on:
 
 jobs:
   releaser:
+    if: github.repository == 'juicedata/juicefs'
     runs-on: ubuntu-22.04
     steps:
       - name: Clean up

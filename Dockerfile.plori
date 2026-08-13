@@ -1,0 +1,58 @@
+ARG GO_IMAGE=golang:1.25.12-bookworm@sha256:6359592445455f2dbe2412bed411336035bc019a50017720d77454ffdd6d0f82
+ARG RUNTIME_IMAGE=alpine:3.22.5@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+
+FROM ${GO_IMAGE} AS source
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY Makefile go.mod go.sum main.go ./
+COPY cmd ./cmd
+COPY pkg ./pkg
+ARG VERSION=dev
+ARG REVISION=unknown
+
+FROM source AS build
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    make -B STATIC=1 juicefs.plori VERSION="${VERSION}" REVISION="${REVISION}" \
+    && ./juicefs.plori version \
+    && if ldd ./juicefs.plori >/dev/null 2>&1; then \
+        echo "Plori binary must be statically linked" >&2; \
+        exit 1; \
+    fi
+
+FROM scratch AS binary
+COPY --from=build /src/juicefs.plori /juicefs
+
+FROM build AS scan-build
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    make -B STATIC=1 juicefs.plori.scan VERSION="${VERSION}" REVISION="${REVISION}"
+
+FROM scratch AS scan-binary
+COPY --from=scan-build /src/juicefs.plori.scan /juicefs.scan
+
+FROM ${RUNTIME_IMAGE}
+
+RUN apk add --no-cache \
+        ca-certificates=20260611-r0 \
+        fuse3=3.16.2-r1 \
+        tini=0.19.0-r3 \
+    && install -d -m 0770 /var/jfsCache
+
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/liu1700/juicefs" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.title="JuiceFS Plori runtime" \
+      org.opencontainers.image.description="Minimal Redis + S3 + FUSE JuiceFS runtime for Plori and Orlop"
+
+COPY --from=build /src/juicefs.plori /usr/local/bin/juicefs
+RUN ln -s /usr/local/bin/juicefs /bin/juicefs
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["/usr/local/bin/juicefs", "version"]

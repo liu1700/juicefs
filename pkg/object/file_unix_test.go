@@ -32,7 +32,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/utils"
 )
 
-func TestLChtimes(t *testing.T) {
+func TestLChtimesRoot(t *testing.T) {
 	tmpDir := t.TempDir()
 	filePath := filepath.Join(tmpDir, "LChtimesTestAfile1")
 	linkPath := filepath.Join(tmpDir, "LChtimesTestLink1")
@@ -51,7 +51,12 @@ func TestLChtimes(t *testing.T) {
 
 	oldAtime := getAtime(oldStat)
 	newMtime := oldStat.ModTime().Add(-time.Hour)
-	err = lchtimes(linkPath, time.Time{}, newMtime)
+	root, err := os.OpenRoot(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	err = lchtimesRoot(root, filepath.Base(linkPath), time.Time{}, newMtime)
 	if err != nil {
 		t.Fatalf("lchtimes file failed: %s", err)
 	}

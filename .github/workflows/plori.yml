@@ -1,0 +1,301 @@
+name: Plori build and release
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/security/**"
+      - ".github/workflows/plori.yml"
+      - "cmd/**"
+      - "hack/plori-profile/**"
+      - "hack/check-govulncheck.py"
+      - "hack/check_govulncheck_test.py"
+      - "hack/install-plori-scanners.sh"
+      - "hack/verify-plori-binary.sh"
+      - "hack/verify_plori_sbom.py"
+      - "pkg/**"
+      - ".dockerignore"
+      - ".go-version"
+      - "Dockerfile.plori"
+      - "Makefile"
+      - "go.mod"
+      - "go.sum"
+  push:
+    branches: [main]
+    tags: ["v*-plori.*"]
+  workflow_dispatch:
+
+concurrency:
+  group: plori-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: 1.25.12
+  GOVULNCHECK_VERSION: v1.6.0
+  MINIO_IMAGE: quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    services:
+      redis:
+        image: redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up patched Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Install build and FUSE dependencies
+        run: sudo apt-get update && sudo apt-get install --yes fuse3 musl-tools
+
+      - name: Build static Plori binary
+        run: |
+          make -B STATIC=1 juicefs.plori juicefs.plori.scan VERSION=ci
+          if ldd ./juicefs.plori >/dev/null 2>&1; then
+            echo "Plori binary must be statically linked" >&2
+            exit 1
+          fi
+          make test.plori.profile
+          hack/verify-plori-binary.sh ./juicefs.plori
+
+      - name: Gate reachable Go vulnerabilities for the artifact configuration
+        run: |
+          python3 hack/check_govulncheck_test.py
+          GOBIN="$RUNNER_TEMP/bin" go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          "$RUNNER_TEMP/bin/govulncheck" -mode=binary -format=json \
+            ./juicefs.plori.scan > govulncheck-plori.json
+          python3 hack/check-govulncheck.py govulncheck-plori.json \
+            .github/security/plori-vuln-waivers.json juicefs.plori
+
+      - name: Start pinned MinIO
+        run: |
+          docker run --detach --rm --name plori-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=plori-ci -e MINIO_ROOT_PASSWORD=plori-ci-secret \
+            "$MINIO_IMAGE" server /data
+          for _ in $(seq 1 30); do
+            curl --fail --silent http://127.0.0.1:9000/minio/health/live && exit 0
+            sleep 1
+          done
+          docker logs plori-minio
+          exit 1
+
+      - name: Exercise Redis, S3, FUSE, and durability barrier
+        env:
+          AWS_ACCESS_KEY_ID: plori-ci
+          AWS_SECRET_ACCESS_KEY: plori-ci-secret
+          AWS_REGION: us-east-1
+        run: |
+          ./juicefs.plori format --storage s3 --bucket http://127.0.0.1:9000/plori-ci \
+            redis://127.0.0.1:6379/0 plori-ci
+          sudo install -d -m 0755 /mnt/plori-ci
+          sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION \
+            ./juicefs.plori mount -d redis://127.0.0.1:6379/0 /mnt/plori-ci \
+            --cache-dir "$RUNNER_TEMP/jfs-cache" --writeback --no-usage-report
+          echo durable | sudo tee /mnt/plori-ci/probe >/dev/null
+          sudo ./juicefs.plori durability --timeout 2m /mnt/plori-ci
+          test "$(sudo cat /mnt/plori-ci/probe)" = durable
+          sudo ./juicefs.plori umount --flush --flush-timeout 2m /mnt/plori-ci
+
+      - name: Install checksum-pinned artifact scanners
+        run: |
+          install -d "$RUNNER_TEMP/scanners"
+          hack/install-plori-scanners.sh "$RUNNER_TEMP/scanners"
+          echo "$RUNNER_TEMP/scanners" >> "$GITHUB_PATH"
+
+      - name: Generate binary SBOM
+        run: |
+          syft scan file:./juicefs.plori -o spdx-json=juicefs.plori.spdx.json
+          python3 hack/verify_plori_sbom.py juicefs.plori.spdx.json
+
+      - name: Build and scan minimal image
+        run: |
+          docker build -f Dockerfile.plori --build-arg VERSION=ci \
+            --build-arg REVISION="$GITHUB_SHA" -t juicefs-plori:ci .
+          docker run --rm juicefs-plori:ci
+          trivy image --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL \
+            --format json --output trivy-plori-image.json --exit-code 1 juicefs-plori:ci
+
+      - name: Upload security evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: plori-security-${{ github.sha }}
+          path: |
+            govulncheck-plori.json
+            juicefs.plori.spdx.json
+            trivy-plori-image.json
+          if-no-files-found: error
+
+      - name: Clean up FUSE mount
+        if: always()
+        run: |
+          if mountpoint --quiet /mnt/plori-ci; then
+            sudo ./juicefs.plori umount /mnt/plori-ci || sudo fusermount3 -u /mnt/plori-ci
+          fi
+
+      - name: Stop MinIO
+        if: always()
+        run: docker rm --force plori-minio 2>/dev/null || true
+
+  release:
+    if: github.repository == 'liu1700/juicefs' && github.ref_type == 'tag'
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up patched Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Set up ARM64 emulation
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate tag and set release metadata
+        id: meta
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-plori\.[0-9]+$ ]]; then
+            echo "invalid Plori release tag: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/juicefs-plori" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push multi-architecture image
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.plori
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ github.ref_name }}
+            ${{ steps.meta.outputs.image }}:latest-plori
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            output="$RUNNER_TEMP/binary-$arch"
+            scan_output="$RUNNER_TEMP/scan-binary-$arch"
+            docker buildx build --file Dockerfile.plori --target binary \
+              --platform "linux/$arch" --build-arg "VERSION=${{ steps.meta.outputs.version }}" \
+              --build-arg "REVISION=$GITHUB_SHA" \
+              --output "type=local,dest=$output" .
+            install -m 0755 "$output/juicefs" "dist/juicefs-${{ steps.meta.outputs.version }}-linux-$arch"
+            docker buildx build --file Dockerfile.plori --target scan-binary \
+              --platform "linux/$arch" --build-arg "VERSION=${{ steps.meta.outputs.version }}" \
+              --build-arg "REVISION=$GITHUB_SHA" \
+              --output "type=local,dest=$scan_output" .
+            tar -C dist -czf "dist/juicefs-${{ steps.meta.outputs.version }}-linux-$arch.tar.gz" \
+              "juicefs-${{ steps.meta.outputs.version }}-linux-$arch"
+          done
+
+      - name: Install checksum-pinned artifact scanners
+        run: |
+          install -d "$RUNNER_TEMP/scanners"
+          hack/install-plori-scanners.sh "$RUNNER_TEMP/scanners"
+          echo "$RUNNER_TEMP/scanners" >> "$GITHUB_PATH"
+          GOBIN="$RUNNER_TEMP/scanners" go install \
+            "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+
+      - name: Gate binaries and generate SBOMs
+        shell: bash
+        run: |
+          for arch in amd64 arm64; do
+            binary="dist/juicefs-${{ steps.meta.outputs.version }}-linux-$arch"
+            scan_binary="$RUNNER_TEMP/scan-binary-$arch/juicefs.scan"
+            hack/verify-plori-binary.sh "$binary"
+            govulncheck -mode=binary -format=json "$scan_binary" \
+              > "dist/govulncheck-linux-$arch.json"
+            python3 hack/check-govulncheck.py "dist/govulncheck-linux-$arch.json" \
+              .github/security/plori-vuln-waivers.json "juicefs.plori-linux-$arch"
+            syft scan "file:$binary" -o "spdx-json=dist/juicefs-linux-$arch.spdx.json"
+            python3 hack/verify_plori_sbom.py "dist/juicefs-linux-$arch.spdx.json"
+          done
+
+      - name: Scan published image
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            arch="${platform#*/}"
+            trivy image --platform "$platform" --scanners vuln --ignore-unfixed \
+              --severity HIGH,CRITICAL --exit-code 1 \
+              --format json --output "dist/trivy-image-$arch.json" \
+              "${{ steps.meta.outputs.image }}@${{ steps.image.outputs.digest }}"
+            syft scan --platform "$platform" \
+              "registry:${{ steps.meta.outputs.image }}@${{ steps.image.outputs.digest }}" \
+              -o "spdx-json=dist/juicefs-plori-container-$arch.spdx.json"
+          done
+
+      - name: Write release metadata and checksums
+        shell: bash
+        run: |
+          jq -n \
+            --arg version "${{ steps.meta.outputs.version }}" \
+            --arg revision "$GITHUB_SHA" \
+            --arg goVersion "$GO_VERSION" \
+            --arg image "${{ steps.meta.outputs.image }}" \
+            --arg digest "${{ steps.image.outputs.digest }}" \
+            --arg tags "$(make -s plori.tags)" \
+            '{version:$version,revision:$revision,goVersion:$goVersion,image:$image,imageDigest:$digest,buildTags:$tags}' \
+            > dist/build-info.json
+          (cd dist && sha256sum -- *.tar.gz *.spdx.json govulncheck-*.json trivy-*.json build-info.json > checksums.txt)
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.spdx.json
+            dist/govulncheck-*.json
+            dist/trivy-*.json
+            dist/build-info.json
+            dist/checksums.txt

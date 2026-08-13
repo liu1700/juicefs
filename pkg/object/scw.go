@@ -1,5 +1,5 @@
-//go:build !nos3
-// +build !nos3
+//go:build !nos3 && !plori
+// +build !nos3,!plori
 
 /*
  * JuiceFS, Copyright 2021 Juicedata, Inc.

@@ -1,3 +1,6 @@
+//go:build !plori
+// +build !plori
+
 /*
  * JuiceFS, Copyright 2022 Juicedata, Inc.
  *

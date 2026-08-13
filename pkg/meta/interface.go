@@ -589,6 +589,12 @@ func Register(name string, register Creator) {
 	metaDrivers[name] = register
 }
 
+// IsSupported reports whether a metadata driver has been registered.
+func IsSupported(name string) bool {
+	_, ok := metaDrivers[name]
+	return ok
+}
+
 func injectPasswordIntoURI(uri, password string) (string, error) {
 	atIndex := strings.LastIndex(uri, "@")
 	if atIndex == -1 {

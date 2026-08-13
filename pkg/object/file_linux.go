@@ -35,18 +35,6 @@ func getAtime(fi os.FileInfo) time.Time {
 	return fi.ModTime()
 }
 
-func lchtimes(name string, atime time.Time, mtime time.Time) error {
-	var ts = make([]unix.Timespec, 2)
-	// only change mtime
-	ts[0] = unix.Timespec{Sec: unix.UTIME_OMIT, Nsec: unix.UTIME_OMIT}
-	ts[1] = unix.NsecToTimespec(mtime.UnixNano())
-
-	if e := unix.UtimesNanoAt(unix.AT_FDCWD, name, ts, unix.AT_SYMLINK_NOFOLLOW); e != nil {
-		return &os.PathError{Op: "lchtimes", Path: name, Err: e}
-	}
-	return nil
-}
-
 func lchtimesRoot(root *os.Root, name string, atime time.Time, mtime time.Time) error {
 	dir, err := root.Open(filepath.Dir(name))
 	if err != nil {
