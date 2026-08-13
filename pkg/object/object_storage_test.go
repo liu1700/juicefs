@@ -680,6 +680,47 @@ func TestDisk(t *testing.T) {
 	testStorage(t, s)
 }
 
+func TestDiskRejectsParentTraversal(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root") + string(filepath.Separator)
+	s, err := newDisk(root, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	invalid := []string{
+		"../escaped",
+		"dir/../../escaped",
+		filepath.Join(string(filepath.Separator), "escaped"),
+		"bad\x00key",
+	}
+	for _, key := range invalid {
+		if err = s.Put(ctx, key, bytes.NewBufferString("escaped")); err == nil {
+			t.Errorf("Put(%q) should reject a key outside the root", key)
+		}
+		if _, err = s.Head(ctx, key); err == nil {
+			t.Errorf("Head(%q) should reject a key outside the root", key)
+		}
+		if r, getErr := s.Get(ctx, key, 0, -1); getErr == nil {
+			_ = r.Close()
+			t.Errorf("Get(%q) should reject a key outside the root", key)
+		}
+		if err = s.Delete(ctx, key); err == nil {
+			t.Errorf("Delete(%q) should reject a key outside the root", key)
+		}
+	}
+	if _, err = os.Stat(filepath.Join(parent, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("file object key escaped the configured root: %v", err)
+	}
+
+	if err = s.Put(ctx, "nested//file", bytes.NewBufferString("safe")); err != nil {
+		t.Fatalf("normalizing repeated separators: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "nested", "file")); err != nil || string(got) != "safe" {
+		t.Fatalf("repeated-separator key was not confined normally: data=%q err=%v", got, err)
+	}
+}
+
 func TestQingStor(t *testing.T) { //skip mutate
 	if os.Getenv("QY_ACCESS_KEY") == "" {
 		t.SkipNow()

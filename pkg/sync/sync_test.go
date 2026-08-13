@@ -412,11 +412,9 @@ func TestSyncLink(t *testing.T) {
 		t.Fatalf("readlink: %s content: %s", err, l1)
 	}
 	content, err := b.Get(ctx, "l1", 0, -1)
-	if err != nil {
-		t.Fatalf("get content failed: %s", err)
-	}
-	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
-		t.Fatalf("read content failed: err %s content %s", err, string(c))
+	if err == nil {
+		_ = content.Close()
+		t.Fatal("get should reject a symlink target outside the destination file storage root")
 	}
 
 	l2, err := bs.Readlink("d1/l2")
@@ -585,11 +583,9 @@ func TestSyncCheckAllLink(t *testing.T) {
 		t.Fatalf("readlink: %s content: %s", err, l1)
 	}
 	content, err := b.Get(ctx, "l1", 0, -1)
-	if err != nil {
-		t.Fatalf("get content failed: %s", err)
-	}
-	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
-		t.Fatalf("read content failed: err %s content %s", err, string(c))
+	if err == nil {
+		_ = content.Close()
+		t.Fatal("get should reject a symlink target outside the destination file storage root")
 	}
 }
 
@@ -623,11 +619,9 @@ func TestSyncCheckNewLink(t *testing.T) {
 		t.Fatalf("readlink: %s content: %s", err, l1)
 	}
 	content, err := b.Get(ctx, "l1", 0, -1)
-	if err != nil {
-		t.Fatalf("get content failed: %s", err)
-	}
-	if c, err := io.ReadAll(content); err != nil || string(c) != "test" {
-		t.Fatalf("read content failed: err %s content %s", err, string(c))
+	if err == nil {
+		_ = content.Close()
+		t.Fatal("get should reject a symlink target outside the destination file storage root")
 	}
 }
 
