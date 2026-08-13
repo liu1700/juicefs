@@ -13,6 +13,12 @@ title: Plori 最小构建配置
 SQL 和 KV 元数据引擎、S3 gateway、WebDAV、本地和内存对象存储，以及非 S3
 对象存储均不会编入此产物。不要把它当作通用 Community Edition 发行版使用。
 
+Hadoop/Java SDK 和 Ranger 鉴权插件也不在本 fork 的安全支持边界内：它们不会
+进入容器构建上下文，也不会被构建、扫描或发布。不要从本 fork 构建或部署
+`sdk/java`；其旧的 UID/GID 合成路径可能把不同用户名映射为同一个 POSIX owner。
+未来如需支持 Hadoop，必须先实现未知名称拒绝访问的权威持久 name-to-ID 映射，
+再完成碰撞审计和显式的 owner 迁移；绝不能静默重分配已有元数据的 owner。
+
 ## 构建与验证
 
 使用 `.go-version` 指定的 Go 版本执行：
@@ -20,11 +26,14 @@ SQL 和 KV 元数据引擎、S3 gateway、WebDAV、本地和内存对象存储�
 ```shell
 make -B juicefs.plori VERSION=dev
 make test.plori.profile
+make test.plori.security
 hack/verify-plori-binary.sh ./juicefs.plori
 ```
 
 如果运行时注册了 Redis 以外的元数据引擎或 S3 以外的对象存储，
 `make test.plori.profile` 会失败。二进制验证脚本还会拒绝被裁剪后端家族的依赖。
+安全测试会验证受限的 Docker 构建上下文、`nohdfs` 构建标签、工作流命令、
+SBOM 拒绝清单和发布文件白名单。
 
 容器使用固定摘要的多架构基础镜像和固定版本的软件包：
 
@@ -44,7 +53,7 @@ Plori CSI mounter 所需的最小镜像契约。
 - SPDX JSON SBOM 和原始 `govulncheck` 证据；
 - 带 provenance 和 SBOM 的多架构
   `ghcr.io/liu1700/juicefs-plori` 镜像；
-- 记录源码版本、Go 版本、构建标签、镜像名和不可变镜像摘要的
+- 记录源码版本、Go 版本、构建标签、镜像名、不可变镜像摘要和机器可读支持策略的
   `build-info.json`。
 
 流水线会验证 Redis + S3 格式化与挂载、FUSE I/O 和远端持久化屏障，并拒绝

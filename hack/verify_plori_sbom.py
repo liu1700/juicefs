@@ -26,6 +26,37 @@ DENIED_PREFIXES = (
     "google.golang.org/grpc",
     "modernc.org/sqlite",
 )
+DENIED_NAME_FRAGMENTS = (
+    "hadoop",
+    "juicefs-hadoop",
+    "org.apache.ranger",
+    "ranger-authorization",
+)
+DENIED_FILE_FRAGMENTS = (
+    "sdk/java/",
+    ".jar",
+    ".class",
+    "io/juicefs/",
+    "hadoop",
+    "ranger",
+)
+
+
+def verify(document: dict) -> tuple[list[str], list[str], list[str]]:
+    packages = {package.get("name", "") for package in document.get("packages", [])}
+    missing = sorted(REQUIRED - packages)
+    denied_packages = sorted(
+        name
+        for name in packages
+        if name.startswith(DENIED_PREFIXES)
+        or any(fragment in name.casefold() for fragment in DENIED_NAME_FRAGMENTS)
+    )
+    denied_files = sorted(
+        file.get("fileName", "")
+        for file in document.get("files", [])
+        if any(fragment in file.get("fileName", "").casefold() for fragment in DENIED_FILE_FRAGMENTS)
+    )
+    return missing, denied_packages, denied_files
 
 
 def main() -> int:
@@ -33,16 +64,16 @@ def main() -> int:
         print(f"usage: {pathlib.Path(sys.argv[0]).name} SPDX_JSON", file=sys.stderr)
         return 2
     document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-    packages = {package.get("name", "") for package in document.get("packages", [])}
-    missing = sorted(REQUIRED - packages)
-    denied = sorted(name for name in packages if name.startswith(DENIED_PREFIXES))
-    if missing or denied:
+    missing, denied_packages, denied_files = verify(document)
+    if missing or denied_packages or denied_files:
         if missing:
             print(f"Plori SBOM is missing required modules: {', '.join(missing)}", file=sys.stderr)
-        if denied:
-            print(f"Plori SBOM contains excluded modules: {', '.join(denied)}", file=sys.stderr)
+        if denied_packages:
+            print(f"Plori SBOM contains excluded modules: {', '.join(denied_packages)}", file=sys.stderr)
+        if denied_files:
+            print(f"Plori SBOM contains excluded files: {', '.join(denied_files)}", file=sys.stderr)
         return 1
-    print(f"Plori SBOM dependency profile verified ({len(packages)} packages)")
+    print(f"Plori SBOM dependency profile verified ({len(document.get('packages', []))} packages)")
     return 0
 
 

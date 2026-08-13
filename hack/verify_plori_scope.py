@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+import json
+import pathlib
+import re
+import shlex
+import sys
+
+
+EXPECTED_CONTEXT = {
+    "Makefile",
+    "go.mod",
+    "go.sum",
+    "main.go",
+    "cmd",
+    "pkg",
+}
+EXPECTED_DOCKERIGNORE = {
+    "**",
+    "!Makefile",
+    "!go.mod",
+    "!go.sum",
+    "!main.go",
+    "!cmd/",
+    "!cmd/**",
+    "!pkg/",
+    "!pkg/**",
+}
+EXPECTED_POLICY = {
+    "schemaVersion": 1,
+    "profile": "redis-s3-fuse",
+    "supportedInterfaces": ["fuse"],
+    "supportedMetadataEngines": ["redis"],
+    "supportedObjectStores": ["s3"],
+    "excludedSecurityDomains": ["hadoop-java-sdk", "ranger-authorization"],
+}
+FORBIDDEN_WORKFLOW = re.compile(
+    r"(?:sdk/java|juicefs-hadoop|org\.apache\.(?:hadoop|ranger)|setup-java|"
+    r"\.jar(?:[\s'\"]|$)|(?:^|[\s/])(?:java|javac|mvn|mvnw|maven|gradle|"
+    r"gradlew|jar|openjdk)(?:[\s/:@]|$))",
+    re.IGNORECASE | re.MULTILINE,
+)
+EXPECTED_STAGE_COPIES = {
+    ("build", "/src/juicefs.plori", "/juicefs"),
+    ("scan-build", "/src/juicefs.plori.scan", "/juicefs.scan"),
+    ("build", "/src/juicefs.plori", "/usr/local/bin/juicefs"),
+}
+
+
+def docker_instructions(path: pathlib.Path) -> list[str]:
+    instructions = []
+    current = ""
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        current = f"{current} {line}".strip()
+        if current.endswith("\\"):
+            current = current[:-1].rstrip()
+            continue
+        instructions.append(current)
+        current = ""
+    if current:
+        instructions.append(current)
+    return instructions
+
+
+def copied_sources(
+    path: pathlib.Path,
+) -> tuple[set[str], set[tuple[str, str, str]], list[str]]:
+    sources = set()
+    stage_copies = set()
+    errors = []
+    for instruction in docker_instructions(path):
+        if not instruction.upper().startswith("COPY "):
+            continue
+        try:
+            fields = shlex.split(instruction)
+        except ValueError as error:
+            errors.append(f"cannot parse Dockerfile instruction {instruction!r}: {error}")
+            continue
+        from_fields = [
+            field.removeprefix("--from=")
+            for field in fields[1:]
+            if field.startswith("--from=")
+        ]
+        operands = [field for field in fields[1:] if not field.startswith("--")]
+        if len(operands) < 2:
+            errors.append(f"invalid Dockerfile COPY instruction: {instruction}")
+            continue
+        if from_fields:
+            if len(from_fields) != 1 or len(operands) != 2:
+                errors.append(f"invalid stage COPY instruction: {instruction}")
+            else:
+                stage_copies.add((from_fields[0], operands[0], operands[1]))
+            continue
+        for source in operands[:-1]:
+            normalized = source.removeprefix("./").rstrip("/")
+            sources.add(normalized)
+            if any(marker in source for marker in ("*", "?", "[")):
+                errors.append(f"Dockerfile COPY source must not use a wildcard: {source}")
+    return sources, stage_copies, errors
+
+
+def verify(root: pathlib.Path) -> list[str]:
+    errors = []
+    policy_path = root / ".github/security/plori-support-policy.json"
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    if policy != EXPECTED_POLICY:
+        errors.append("Plori support policy differs from the audited Redis + S3 + FUSE contract")
+
+    dockerfile_path = root / "Dockerfile.plori"
+    context_sources, stage_copies, docker_errors = copied_sources(dockerfile_path)
+    errors.extend(docker_errors)
+    if context_sources != EXPECTED_CONTEXT:
+        errors.append(
+            "Dockerfile.plori context sources must be exactly: "
+            + ", ".join(sorted(EXPECTED_CONTEXT))
+        )
+    if stage_copies != EXPECTED_STAGE_COPIES:
+        errors.append("Dockerfile.plori stage copies must contain only the audited Plori binaries")
+    forbidden = FORBIDDEN_WORKFLOW.search(dockerfile_path.read_text(encoding="utf-8"))
+    if forbidden:
+        errors.append(
+            "Dockerfile.plori contains an excluded build or runtime path: "
+            f"{forbidden.group(0)!r}"
+        )
+
+    dockerignore = {
+        line.strip()
+        for line in (root / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    if dockerignore != EXPECTED_DOCKERIGNORE:
+        errors.append(".dockerignore must expose only the audited Plori Go build inputs")
+
+    makefile = (root / "Makefile").read_text(encoding="utf-8")
+    tags_match = re.search(r"^PLORI_TAGS\s*:=\s*(.+)$", makefile, re.MULTILINE)
+    tags = set(tags_match.group(1).split(",")) if tags_match else set()
+    if not {"plori", "nohdfs"}.issubset(tags):
+        errors.append("PLORI_TAGS must include plori and nohdfs")
+
+    workflow = (root / ".github/workflows/plori.yml").read_text(encoding="utf-8")
+    forbidden = FORBIDDEN_WORKFLOW.search(workflow)
+    if forbidden:
+        errors.append(f"Plori workflow contains an excluded build or publish path: {forbidden.group(0)!r}")
+    if not any(
+        command in workflow
+        for command in ("python3 hack/verify_plori_scope.py", "make test.plori.security")
+    ):
+        errors.append("Plori workflow does not run the support-scope verifier")
+    if "python3 hack/verify_plori_release.py" not in workflow:
+        errors.append("Plori workflow does not verify the release directory allowlist")
+    return errors
+
+
+def main() -> int:
+    root = (
+        pathlib.Path(sys.argv[1]).resolve()
+        if len(sys.argv) == 2
+        else pathlib.Path(__file__).resolve().parents[1]
+    )
+    if len(sys.argv) > 2:
+        print(f"usage: {pathlib.Path(sys.argv[0]).name} [REPOSITORY]", file=sys.stderr)
+        return 2
+    errors = verify(root)
+    if errors:
+        for error in errors:
+            print(f"Plori scope verification failed: {error}", file=sys.stderr)
+        return 1
+    print("Plori support scope verified (Redis + S3 + FUSE; Hadoop/Java excluded)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"Plori scope verification failed: {error}", file=sys.stderr)
+        raise SystemExit(2)

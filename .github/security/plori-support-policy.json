@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "profile": "redis-s3-fuse",
+  "supportedInterfaces": [
+    "fuse"
+  ],
+  "supportedMetadataEngines": [
+    "redis"
+  ],
+  "supportedObjectStores": [
+    "s3"
+  ],
+  "excludedSecurityDomains": [
+    "hadoop-java-sdk",
+    "ranger-authorization"
+  ]
+}
