@@ -1,0 +1,51 @@
+groups:
+  - name: plori-juicefs
+    interval: 30s
+    rules:
+      - alert: PloriJuiceFSWritebackUploadFailures
+        expr: max by (vol_name, mp) (juicefs_writeback_failed_uploads) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: JuiceFS writeback has failed uploads
+          description: Stop rollout and run the durability barrier before draining this mount.
+
+      - alert: PloriJuiceFSWritebackBacklogOld
+        expr: max by (vol_name, mp) (juicefs_writeback_oldest_pending_age_seconds) > 60
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: JuiceFS writeback backlog is older than 60 seconds
+          description: Check S3 latency, upload saturation, cache disk bandwidth, and pending bytes.
+
+      - alert: PloriJuiceFSWritebackBarrierStale
+        expr: |
+          max by (vol_name, mp) (juicefs_writeback_pending_blocks) > 0
+            and on (vol_name, mp)
+          (time() - max by (vol_name, mp) (juicefs_writeback_last_successful_barrier_unixtime) > 900)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Pending JuiceFS writes have no recent successful durability barrier
+          description: Do not terminate or reschedule the mount until durability succeeds.
+
+      - alert: PloriJuiceFSObjectRequestErrors
+        expr: sum by (vol_name, mp) (increase(juicefs_object_request_errors[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: JuiceFS object storage requests are failing
+          description: Inspect S3 status, request latency, credentials, and retry logs.
+
+      - alert: PloriJuiceFSUploadConcurrencySaturated
+        expr: max by (vol_name, mp) (juicefs_object_request_uploading) >= 18
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: JuiceFS is continuously using at least 90% of the Plori upload limit
+          description: Benchmark max-uploads and buffer-size together before increasing either value.

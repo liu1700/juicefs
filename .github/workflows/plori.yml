@@ -73,6 +73,7 @@ jobs:
             exit 1
           fi
           make test.plori.profile
+          make test.plori.benchmark
           hack/verify-plori-binary.sh ./juicefs.plori
 
       - name: Gate reachable Go vulnerabilities for the artifact configuration

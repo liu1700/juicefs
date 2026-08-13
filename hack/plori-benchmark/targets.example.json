@@ -1,0 +1,25 @@
+{
+  "targets": [
+    {
+      "name": "4m",
+      "mount": "/mnt/plori-4m",
+      "block_size_mib": 4,
+      "metrics_url": "http://127.0.0.1:9567/metrics",
+      "node_metrics_url": "http://127.0.0.1:9100/metrics"
+    },
+    {
+      "name": "8m",
+      "mount": "/mnt/plori-8m",
+      "block_size_mib": 8,
+      "metrics_url": "http://127.0.0.1:9568/metrics",
+      "node_metrics_url": "http://127.0.0.1:9100/metrics"
+    },
+    {
+      "name": "16m",
+      "mount": "/mnt/plori-16m",
+      "block_size_mib": 16,
+      "metrics_url": "http://127.0.0.1:9569/metrics",
+      "node_metrics_url": "http://127.0.0.1:9100/metrics"
+    }
+  ]
+}

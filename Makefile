@@ -55,6 +55,9 @@ juicefs.plori.scan: Makefile cmd/*.go pkg/*/*.go go.*
 test.plori.profile:
 	go run -tags "$(PLORI_TAGS)" ./hack/plori-profile
 
+test.plori.benchmark:
+	python3 -m unittest discover -s hack/plori-benchmark -p 'test_*.py'
+
 juicefs.ceph: Makefile cmd/*.go pkg/*/*.go
 	go build -tags ceph -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.ceph .
 
@@ -100,7 +103,7 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test test.plori.profile plori.tags
+.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark plori.tags
 
 plori.tags:
 	@printf '%s\n' "$(PLORI_TAGS)"
