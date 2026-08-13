@@ -910,7 +910,14 @@ hadoop jar juicefs-hadoop-{version}.jar ranger \
 
 #### 4.1 Ranger版本
 
-当前代码测试基于`Ranger2.3`和`Ranger2.4`版本，因除`HDFS`模块鉴权外并未使用其他特性，理论上其他版本均适用。
+当前源码的 Apache Ranger 依赖基线为 2.8.0。common、authorization、
+classloader、credential 和 audit 模块统一锁定到一个 `ranger.version` 属性；CI
+还会检查 Maven 实际解析的依赖树，防止发布物意外混入旧版传递依赖。不要覆盖或
+降低该版本。SDK 测试使用 Hadoop 3.1.4 API 和 Ranger 所需的 Hadoop 3.4.2
+client runtime。
+
+Plori/Orlop 发行物不会构建、扫描、发布或支持 Hadoop SDK 与 Ranger 集成。
+本节只适用于单独构建的通用 Java SDK。
 
 #### 4.2 Ranger Audit
 

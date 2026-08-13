@@ -787,7 +787,16 @@ hadoop jar juicefs-hadoop-{version}.jar ranger \
 
 #### 4.1 Ranger version
 
-The code is tested on `Ranger2.3` and `Ranger2.4`. As no other features are used except for `HDFS` module authentication, theoretically all other versions are applicable.
+The source dependency baseline is Apache Ranger 2.8.0. All common,
+authorization, classloader, credential, and audit modules are locked to the
+single `ranger.version` property. CI also checks the resolved Maven dependency
+tree so an older transitive Ranger module cannot be published accidentally.
+Do not override or downgrade this property. The SDK tests use the Hadoop 3.1.4
+API and Ranger's Hadoop 3.4.2 client runtime.
+
+The Plori/Orlop release does not build, scan, publish, or support this Hadoop
+SDK or Ranger integration. This section applies only to separate generic Java
+SDK builds.
 
 #### 4.2 Ranger Audit
 
