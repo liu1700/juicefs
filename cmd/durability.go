@@ -77,11 +77,11 @@ func requestRemoteDurability(mountpoint string, statusOnly bool, timeout time.Du
 		w.Put8(1)
 	} else {
 		w.Put8(0)
-		timeoutMillis := timeout / time.Millisecond
+		wireTimeout := uint64(timeout / time.Millisecond)
 		if timeout%time.Millisecond != 0 {
-			timeoutMillis++
+			wireTimeout++
 		}
-		w.Put64(uint64(timeoutMillis))
+		w.Put64(wireTimeout)
 	}
 	if _, err = f.Write(w.Bytes()); err != nil {
 		return nil, fmt.Errorf("write durability request: %w", err)
