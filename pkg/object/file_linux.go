@@ -17,7 +17,10 @@
 package object
 
 import (
+	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -40,6 +43,56 @@ func lchtimes(name string, atime time.Time, mtime time.Time) error {
 
 	if e := unix.UtimesNanoAt(unix.AT_FDCWD, name, ts, unix.AT_SYMLINK_NOFOLLOW); e != nil {
 		return &os.PathError{Op: "lchtimes", Path: name, Err: e}
+	}
+	return nil
+}
+
+func lchtimesRoot(root *os.Root, name string, atime time.Time, mtime time.Time) error {
+	dir, err := root.Open(filepath.Dir(name))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	var ts = []unix.Timespec{
+		{Sec: unix.UTIME_OMIT, Nsec: unix.UTIME_OMIT},
+		unix.NsecToTimespec(mtime.UnixNano()),
+	}
+	if e := unix.UtimesNanoAt(int(dir.Fd()), filepath.Base(name), ts, unix.AT_SYMLINK_NOFOLLOW); e != nil {
+		return &os.PathError{Op: "lchtimes", Path: name, Err: e}
+	}
+	return nil
+}
+
+func chmodInRoot(root *os.Root, name string, mode os.FileMode) error {
+	resolved, err := resolveInRoot(root, name)
+	if err != nil {
+		return err
+	}
+	base, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer base.Close()
+	fd, err := unix.Openat2(int(base.Fd()), resolved, &unix.OpenHow{
+		Flags:   unix.O_PATH | unix.O_CLOEXEC,
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS,
+	})
+	if err != nil {
+		// openat2 was added in Linux 5.6. Root.Chmod still confines the
+		// operation on older kernels, although it cannot pin the target.
+		if errors.Is(err, unix.ENOSYS) {
+			return root.Chmod(resolved, mode)
+		}
+		return &os.PathError{Op: "chmod", Path: name, Err: err}
+	}
+	defer unix.Close(fd)
+	if err = unix.Fchmodat(fd, "", uint32(mode.Perm()), unix.AT_EMPTY_PATH); err == nil {
+		return nil
+	} else if err != unix.EOPNOTSUPP {
+		return &os.PathError{Op: "chmod", Path: name, Err: err}
+	}
+	if err = os.Chmod(fmt.Sprintf("/proc/self/fd/%d", fd), mode.Perm()); err != nil {
+		return fmt.Errorf("chmod %q through pinned descriptor: %w", name, err)
 	}
 	return nil
 }

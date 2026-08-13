@@ -34,6 +34,14 @@ func lookupGroup(name string) int {
 }
 
 func (d *filestore) Chtimes(key string, mtime time.Time) error {
-	p := d.path(key)
-	return os.Chtimes(p, time.Time{}, mtime)
+	r, name, err := d.openKeyRoot(key, false)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return r.Chtimes(name, time.Time{}, mtime)
+}
+
+func chmodInRoot(root *os.Root, name string, mode os.FileMode) error {
+	return root.Chmod(name, mode)
 }

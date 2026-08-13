@@ -233,6 +233,8 @@ In addition, when migrating data between file systems such as local, SFTP, and H
 
 For synchronization between **local directories**, the `--links` option allows symbolic links to be copied as is, instead of resolving their targets. The synchronized symbolic link retains the original path stored in the source, regardless of whether the path is valid before or after the synchronization.
 
+The `file://` object storage API does not dereference a copied symbolic link when its target is outside the configured local root. The link itself is preserved and can be inspected with `readlink`, but `Head`, `Get`, permission changes, and timestamp changes through the storage API reject the escape. Treat `--links` as a trusted-input option because operating-system tools used directly on the destination directory may still follow the copied link.
+
 Note:
 
 * The `mtime` of a symbolic link is not synchronized.

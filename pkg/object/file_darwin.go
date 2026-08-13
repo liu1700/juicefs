@@ -18,6 +18,7 @@ package object
 
 import (
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -45,4 +46,28 @@ func lchtimes(name string, atime time.Time, mtime time.Time) error {
 		return &os.PathError{Op: "lchtimes", Path: name, Err: e}
 	}
 	return nil
+}
+
+func lchtimesRoot(root *os.Root, name string, atime time.Time, mtime time.Time) error {
+	dir, err := root.Open(filepath.Dir(name))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	var ts = []unix.Timespec{
+		{Sec: -2, Nsec: -2},
+		unix.NsecToTimespec(mtime.UnixNano()),
+	}
+	if e := unix.UtimesNanoAt(int(dir.Fd()), filepath.Base(name), ts, unix.AT_SYMLINK_NOFOLLOW); e != nil {
+		return &os.PathError{Op: "lchtimes", Path: name, Err: e}
+	}
+	return nil
+}
+
+func chmodInRoot(root *os.Root, name string, mode os.FileMode) error {
+	resolved, err := resolveInRoot(root, name)
+	if err != nil {
+		return err
+	}
+	return root.Chmod(resolved, mode)
 }

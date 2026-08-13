@@ -19,6 +19,7 @@ package object
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -45,19 +46,24 @@ type filestore struct {
 }
 
 func (d *filestore) Symlink(oldName, newName string) error {
-	p := d.path(newName)
-	if _, err := os.Stat(filepath.Dir(p)); err != nil && os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
-			return err
-		}
-	} else if err != nil && !os.IsNotExist(err) {
+	r, name, err := d.openKeyRoot(newName, true)
+	if err != nil {
 		return err
 	}
-	return os.Symlink(oldName, p)
+	defer r.Close()
+	if err = mkdirAllInRoot(r, filepath.Dir(name), os.FileMode(0777)); err != nil {
+		return err
+	}
+	return r.Symlink(oldName, name)
 }
 
 func (d *filestore) Readlink(name string) (string, error) {
-	return os.Readlink(d.path(name))
+	r, name, err := d.openKeyRoot(name, false)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	return r.Readlink(name)
 }
 
 func (d *filestore) String() string {
@@ -67,22 +73,145 @@ func (d *filestore) String() string {
 	return "file://" + d.root
 }
 
-func (d *filestore) path(key string) string {
-	if strings.HasSuffix(d.root, dirSuffix) {
-		return filepath.Join(d.root, key)
+func (d *filestore) rootPath() string {
+	if d.root == "" {
+		return "."
 	}
-	return filepath.Clean(d.root + key)
+	return filepath.Clean(d.root)
+}
+
+func (d *filestore) openKeyRoot(key string, create bool) (*os.Root, string, error) {
+	if strings.IndexByte(key, 0) >= 0 {
+		return nil, "", fmt.Errorf("invalid file object key %q: NUL bytes are not allowed", key)
+	}
+	name := filepath.FromSlash(key)
+	if filepath.VolumeName(name) != "" {
+		return nil, "", fmt.Errorf("invalid file object key %q: volume paths are not allowed", key)
+	}
+	for _, component := range strings.Split(filepath.ToSlash(name), dirSuffix) {
+		if component == ".." {
+			return nil, "", fmt.Errorf("invalid file object key %q: parent traversal is not allowed", key)
+		}
+	}
+
+	root := d.rootPath()
+	if strings.HasSuffix(d.root, dirSuffix) {
+		if filepath.IsAbs(name) {
+			return nil, "", fmt.Errorf("invalid file object key %q: absolute paths are not allowed", key)
+		}
+	} else if key == "" {
+		name = filepath.Base(root)
+		root = filepath.Dir(root)
+	} else {
+		name = strings.TrimLeft(name, `/\`)
+	}
+	if name == "" {
+		name = "."
+	}
+	name = filepath.Clean(name)
+	if !filepath.IsLocal(name) {
+		return nil, "", fmt.Errorf("invalid file object key %q: path escapes storage root", key)
+	}
+	if create {
+		if err := os.MkdirAll(root, os.FileMode(0777)); err != nil {
+			return nil, "", err
+		}
+	}
+	r, err := os.OpenRoot(root)
+	return r, name, err
+}
+
+func resolveInRoot(root *os.Root, name string) (string, error) {
+	rootPath, err := filepath.Abs(root.Name())
+	if err != nil {
+		return "", err
+	}
+	rootPath, err = filepath.EvalSymlinks(rootPath)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Join(rootPath, name))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(rootPath, resolved)
+	if err != nil || !filepath.IsLocal(rel) {
+		return "", fmt.Errorf("path %q resolves to %q (relative %q), outside file storage root %q", name, resolved, rel, rootPath)
+	}
+	return rel, nil
+}
+
+func openInRoot(root *os.Root, name string) (*os.File, error) {
+	f, err := root.Open(name)
+	if err == nil {
+		return f, nil
+	}
+	resolved, resolveErr := resolveInRoot(root, name)
+	if resolveErr != nil {
+		if os.IsNotExist(resolveErr) {
+			return nil, resolveErr
+		}
+		return nil, fmt.Errorf("open %q in file storage root: %w (original error: %v)", name, resolveErr, err)
+	}
+	return root.Open(resolved)
+}
+
+func statInRoot(root *os.Root, name string) (os.FileInfo, error) {
+	fi, err := root.Stat(name)
+	if err == nil {
+		return fi, nil
+	}
+	resolved, resolveErr := resolveInRoot(root, name)
+	if resolveErr != nil {
+		if os.IsNotExist(resolveErr) {
+			return nil, resolveErr
+		}
+		return nil, fmt.Errorf("stat %q in file storage root: %w (original error: %v)", name, resolveErr, err)
+	}
+	return root.Stat(resolved)
+}
+
+func mkdirAllInRoot(root *os.Root, name string, mode os.FileMode) error {
+	for i := 0; i < 3; i++ {
+		err := root.MkdirAll(name, mode)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+	}
+	return root.MkdirAll(name, mode)
+}
+
+func (d *filestore) objectKey(name string) string {
+	name = filepath.ToSlash(name)
+	if name == "." {
+		return ""
+	}
+	if !strings.HasSuffix(d.root, dirSuffix) {
+		return dirSuffix + name
+	}
+	return name
 }
 
 func (d *filestore) Head(ctx context.Context, key string) (Object, error) {
-	p := d.path(key)
-	fi, err := os.Lstat(p)
+	r, name, err := d.openKeyRoot(key, false)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	fi, err := r.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
 	isSymlink := fi.Mode()&os.ModeSymlink != 0
 	if isSymlink {
-		fi, err = os.Stat(p)
+		if key == "" && !strings.HasSuffix(d.root, dirSuffix) {
+			fi, err = os.Stat(d.rootPath())
+		} else {
+			fi, err = statInRoot(r, name)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -118,9 +247,17 @@ type SectionReaderCloser struct {
 }
 
 func (d *filestore) Get(ctx context.Context, key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
-	p := d.path(key)
-
-	f, err := os.Open(p)
+	r, name, err := d.openKeyRoot(key, false)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	var f *os.File
+	if key == "" && !strings.HasSuffix(d.root, dirSuffix) {
+		f, err = os.Open(d.rootPath())
+	} else {
+		f, err = openInRoot(r, name)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -145,39 +282,45 @@ func (d *filestore) Get(ctx context.Context, key string, off, limit int64, gette
 }
 
 func (d *filestore) Put(ctx context.Context, key string, in io.Reader, getters ...AttrGetter) (err error) {
-	p := d.path(key)
+	r, name, err := d.openKeyRoot(key, true)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
 
 	if strings.HasSuffix(key, dirSuffix) || key == "" && strings.HasSuffix(d.root, dirSuffix) {
-		return os.MkdirAll(p, os.FileMode(0777))
+		return mkdirAllInRoot(r, name, os.FileMode(0777))
 	}
 
 	var tmp string
+	var tmpCreated bool
 	if PutInplace {
-		tmp = p
+		tmp = name
 	} else {
-		name := filepath.Base(p)
-		if len(name) > 200 {
-			name = name[:200]
+		base := filepath.Base(name)
+		if len(base) > 200 {
+			base = base[:200]
 		}
-		tmp = TmpFilePath(p, name)
+		tmp = TmpFilePath(name, base)
 		defer func() {
-			if err != nil {
-				if e := os.Remove(tmp); e != nil && !os.IsNotExist(e) {
+			if err != nil && tmpCreated {
+				if e := r.Remove(tmp); e != nil && !os.IsNotExist(e) {
 					logger.Warnf("delete %s: %s", tmp, e)
 				}
 			}
 		}()
 	}
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	f, err := r.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil && os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(p), os.FileMode(0777)); err != nil {
+		if err := mkdirAllInRoot(r, filepath.Dir(name), os.FileMode(0777)); err != nil {
 			return err
 		}
-		f, err = os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+		f, err = r.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	}
 	if err != nil {
 		return err
 	}
+	tmpCreated = true
 
 	if TryCFR {
 		_, err = io.Copy(f, in)
@@ -195,7 +338,7 @@ func (d *filestore) Put(ctx context.Context, key string, in io.Reader, getters .
 		return err
 	}
 	if !PutInplace {
-		err = os.Rename(tmp, p)
+		err = r.Rename(tmp, name)
 	}
 	return err
 }
@@ -210,7 +353,15 @@ func (d *filestore) Copy(ctx context.Context, dst, src string) error {
 }
 
 func (d *filestore) Delete(ctx context.Context, key string, getters ...AttrGetter) error {
-	err := os.Remove(d.path(key))
+	r, name, err := d.openKeyRoot(key, false)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer r.Close()
+	err = r.Remove(name)
 	if err != nil && os.IsNotExist(err) {
 		err = nil
 	}
@@ -244,8 +395,8 @@ func (m *mEntry) IsDir() bool {
 
 // readDirSorted reads the directory named by dir and returns
 // a sorted list of directory entries.
-func readDirSorted(dir string, followLink bool) ([]*mEntry, error) {
-	f, err := os.Open(dir)
+func readDirSorted(root *os.Root, dir string, followLink bool) ([]*mEntry, error) {
+	f, err := root.Open(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +412,7 @@ func readDirSorted(dir string, followLink bool) ([]*mEntry, error) {
 		if e.IsDir() {
 			mEntries = append(mEntries, &mEntry{e, e.Name() + dirSuffix, nil, false})
 		} else if isSymlink && followLink {
-			fi, err := os.Stat(filepath.Join(dir, e.Name()))
+			fi, err := statInRoot(root, filepath.Join(dir, e.Name()))
 			if err != nil {
 				mEntries = append(mEntries, &mEntry{e, e.Name(), nil, true})
 				continue
@@ -290,14 +441,50 @@ func (d *filestore) List(ctx context.Context, prefix, marker, token, delimiter s
 	if delimiter != "/" {
 		return nil, false, "", notSupported
 	}
-	var dir string = d.root + prefix
+	dir := prefix
 	var objs []Object
-	if !strings.HasSuffix(dir, dirSuffix) {
-		dir = path.Dir(dir)
-		if !strings.HasSuffix(dir, dirSuffix) {
-			dir += dirSuffix
+	if prefix == "" && !strings.HasSuffix(d.root, dirSuffix) {
+		r, name, err := d.openKeyRoot("", false)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, false, "", nil
+			}
+			return nil, false, "", err
 		}
-	} else if marker == "" {
+		defer r.Close()
+		fi, err := r.Lstat(name)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil, false, "", nil
+			}
+			return nil, false, "", err
+		}
+		isSymlink := fi.Mode()&os.ModeSymlink != 0
+		if isSymlink && followLink {
+			if target, statErr := os.Stat(d.rootPath()); statErr == nil {
+				fi = target
+				isSymlink = false
+			}
+		}
+		key := ""
+		if fi.IsDir() {
+			key = dirSuffix
+		}
+		return generateListResult([]Object{toFile(key, fi, isSymlink, getOwnerGroup)}, limit)
+	}
+	includeDir := strings.HasSuffix(prefix, dirSuffix) || prefix == "" && strings.HasSuffix(d.root, dirSuffix)
+	if !strings.HasSuffix(prefix, dirSuffix) {
+		dir = path.Dir(prefix)
+	}
+	r, name, err := d.openKeyRoot(dir, false)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, "", nil
+		}
+		return nil, false, "", err
+	}
+	defer r.Close()
+	if includeDir && marker == "" {
 		obj, err := d.Head(ctx, prefix)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -307,7 +494,7 @@ func (d *filestore) List(ctx context.Context, prefix, marker, token, delimiter s
 		}
 		objs = append(objs, obj)
 	}
-	entries, err := readDirSorted(dir, followLink)
+	entries, err := readDirSorted(r, name, followLink)
 	if err != nil {
 		if os.IsPermission(err) {
 			logger.Warnf("skip %s: %s", dir, err)
@@ -320,14 +507,17 @@ func (d *filestore) List(ctx context.Context, prefix, marker, token, delimiter s
 		return nil, false, "", err
 	}
 	for _, e := range entries {
-		p := path.Join(dir, e.Name())
+		p := path.Join(filepath.ToSlash(name), e.Name())
+		if p == "." {
+			p = ""
+		}
 		if e.IsDir() {
 			p = p + "/"
 		}
-		if !strings.HasPrefix(p, d.root) {
-			continue
+		key := d.objectKey(strings.TrimSuffix(p, "/"))
+		if e.IsDir() {
+			key += "/"
 		}
-		key := p[len(d.root):]
 		if !strings.HasPrefix(key, prefix) || (marker != "" && key <= marker) {
 			continue
 		}
@@ -342,18 +532,26 @@ func (d *filestore) List(ctx context.Context, prefix, marker, token, delimiter s
 }
 
 func (d *filestore) Chmod(key string, mode os.FileMode) error {
-	p := d.path(key)
-	return os.Chmod(p, mode)
+	r, name, err := d.openKeyRoot(key, false)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return chmodInRoot(r, name, mode)
 }
 
 func (d *filestore) Chown(key string, owner, group string) error {
-	p := d.path(key)
 	uid := utils.LookupUser(owner)
 	gid := utils.LookupGroup(group)
 	if uid == -1 || gid == -1 {
 		return fmt.Errorf("user(%s):group(%s) not found", owner, group)
 	}
-	return os.Lchown(p, uid, gid)
+	r, name, err := d.openKeyRoot(key, false)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	return r.Lchown(name, uid, gid)
 }
 
 func newDisk(root, accesskey, secretkey, token string) (ObjectStorage, error) {
