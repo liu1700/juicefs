@@ -62,6 +62,10 @@ test.plori.security:
 	python3 hack/verify_plori_security_test.py
 	python3 hack/verify_plori_scope.py
 
+test.java.security:
+	python3 sdk/java/verify_ranger_dependencies_test.py
+	python3 sdk/java/verify_ranger_dependencies.py sdk/java/pom.xml
+
 juicefs.ceph: Makefile cmd/*.go pkg/*/*.go
 	go build -tags ceph -gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.ceph .
 
@@ -107,7 +111,7 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.security plori.tags
+.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.security test.java.security plori.tags
 
 plori.tags:
 	@printf '%s\n' "$(PLORI_TAGS)"

@@ -53,6 +53,15 @@ jobs:
           distribution: 'temurin'
           java-version: '8'
 
+      - name: Verify Ranger dependency security baseline
+        run: |
+          make test.java.security
+          mvn -f sdk/java/pom.xml dependency:tree -B \
+            -Dincludes=org.apache.ranger -DoutputType=text \
+            -DoutputFile="$RUNNER_TEMP/ranger-dependencies.txt"
+          python3 sdk/java/verify_ranger_dependencies.py sdk/java/pom.xml \
+            "$RUNNER_TEMP/ranger-dependencies.txt"
+
       - name: Run Redis
         run: |
           sudo docker run -d --name redis -v redis-data:/data  \
