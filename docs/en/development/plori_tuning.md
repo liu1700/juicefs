@@ -5,7 +5,7 @@ title: Plori immutable-chunk profile
 This profile is only for the Plori/Orlop data path. Orlop stores immutable,
 content-addressed FastCDC chunks as individual files, writes them once with
 `temp + fsync + rename`, reads each chunk in full, and eventually unlinks it.
-Generic filesystem tuning advice does not necessarily apply to this workload.
+Generic file system tuning advice does not necessarily apply to this workload.
 
 ## Selected profile
 
