@@ -21,8 +21,6 @@ package winfsp
 
 import (
 	"fmt"
-	"os"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -64,18 +62,25 @@ func (j *juice) log(ctx fs.LogContext, format string, args ...interface{}) {
 	}
 }
 
-func (fs *juice) flushLog(f *os.File, path string, rotateCount int) {
+func (j *juice) flushLog(f *fs.AccessLog, path string, rotateCount int) {
 	buf := make([]byte, 0, 128<<10)
 	var lastcheck = time.Now()
 	numFiles := rotateCount
+	defer func() { _ = f.Close() }()
 
 	for {
-		line := <-fs.logBuffer
+		line, ok := <-j.logBuffer
+		if !ok {
+			return
+		}
 		buf = append(buf[:0], []byte(line)...)
 	LOOP:
 		for len(buf) < (128 << 10) {
 			select {
-			case line = <-fs.logBuffer:
+			case line, ok = <-j.logBuffer:
+				if !ok {
+					break LOOP
+				}
 				buf = append(buf, []byte(line)...)
 			default:
 				break LOOP
@@ -90,35 +95,8 @@ func (fs *juice) flushLog(f *os.File, path string, rotateCount int) {
 			continue
 		}
 		lastcheck = time.Now()
-		fi, err := f.Stat()
-		if err != nil {
-			logger.Errorf("stat access log: %s", err)
-			continue
-		}
-		if fi.Size() > RotateAccessLog {
-			_ = f.Close()
-			fi, err = os.Stat(path)
-			if err == nil && fi.Size() > RotateAccessLog {
-				tmp := fmt.Sprintf("%s.%p", path, fs)
-				if os.Rename(path, tmp) == nil {
-					for i := numFiles - 1; i > 0; i-- {
-						_ = os.Rename(path+"."+strconv.Itoa(i), path+"."+strconv.Itoa(i+1))
-					}
-					_ = os.Rename(tmp, path+".1")
-				} else {
-					fi, err = os.Stat(path)
-					if err == nil && fi.Size() > RotateAccessLog*int64(numFiles) {
-						logger.Infof("can't rename %s, truncate it", path)
-						_ = os.Truncate(path, 0)
-					}
-				}
-			}
-			f, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-			if err != nil {
-				logger.Errorf("open %s: %s", path, err)
-				break
-			}
-			_ = os.Chmod(path, 0666)
+		if _, err = f.Rotate(RotateAccessLog, numFiles); err != nil {
+			logger.Errorf("rotate access log %s: %s; continuing with the open log file", path, err)
 		}
 	}
 }

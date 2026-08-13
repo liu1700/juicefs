@@ -1059,19 +1059,17 @@ func Serve(v *vfs.VFS, fuseOpt string, asRoot bool, delayCloseSec int, showDotFi
 
 	fuseAccessLog := c.String("fuse-access-log")
 	if fuseAccessLog != "" {
-		f, err := os.OpenFile(fuseAccessLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+		f, err := fs.OpenAccessLog(fuseAccessLog)
 		if err != nil {
-			logger.Errorf("open fuse access log %s: %s", fuseAccessLog, err)
-		} else {
-			logger.Infof("fuse access log: %s", fuseAccessLog)
-			_ = os.Chmod(fuseAccessLog, 0666)
-			jfs.logBuffer = make(chan string, 1024)
-			rotateCount := c.Int("fuse-access-log-rotate-count")
-			if rotateCount <= 0 {
-				rotateCount = 7
-			}
-			go jfs.flushLog(f, fuseAccessLog, rotateCount)
+			return fmt.Errorf("open fuse access log %s: %w", fuseAccessLog, err)
 		}
+		logger.Infof("fuse access log: %s", fuseAccessLog)
+		jfs.logBuffer = make(chan string, 1024)
+		rotateCount := c.Int("fuse-access-log-rotate-count")
+		if rotateCount <= 0 {
+			rotateCount = 7
+		}
+		go jfs.flushLog(f, fuseAccessLog, rotateCount)
 	}
 
 	var err error
