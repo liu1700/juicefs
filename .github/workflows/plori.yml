@@ -12,7 +12,10 @@ on:
       - "hack/check_govulncheck_test.py"
       - "hack/install-plori-scanners.sh"
       - "hack/verify-plori-binary.sh"
+      - "hack/verify_plori_release.py"
       - "hack/verify_plori_sbom.py"
+      - "hack/verify_plori_scope.py"
+      - "hack/verify_plori_security_test.py"
       - "pkg/**"
       - ".dockerignore"
       - ".go-version"
@@ -67,6 +70,7 @@ jobs:
 
       - name: Build static Plori binary
         run: |
+          make test.plori.security
           make -B STATIC=1 juicefs.plori juicefs.plori.scan VERSION=ci
           if ldd ./juicefs.plori >/dev/null 2>&1; then
             echo "Plori binary must be statically linked" >&2
@@ -272,6 +276,8 @@ jobs:
             syft scan --platform "$platform" \
               "registry:${{ steps.meta.outputs.image }}@${{ steps.image.outputs.digest }}" \
               -o "spdx-json=dist/juicefs-plori-container-$arch.spdx.json"
+            python3 hack/verify_plori_sbom.py \
+              "dist/juicefs-plori-container-$arch.spdx.json"
           done
 
       - name: Write release metadata and checksums
@@ -284,8 +290,11 @@ jobs:
             --arg image "${{ steps.meta.outputs.image }}" \
             --arg digest "${{ steps.image.outputs.digest }}" \
             --arg tags "$(make -s plori.tags)" \
-            '{version:$version,revision:$revision,goVersion:$goVersion,image:$image,imageDigest:$digest,buildTags:$tags}' \
+            --slurpfile policy .github/security/plori-support-policy.json \
+            '{version:$version,revision:$revision,goVersion:$goVersion,image:$image,imageDigest:$digest,buildTags:$tags,supportPolicy:$policy[0]}' \
             > dist/build-info.json
+          python3 hack/verify_plori_release.py dist "${{ steps.meta.outputs.version }}" \
+            .github/security/plori-support-policy.json
           (cd dist && sha256sum -- *.tar.gz *.spdx.json govulncheck-*.json trivy-*.json build-info.json > checksums.txt)
 
       - name: Publish GitHub release

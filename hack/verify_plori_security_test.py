@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+import importlib.util
+import io
+import json
+import pathlib
+import shutil
+import tarfile
+import tempfile
+import unittest
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def load_module(name: str, path: pathlib.Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+scope = load_module("verify_plori_scope", ROOT / "hack/verify_plori_scope.py")
+release = load_module("verify_plori_release", ROOT / "hack/verify_plori_release.py")
+sbom = load_module("verify_plori_sbom", ROOT / "hack/verify_plori_sbom.py")
+
+
+class ScopeTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.temp.name)
+        for path in (
+            ".dockerignore",
+            "Dockerfile.plori",
+            "Makefile",
+            ".github/workflows/plori.yml",
+            ".github/security/plori-support-policy.json",
+        ):
+            source = ROOT / path
+            target = self.root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_repository_scope_is_valid(self):
+        self.assertEqual(scope.verify(self.root), [])
+
+    def test_broad_docker_copy_is_rejected(self):
+        dockerfile = self.root / "Dockerfile.plori"
+        dockerfile.write_text(dockerfile.read_text() + "\nCOPY . /src\n", encoding="utf-8")
+        self.assertTrue(any("context sources" in error for error in scope.verify(self.root)))
+
+    def test_extra_stage_copy_is_rejected(self):
+        dockerfile = self.root / "Dockerfile.plori"
+        dockerfile.write_text(
+            dockerfile.read_text() + "\nCOPY --from=source /tmp/component /opt/component\n",
+            encoding="utf-8",
+        )
+        self.assertTrue(any("stage copies" in error for error in scope.verify(self.root)))
+
+    def test_java_build_is_rejected(self):
+        workflow = self.root / ".github/workflows/plori.yml"
+        workflow.write_text(workflow.read_text() + "\n# mvn package\n", encoding="utf-8")
+        self.assertTrue(any("excluded build" in error for error in scope.verify(self.root)))
+
+
+class SbomTest(unittest.TestCase):
+    def valid_document(self):
+        return {"packages": [{"name": name} for name in sbom.REQUIRED], "files": []}
+
+    def test_supported_profile_is_valid(self):
+        self.assertEqual(sbom.verify(self.valid_document()), ([], [], []))
+
+    def test_hadoop_package_is_rejected(self):
+        document = self.valid_document()
+        document["packages"].append({"name": "org.apache.hadoop:hadoop-client"})
+        self.assertEqual(sbom.verify(document)[1], ["org.apache.hadoop:hadoop-client"])
+
+    def test_jar_file_is_rejected(self):
+        document = self.valid_document()
+        document["files"].append({"fileName": "/opt/juicefs/juicefs-hadoop.jar"})
+        self.assertEqual(sbom.verify(document)[2], ["/opt/juicefs/juicefs-hadoop.jar"])
+
+    def test_unpacked_java_class_is_rejected(self):
+        document = self.valid_document()
+        document["files"].append({"fileName": "/opt/io/juicefs/JuiceFileSystem.class"})
+        self.assertEqual(
+            sbom.verify(document)[2],
+            ["/opt/io/juicefs/JuiceFileSystem.class"],
+        )
+
+
+class ReleaseTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.directory = pathlib.Path(self.temp.name)
+        self.version = "1.5.0-plori.1"
+        self.policy = ROOT / ".github/security/plori-support-policy.json"
+        for name in release.expected_files(self.version):
+            path = self.directory / name
+            if name == "build-info.json":
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": self.version,
+                            "supportPolicy": json.loads(
+                                self.policy.read_text(encoding="utf-8")
+                            ),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            elif name.endswith(".tar.gz"):
+                binary = name.removesuffix(".tar.gz")
+                with tarfile.open(path, mode="w:gz") as bundle:
+                    payload = b"binary"
+                    info = tarfile.TarInfo(binary)
+                    info.size = len(payload)
+                    bundle.addfile(info, io.BytesIO(payload))
+            else:
+                path.write_bytes(b"test")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_release_allowlist_is_valid(self):
+        self.assertEqual(release.verify(self.directory, self.version, self.policy), [])
+
+    def test_jar_asset_is_rejected(self):
+        (self.directory / "juicefs-hadoop.jar").write_bytes(b"test")
+        errors = release.verify(self.directory, self.version, self.policy)
+        self.assertTrue(any("unexpected release files" in error for error in errors))
+
+
+if __name__ == "__main__":
+    unittest.main()

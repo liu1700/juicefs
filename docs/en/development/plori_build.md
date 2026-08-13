@@ -14,6 +14,15 @@ SQL and KV metadata engines, the S3 gateway, WebDAV, local and in-memory object
 stores, and non-S3 object storage providers are excluded. Do not use this
 artifact as a general-purpose replacement for a Community Edition release.
 
+The Hadoop/Java SDK and Ranger authorization plugin are also outside this
+fork's supported security boundary. They are not copied into the container
+build context, built, scanned, or published. Do not build or deploy
+`sdk/java` from this fork: its legacy synthesized UID/GID path can map distinct
+names to the same POSIX owner. Supporting Hadoop later requires an
+authoritative persistent name-to-ID mapping that rejects unknown names, plus a
+collision audit and an explicit ownership migration. Existing metadata must
+never be silently reassigned.
+
 ## Build and verify
 
 Use the Go version in `.go-version` and run:
@@ -21,12 +30,15 @@ Use the Go version in `.go-version` and run:
 ```shell
 make -B juicefs.plori VERSION=dev
 make test.plori.profile
+make test.plori.security
 hack/verify-plori-binary.sh ./juicefs.plori
 ```
 
 `make test.plori.profile` fails if any metadata engine other than Redis or any
 object storage driver other than S3 is registered. The binary verifier also
-rejects dependencies belonging to excluded backend families.
+rejects dependencies belonging to excluded backend families. The security
+test verifies the restricted Docker build context, `nohdfs` build tag,
+workflow commands, SBOM denylist, and release-file allowlist.
 
 The container build uses pinned multi-architecture base images and package
 versions:
@@ -49,7 +61,7 @@ release publishes:
 - a multi-architecture `ghcr.io/liu1700/juicefs-plori` image with provenance
   and an SBOM;
 - `build-info.json`, which records the source revision, Go version, build tags,
-  image name, and immutable image digest.
+  image name, immutable image digest, and the machine-readable support policy.
 
 The workflow tests Redis + S3 format and mount, FUSE I/O, and the remote
 durability barrier. It rejects reachable Go vulnerabilities and fixed HIGH or
