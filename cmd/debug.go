@@ -295,13 +295,16 @@ func reqAndSaveMetric(name string, metric metricItem, outDir string, timeout tim
 	return writer.Flush()
 }
 
-func checkAgent(cmd string) bool {
+func debugAgentMode(cmd string) (disabled, explicit bool) {
 	for _, field := range strings.Fields(cmd) {
 		if field == "--no-agent" {
-			return false
+			disabled = true
+		}
+		if field == "--debug-agent" || strings.HasPrefix(field, "--debug-agent=") {
+			explicit = true
 		}
 	}
-	return true
+	return disabled, explicit
 }
 
 func geneZipFile(srcPath, destPath string) error {
@@ -352,13 +355,18 @@ func geneZipFile(srcPath, destPath string) error {
 }
 
 func collectPprof(ctx *cli.Context, cmd string, pid string, amp string, requireRootPrivileges bool, currDir string, wg *sync.WaitGroup) error {
-	if !checkAgent(cmd) {
+	disabled, explicit := debugAgentMode(cmd)
+	if disabled {
 		logger.Warnf("No agent found, the pprof metrics will not be collected")
 		return nil
 	}
 
 	port, err := getPprofPort(pid, amp, requireRootPrivileges)
 	if err != nil {
+		if !explicit {
+			logger.Warnf("No debug agent found; pprof metrics will not be collected: %v", err)
+			return nil
+		}
 		return fmt.Errorf("failed to get pprof port: %v", err)
 	}
 	baseUrl := fmt.Sprintf("http://localhost:%d/debug/pprof/", port)

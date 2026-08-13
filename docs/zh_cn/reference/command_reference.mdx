@@ -61,7 +61,8 @@ GLOBAL OPTIONS:
    --quiet, -q             show warning and errors only (default: false)
    --trace                 enable trace log (default: false)
    --log-id value          append the given log id in log, use "random" to use random uuid
-   --no-agent              disable pprof (:6060) agent (default: false)
+   --no-agent              disable pprof agent (deprecated; disabled by default) (default: false)
+   --debug-agent value     enable pprof on a loopback address (for example, 127.0.0.1:6060)
    --pyroscope value       pyroscope address
    --no-color              disable colors (default: false)
    --help, -h              show help (default: false)
@@ -125,7 +126,8 @@ source /etc/bash_completion.d/juicefs
 |`-q` `--quiet`|仅显示警告及错误日志。|
 |`-v` `--verbose` `--debug`|开启调试日志。|
 |`--trace`|开启比 `--debug` 选项更详细的调试日志。|
-|`--no-agent`|关闭 pprof 代理。|
+|`--debug-agent`|显式在回环地址启用 pprof，例如 `127.0.0.1:6060`；默认关闭。|
+|`--no-agent`|用于兼容旧配置的废弃选项；即使同时指定 `--debug-agent` 也保持 pprof 关闭。|
 |`--pyroscope`|配置 [Pyroscope](https://github.com/pyroscope-io/pyroscope) 地址，如 `http://localhost:4040`。|
 |`--no-color`|关闭日志的颜色。|
 

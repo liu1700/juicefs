@@ -53,7 +53,11 @@ func globalFlags() []cli.Flag {
 		},
 		&cli.BoolFlag{
 			Name:  "no-agent",
-			Usage: "disable pprof (:6060) agent",
+			Usage: "disable pprof agent (deprecated; disabled by default)",
+		},
+		&cli.StringFlag{
+			Name:  "debug-agent",
+			Usage: "enable pprof on a loopback address (for example, 127.0.0.1:6060)",
 		},
 		&cli.StringFlag{
 			Name:  "pyroscope",

@@ -241,7 +241,15 @@ The `object` stands for object storage related metrics, when cache is enabled, p
 
 ## Get runtime information using pprof {#runtime-information}
 
-By default, JuiceFS clients will listen to a TCP port locally via [pprof](https://pkg.go.dev/net/http/pprof) to get runtime information such as Goroutine stack information, CPU performance statistics, memory allocation statistics. You can view the specific port number that the current JuiceFS client is listening to through the `.config` file under the mount point:
+JuiceFS clients do not start a [pprof](https://pkg.go.dev/net/http/pprof) listener by default. Temporarily add an explicit loopback address when runtime diagnostics are needed, for example:
+
+```bash
+juicefs --debug-agent=127.0.0.1:6060 mount redis://localhost /jfs
+```
+
+The address must be loopback. The endpoint has no HTTP authentication, so do not expose it through host-network sharing, a proxy, port forwarding, or a sidecar. CPU and trace profiles are limited to 120 seconds, and only one expensive profile is allowed at a time. Remove `--debug-agent` after diagnosis. The legacy `--no-agent` option remains accepted and wins if both options are present.
+
+For a mount, view the active address through the `.config` file under the mount point:
 
 ```bash
 # Assume the mount point is /jfs
@@ -249,7 +257,7 @@ $ cat /jfs/.config | grep 'DebugAgent'
   "DebugAgent": "127.0.0.1:6064",
 ```
 
-The default port number range that pprof listens to starts from 6060 and ends at 6099. From the above example, you can see that the actual port number is 6064. Once you get the listening port number, you can view all the available runtime information by accessing `http://localhost:<port>/debug/pprof`, and some important runtime information will be shown as follows:
+Once you get the configured port number, you can view all available runtime information at `http://localhost:<port>/debug/pprof`. Some important endpoints are:
 
 - Goroutine stack information: `http://localhost:<port>/debug/pprof/goroutine?debug=1`
 - CPU performance statistics: `http://localhost:<port>/debug/pprof/profile?seconds=30`
@@ -270,7 +278,7 @@ curl 'http://localhost:<port>/debug/pprof/heap' > juicefs.heap.pb.gz
 ```
 
 :::tip
-You can also use the `juicefs debug` command to automatically collect these runtime information and save it locally. By default, it is saved to the `debug` directory under the current directory, for example:
+You can also use the `juicefs debug` command to collect this runtime information when the target client was started with `--debug-agent`. Without the opt-in listener, the command skips pprof and still collects its other diagnostics. By default, output is saved to the `debug` directory under the current directory, for example:
 
 ```bash
 juicefs debug /mnt/jfs

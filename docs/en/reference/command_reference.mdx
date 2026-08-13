@@ -61,7 +61,8 @@ GLOBAL OPTIONS:
    --quiet, -q             show warning and errors only (default: false)
    --trace                 enable trace log (default: false)
    --log-id value          append the given log id in log, use "random" to use random uuid
-   --no-agent              disable pprof (:6060) agent (default: false)
+   --no-agent              disable pprof agent (deprecated; disabled by default) (default: false)
+   --debug-agent value     enable pprof on a loopback address (for example, 127.0.0.1:6060)
    --pyroscope value       pyroscope address
    --no-color              disable colors (default: false)
    --help, -h              show help (default: false)
@@ -125,7 +126,8 @@ source /etc/bash_completion.d/juicefs
 |`-v` `--verbose` `--debug`|Enable debug logs.|
 |`-q` `--quiet`|Show only warning and error logs.|
 |`--trace`|Enable more detailed debug logs than the `--debug` option.|
-|`--no-agent`|Disable pprof agent.|
+|`--debug-agent`|Explicitly enable pprof on a loopback address, for example `127.0.0.1:6060`. Disabled by default.|
+|`--no-agent`|Deprecated compatibility flag. Keep pprof disabled even if `--debug-agent` is also supplied.|
 |`--pyroscope`|Config [Pyroscope](https://github.com/pyroscope-io/pyroscope) address, e.g. `http://localhost:4040`.|
 |`--no-color`|Disable log color.|
 

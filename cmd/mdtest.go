@@ -19,7 +19,6 @@ package cmd
 import (
 	"fmt"
 	"math/rand"
-	_ "net/http/pprof"
 	"os"
 	"path"
 	"runtime"

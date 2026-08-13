@@ -18,18 +18,20 @@ package cmd
 
 import (
 	"fmt"
+	"net"
 	"net/http"
-	_ "net/http/pprof"
+	stdpprof "net/http/pprof"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/grafana/pyroscope-go"
-	_ "github.com/grafana/pyroscope-go/godeltaprof/http/pprof"
+	deltapprof "github.com/grafana/pyroscope-go/godeltaprof/http/pprof"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/sirupsen/logrus"
@@ -40,6 +42,84 @@ import (
 var logger = utils.GetLogger("juicefs")
 var debugAgent string
 var debugAgentOnce sync.Once
+
+const maxDebugProfileDuration = 120
+
+func debugAgentMux() http.Handler {
+	mux := http.NewServeMux()
+	sem := make(chan struct{}, 1)
+	mux.HandleFunc("/debug/pprof/", stdpprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", stdpprof.Cmdline)
+	mux.Handle("/debug/pprof/profile", limitDebugProfile(sem, stdpprof.Profile))
+	mux.HandleFunc("/debug/pprof/symbol", stdpprof.Symbol)
+	mux.Handle("/debug/pprof/trace", limitDebugProfile(sem, stdpprof.Trace))
+	mux.Handle("/debug/pprof/delta_heap", limitDebugProfile(sem, deltapprof.Heap))
+	mux.Handle("/debug/pprof/delta_block", limitDebugProfile(sem, deltapprof.Block))
+	mux.Handle("/debug/pprof/delta_mutex", limitDebugProfile(sem, deltapprof.Mutex))
+	return mux
+}
+
+func limitDebugProfile(sem chan struct{}, next http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if seconds := r.URL.Query().Get("seconds"); seconds != "" {
+			duration, err := strconv.Atoi(seconds)
+			if err != nil || duration < 0 || duration > maxDebugProfileDuration {
+				http.Error(w, fmt.Sprintf("seconds must be between 0 and %d", maxDebugProfileDuration), http.StatusBadRequest)
+				return
+			}
+		}
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			next(w, r)
+		default:
+			http.Error(w, "another expensive profile is already running", http.StatusTooManyRequests)
+		}
+	})
+}
+
+func newDebugAgentServer(addr string) (*http.Server, net.Listener, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid debug agent address %q: %w", addr, err)
+	}
+	if host != "localhost" {
+		ip := net.ParseIP(host)
+		if ip == nil || !ip.IsLoopback() {
+			return nil, nil, fmt.Errorf("debug agent address %q must use a loopback host", addr)
+		}
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	server := &http.Server{
+		Handler:           debugAgentMux(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       5 * time.Second,
+		WriteTimeout:      (maxDebugProfileDuration + 5) * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+	return server, listener, nil
+}
+
+func startDebugAgent(addr string) {
+	debugAgentOnce.Do(func() {
+		server, listener, err := newDebugAgentServer(addr)
+		if err != nil {
+			logger.Errorf("start debug agent on %s: %s", addr, err)
+			return
+		}
+		debugAgent = listener.Addr().String()
+		logger.Infof("Debug agent listening on %s", debugAgent)
+		go func() {
+			if serveErr := server.Serve(listener); serveErr != nil && serveErr != http.ErrServerClosed {
+				logger.Errorf("serve debug agent on %s: %s", debugAgent, serveErr)
+			}
+		}()
+	})
+}
 
 func Main(args []string) error {
 	// we have to call this because gspt removes all arguments
@@ -328,14 +408,12 @@ func setup0(c *cli.Context, min, max int) {
 		utils.SetLogID("[" + logID + "] ")
 	}
 
-	if !c.Bool("no-agent") {
-		go debugAgentOnce.Do(func() {
-			for port := 6060; port < 6100; port++ {
-				debugAgent = fmt.Sprintf("127.0.0.1:%d", port)
-				logger.Debugf("Debug agent listening on %s", debugAgent)
-				_ = http.ListenAndServe(debugAgent, nil)
-			}
-		})
+	if addr := c.String("debug-agent"); addr != "" {
+		if c.Bool("no-agent") {
+			logger.Warn("ignore --debug-agent because --no-agent is set")
+		} else {
+			startDebugAgent(addr)
+		}
 	}
 
 	if c.IsSet("pyroscope") {

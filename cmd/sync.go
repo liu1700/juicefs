@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"path/filepath"
