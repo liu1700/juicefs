@@ -41,8 +41,17 @@ SBOM 拒绝清单和发布文件白名单。
 docker build -f Dockerfile.plori -t juicefs-plori:dev .
 ```
 
-运行镜像只包含静态客户端、CA 证书、FUSE 3、POSIX shell 和 `tini`，这是
-Plori CSI mounter 所需的最小镜像契约。
+运行镜像只包含静态客户端、CA 证书、FUSE 3、POSIX shell 和 `tini`。
+JuiceFS CSI v0.32 的 CE mount pod 会执行 `/bin/mount.juicefs`，二进制升级
+job 则会复制 `/usr/local/bin/juicefs`；这两个路径都指向同一个受支持的静态
+客户端。可用下面的命令验证这一精确镜像契约：
+
+```shell
+hack/verify-plori-csi-image.sh juicefs-plori:dev
+```
+
+验证脚本还会检查 CSI mount pod 生命周期使用的 shell 和基础命令。PR 镜像和
+发布镜像都必须通过该检查。
 
 ## 发布与安全契约
 

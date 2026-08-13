@@ -44,6 +44,7 @@ EXPECTED_STAGE_COPIES = {
     ("scan-build", "/src/juicefs.plori.scan", "/juicefs.scan"),
     ("build", "/src/juicefs.plori", "/usr/local/bin/juicefs"),
 }
+EXPECTED_CSI_LINK = "ln -s /usr/local/bin/juicefs /bin/mount.juicefs"
 
 
 def docker_instructions(path: pathlib.Path) -> list[str]:
@@ -103,6 +104,10 @@ def copied_sources(
 
 def verify(root: pathlib.Path) -> list[str]:
     errors = []
+    csi_verifier = root / "hack/verify-plori-csi-image.sh"
+    if not csi_verifier.is_file() or not csi_verifier.stat().st_mode & 0o111:
+        errors.append("Plori CSI image verifier must exist and be executable")
+
     policy_path = root / ".github/security/plori-support-policy.json"
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
     if policy != EXPECTED_POLICY:
@@ -123,6 +128,13 @@ def verify(root: pathlib.Path) -> list[str]:
         errors.append(
             "Dockerfile.plori contains an excluded build or runtime path: "
             f"{forbidden.group(0)!r}"
+        )
+    if not any(
+        EXPECTED_CSI_LINK in instruction
+        for instruction in docker_instructions(dockerfile_path)
+    ):
+        errors.append(
+            "Dockerfile.plori must link /bin/mount.juicefs to the supported client"
         )
 
     dockerignore = {
@@ -150,6 +162,8 @@ def verify(root: pathlib.Path) -> list[str]:
         errors.append("Plori workflow does not run the support-scope verifier")
     if "python3 hack/verify_plori_release.py" not in workflow:
         errors.append("Plori workflow does not verify the release directory allowlist")
+    if workflow.count("hack/verify-plori-csi-image.sh") < 2:
+        errors.append("Plori workflow must verify the CSI image contract before release")
     return errors
 
 

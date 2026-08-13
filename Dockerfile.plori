@@ -52,7 +52,8 @@ LABEL org.opencontainers.image.source="https://github.com/liu1700/juicefs" \
       org.opencontainers.image.description="Minimal Redis + S3 + FUSE JuiceFS runtime for Plori and Orlop"
 
 COPY --from=build /src/juicefs.plori /usr/local/bin/juicefs
-RUN ln -s /usr/local/bin/juicefs /bin/juicefs
+RUN ln -s /usr/local/bin/juicefs /bin/juicefs \
+    && ln -s /usr/local/bin/juicefs /bin/mount.juicefs
 
 ENTRYPOINT ["/sbin/tini", "--"]
 CMD ["/usr/local/bin/juicefs", "version"]
