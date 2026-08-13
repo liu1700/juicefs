@@ -1,0 +1,134 @@
+{
+  "__inputs": [
+    {
+      "label": "Prometheus",
+      "name": "DS_PROMETHEUS",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus",
+      "type": "datasource"
+    }
+  ],
+  "__requires": [
+    {"id": "grafana", "name": "Grafana", "type": "grafana", "version": "10.0.0"},
+    {"id": "prometheus", "name": "Prometheus", "type": "datasource", "version": "1.0.0"}
+  ],
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "targets": [{"expr": "sum by (method) (rate(juicefs_object_request_durations_histogram_seconds_count{vol_name=~\"$volume\"}[$__rate_interval]))", "legendFormat": "{{method}}"}],
+      "title": "S3 requests by method",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, method) (rate(juicefs_object_request_durations_histogram_seconds_bucket{vol_name=~\"$volume\"}[$__rate_interval])))", "legendFormat": "p95 {{method}}"}],
+      "title": "S3 request latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "id": 3,
+      "targets": [
+        {"expr": "max by (mp) (juicefs_writeback_pending_bytes{vol_name=~\"$volume\"})", "legendFormat": "pending {{mp}}"},
+        {"expr": "max by (mp) (juicefs_staging_block_bytes{vol_name=~\"$volume\"})", "legendFormat": "staging {{mp}}"}
+      ],
+      "title": "Writeback and staging bytes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "id": 4,
+      "targets": [{"expr": "max by (mp) (juicefs_writeback_oldest_pending_age_seconds{vol_name=~\"$volume\"})", "legendFormat": "{{mp}}"}],
+      "title": "Oldest pending upload",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"max": 1, "min": 0, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 5,
+      "targets": [{"expr": "sum(rate(juicefs_blockcache_hit_bytes{vol_name=~\"$volume\"}[$__rate_interval])) / clamp_min(sum(rate(juicefs_blockcache_hit_bytes{vol_name=~\"$volume\"}[$__rate_interval])) + sum(rate(juicefs_blockcache_miss_bytes{vol_name=~\"$volume\"}[$__rate_interval])), 1)", "legendFormat": "hit ratio"}],
+      "title": "JuiceFS block-cache byte hit ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "id": 6,
+      "targets": [
+        {"expr": "max by (mp) (juicefs_object_request_uploading{vol_name=~\"$volume\"})", "legendFormat": "uploads {{mp}}"},
+        {"expr": "max by (mp) (juicefs_writeback_failed_uploads{vol_name=~\"$volume\"})", "legendFormat": "failures {{mp}}"}
+      ],
+      "title": "Upload utilization and failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 24},
+      "id": 7,
+      "targets": [
+        {"expr": "max by (mp) (juicefs_process_resident_memory_bytes{vol_name=~\"$volume\"})", "legendFormat": "RSS {{mp}}"},
+        {"expr": "max by (mp) (juicefs_go_memstats_sys_bytes{vol_name=~\"$volume\"})", "legendFormat": "Go sys {{mp}}"}
+      ],
+      "title": "JuiceFS process memory",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "cores"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 24},
+      "id": 8,
+      "targets": [{"expr": "sum by (mp) (rate(juicefs_process_cpu_seconds_total{vol_name=~\"$volume\"}[$__rate_interval]))", "legendFormat": "{{mp}}"}],
+      "title": "JuiceFS process CPU",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "Bps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 24},
+      "id": 9,
+      "targets": [
+        {"expr": "sum by (instance, device) (rate(node_disk_read_bytes_total[$__rate_interval]))", "legendFormat": "read {{instance}} {{device}}"},
+        {"expr": "sum by (instance, device) (rate(node_disk_written_bytes_total[$__rate_interval]))", "legendFormat": "write {{instance}} {{device}}"}
+      ],
+      "title": "Node disk bandwidth",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["juicefs", "orlop", "plori"],
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": false, "text": ".*", "value": ".*"},
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "definition": "label_values(juicefs_object_request_errors, vol_name)",
+        "includeAll": true,
+        "label": "Volume",
+        "name": "volume",
+        "query": {"query": "label_values(juicefs_object_request_errors, vol_name)", "refId": "StandardVariableQuery"},
+        "regex": "",
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "Plori / Orlop JuiceFS",
+  "uid": "plori-juicefs"
+}

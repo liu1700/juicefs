@@ -57,3 +57,6 @@ Plori CSI mounter 所需的最小镜像契约。
 生产部署必须使用 `build-info.json` 中的镜像摘要，不能使用可变标签。替换
 Community Edition mount 镜像时，应保持现有 Redis 元数据 URL、S3 bucket URL、
 凭据、挂载参数和挂载路径不变。
+
+新卷和灰度验证请使用 [Plori 不可变 chunk 配置](./plori_tuning.md)。它会明确记录
+block size 决策；任何候选变更都只能用于新格式化的卷。

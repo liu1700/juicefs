@@ -63,3 +63,7 @@ reason. Expired, duplicate, unused, or overly broad exceptions fail the build.
 Production manifests must use the image digest from `build-info.json`, not a
 mutable tag. Keep the existing Redis metadata URL, S3 bucket URL, credentials,
 mount flags, and mount path when replacing the Community Edition mount image.
+
+Use the [Plori immutable-chunk profile](./plori_tuning.md) for new volumes and
+canary validation. It makes the block-size decision explicit; any candidate
+change applies only to a newly formatted volume.
