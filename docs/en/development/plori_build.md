@@ -48,8 +48,17 @@ docker build -f Dockerfile.plori -t juicefs-plori:dev .
 ```
 
 The runtime image contains the static client, CA certificates, FUSE 3, a POSIX
-shell, and `tini`. This is the minimum image contract required by the Plori CSI
-mounter.
+shell, and `tini`. JuiceFS CSI v0.32 CE mount pods execute
+`/bin/mount.juicefs`, while its binary-upgrade job copies
+`/usr/local/bin/juicefs`. Both paths resolve to the same supported static
+client. Verify that exact image contract with:
+
+```shell
+hack/verify-plori-csi-image.sh juicefs-plori:dev
+```
+
+The verifier also checks the shell and core utilities used by the CSI mount-pod
+lifecycle. A successful check is required for pull-request and release images.
 
 ## Release and security contract
 

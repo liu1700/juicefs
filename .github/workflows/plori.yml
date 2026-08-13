@@ -12,6 +12,7 @@ on:
       - "hack/check_govulncheck_test.py"
       - "hack/install-plori-scanners.sh"
       - "hack/verify-plori-binary.sh"
+      - "hack/verify-plori-csi-image.sh"
       - "hack/verify_plori_release.py"
       - "hack/verify_plori_sbom.py"
       - "hack/verify_plori_scope.py"
@@ -133,6 +134,7 @@ jobs:
         run: |
           docker build -f Dockerfile.plori --build-arg VERSION=ci \
             --build-arg REVISION="$GITHUB_SHA" -t juicefs-plori:ci .
+          hack/verify-plori-csi-image.sh juicefs-plori:ci
           docker run --rm juicefs-plori:ci
           trivy image --scanners vuln --ignore-unfixed --severity HIGH,CRITICAL \
             --format json --output trivy-plori-image.json --exit-code 1 juicefs-plori:ci
@@ -269,6 +271,8 @@ jobs:
         run: |
           for platform in linux/amd64 linux/arm64; do
             arch="${platform#*/}"
+            hack/verify-plori-csi-image.sh \
+              "${{ steps.meta.outputs.image }}@${{ steps.image.outputs.digest }}" "$platform"
             trivy image --platform "$platform" --scanners vuln --ignore-unfixed \
               --severity HIGH,CRITICAL --exit-code 1 \
               --format json --output "dist/trivy-image-$arch.json" \

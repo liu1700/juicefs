@@ -34,11 +34,12 @@ class ScopeTest(unittest.TestCase):
             "Makefile",
             ".github/workflows/plori.yml",
             ".github/security/plori-support-policy.json",
+            "hack/verify-plori-csi-image.sh",
         ):
             source = ROOT / path
             target = self.root / path
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source, target)
+            shutil.copy2(source, target)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -63,6 +64,24 @@ class ScopeTest(unittest.TestCase):
         workflow = self.root / ".github/workflows/plori.yml"
         workflow.write_text(workflow.read_text() + "\n# mvn package\n", encoding="utf-8")
         self.assertTrue(any("excluded build" in error for error in scope.verify(self.root)))
+
+    def test_missing_csi_mount_helper_is_rejected(self):
+        dockerfile = self.root / "Dockerfile.plori"
+        dockerfile.write_text(
+            dockerfile.read_text().replace(
+                "    && ln -s /usr/local/bin/juicefs /bin/mount.juicefs\n", ""
+            ),
+            encoding="utf-8",
+        )
+        self.assertTrue(any("/bin/mount.juicefs" in error for error in scope.verify(self.root)))
+
+    def test_missing_csi_image_workflow_gate_is_rejected(self):
+        workflow = self.root / ".github/workflows/plori.yml"
+        workflow.write_text(
+            workflow.read_text().replace("hack/verify-plori-csi-image.sh", "true #"),
+            encoding="utf-8",
+        )
+        self.assertTrue(any("CSI image contract" in error for error in scope.verify(self.root)))
 
 
 class SbomTest(unittest.TestCase):
