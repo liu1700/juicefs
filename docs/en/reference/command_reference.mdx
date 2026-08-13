@@ -736,6 +736,30 @@ juicefs umount /mnt/jfs
 |-|-|
 |`-f, --force`|force unmount a busy mount point (default: false)|
 |`--flush` <VersionAdd>1.1</VersionAdd> |wait for all staging chunks to be flushed (default: false)|
+|`--flush-timeout value`|maximum time to wait for `--flush`; 0 means no timeout (default: 10m)|
+
+### `juicefs durability` {#durability}
+
+Wait for data staged by writeback mode to become durable in object storage, or
+inspect the current writeback status. The command must be run as root or as the
+user that owns the mount process.
+
+#### Synopsis
+
+```shell
+juicefs durability [command options] MOUNTPOINT
+
+juicefs durability --timeout 10m /mnt/jfs
+juicefs durability --status --json /mnt/jfs
+```
+
+#### Options
+
+|Items|Description|
+|-|-|
+|`--status`|show current writeback durability status without waiting|
+|`--timeout value`|maximum time to wait for the barrier; 0 means no timeout (default: 10m)|
+|`--json`|print the response as JSON|
 
 ### `juicefs gateway` {#gateway}
 

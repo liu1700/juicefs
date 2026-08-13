@@ -213,6 +213,22 @@ juicefs_staging_block_delay_seconds 46116860185.95535
 juicefs_staging_blocks 394  # 待上传的数据块数量
 ```
 
+在 writeback 模式下，`close()` 或 `fsync()` 成功只表示数据已经可通过
+JuiceFS 访问并安全暂存在本地缓存中，**不表示**数据已经持久化到对象存储。
+删除缓存、停止挂载，或把任务交给无法访问本地缓存的其他节点之前，应执行远端
+持久化屏障：
+
+```shell
+sudo juicefs durability --timeout 10m /jfs
+sudo juicefs durability --status /jfs
+```
+
+屏障会捕获当前 staging 代次，无视 `--upload-delay` 和 `--upload-hours`，
+强制上传该代次及更早的数据块，并等待对象存储的 `Put` 操作成功。屏障捕获后
+产生的新写入不会拖住本次等待。超时或持续上传失败时，命令会明确报错，并保留
+失败的 staging 文件以便稍后重试。只有 root 或挂载进程的所属用户可以调用该
+屏障。`juicefs umount --flush` 在卸载前使用同一个屏障。
+
 ### 缓存位置 {#cache-dir}
 
 取决于操作系统，JuiceFS 的默认缓存路径如下：

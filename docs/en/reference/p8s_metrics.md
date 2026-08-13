@@ -83,6 +83,11 @@ If you haven't yet set up monitoring for JuiceFS, read [monitoring and data visu
 | `juicefs_staging_blocks`                | Number of blocks in the staging path        |        |
 | `juicefs_staging_block_bytes`           | Total bytes of blocks in the staging path   | byte   |
 | `juicefs_staging_block_delay_seconds`   | Total seconds of delay for staging blocks   | second |
+| `juicefs_writeback_pending_blocks`      | Staged blocks not yet durable in object storage | |
+| `juicefs_writeback_pending_bytes`       | Staged bytes not yet durable in object storage | byte |
+| `juicefs_writeback_oldest_pending_age_seconds` | Age of the oldest block not yet durable | second |
+| `juicefs_writeback_failed_uploads`      | Failed staged-block upload attempts | |
+| `juicefs_writeback_last_successful_barrier_unixtime` | Unix time of the last successful durability barrier | second |
 
 ## Object storage {#object-storage}
 

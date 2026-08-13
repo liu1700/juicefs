@@ -209,6 +209,25 @@ juicefs_staging_block_delay_seconds 46116860185.95535
 juicefs_staging_blocks 394  # The number of data blocks to be uploaded
 ```
 
+In writeback mode, a successful `close()` or `fsync()` means the data is visible
+through JuiceFS and safely staged in the local cache. It does **not** mean the
+data is already durable in object storage. Before deleting the cache, stopping
+the mount, or handing a task to a node that cannot access this cache, run a
+remote durability barrier:
+
+```shell
+sudo juicefs durability --timeout 10m /jfs
+sudo juicefs durability --status /jfs
+```
+
+The barrier captures the current staging generation, forces those blocks to be
+uploaded regardless of `--upload-delay` or `--upload-hours`, and waits for the
+object storage `Put` operations to succeed. Writes staged after the generation
+was captured do not delay that barrier. The command returns an error on timeout
+or a persistent upload failure and leaves failed staging files intact for a
+later retry. Only root or the user that owns the mount process may invoke the
+barrier. `juicefs umount --flush` uses the same barrier before unmounting.
+
 ### Cache directory {#cache-dir}
 
 Depending on the operating system, the default cache path for JuiceFS is as follows:

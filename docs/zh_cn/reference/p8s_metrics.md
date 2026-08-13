@@ -83,6 +83,11 @@ sidebar_position: 4
 | `juicefs_staging_blocks`                | 暂存路径中的块数    |    |
 | `juicefs_staging_block_bytes`           | 暂存路径中块的总字节数 | 秒  |
 | `juicefs_staging_block_delay_seconds`   | 暂存块延迟的总秒数 | 秒  |
+| `juicefs_writeback_pending_blocks`      | 尚未持久化到对象存储的暂存块数量 | |
+| `juicefs_writeback_pending_bytes`       | 尚未持久化到对象存储的暂存数据量 | 字节 |
+| `juicefs_writeback_oldest_pending_age_seconds` | 最早未持久化暂存块的等待时间 | 秒 |
+| `juicefs_writeback_failed_uploads`      | 暂存块上传失败次数 | |
+| `juicefs_writeback_last_successful_barrier_unixtime` | 最近一次成功持久化屏障的 Unix 时间 | 秒 |
 
 ## 对象存储 {#object-storage}
 

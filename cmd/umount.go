@@ -53,6 +53,11 @@ $ juicefs umount /mnt/jfs`,
 				Name:  "flush",
 				Usage: "wait for all staging chunks to be flushed",
 			},
+			&cli.DurationFlag{
+				Name:  "flush-timeout",
+				Value: 10 * time.Minute,
+				Usage: "maximum time to wait for --flush (0 means no timeout)",
+			},
 		},
 	}
 }
@@ -114,19 +119,27 @@ func umount(ctx *cli.Context) error {
 			return errors.Wrap(err, "failed to parse config")
 		}
 		if conf.Chunk.Writeback {
-			stagingDir := path.Join(conf.Chunk.CacheDir, "rawstaging")
-			if err := waitWritebackComplete(stagingDir); err != nil {
-				return err
-			}
-			defer func() {
-				size, _ := fileSizeInDir(stagingDir)
-				clearLastLine()
-				if size == 0 {
-					fmt.Println("\rAll staging chunks are flushed")
-				} else {
-					fmt.Printf("\r%s staging chunks are not flushed\n", humanize.IBytes(size))
+			if _, err := requestRemoteDurability(mp, false, ctx.Duration("flush-timeout")); err != nil {
+				if !errors.Is(err, errDurabilityUnsupported) {
+					return err
 				}
-			}()
+				logger.Warn("mounted client does not support a remote durability barrier; using legacy staging-directory polling")
+				stagingDir := path.Join(conf.Chunk.CacheDir, "rawstaging")
+				if err := waitWritebackComplete(stagingDir); err != nil {
+					return err
+				}
+				defer func() {
+					size, _ := fileSizeInDir(stagingDir)
+					clearLastLine()
+					if size == 0 {
+						fmt.Println("\rAll staging chunks are flushed")
+					} else {
+						fmt.Printf("\r%s staging chunks are not flushed\n", humanize.IBytes(size))
+					}
+				}()
+			} else {
+				fmt.Println("All staging chunks are remotely durable")
+			}
 		}
 	}
 	return doUmount(mp, ctx.Bool("force"))

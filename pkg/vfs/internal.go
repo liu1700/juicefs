@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -217,6 +218,28 @@ type Obj struct {
 	Size, Off, Len uint32
 }
 
+type DurabilityResponse struct {
+	chunk.DurabilityStatus
+	Error string `json:"error,omitempty"`
+}
+
+func writeDurabilityResponse(out io.Writer, status chunk.DurabilityStatus, err error) {
+	resp := DurabilityResponse{DurabilityStatus: status}
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	data, marshalErr := json.Marshal(&resp)
+	if marshalErr != nil {
+		_, _ = out.Write([]byte{byte(syscall.EIO & 0xff)})
+		return
+	}
+	w := utils.NewBuffer(uint32(1 + 4 + len(data)))
+	w.Put8(meta.CDATA)
+	w.Put32(uint32(len(data)))
+	w.Put(data)
+	_, _ = out.Write(w.Bytes())
+}
+
 func CalcObjects(format meta.Format, id uint64, size, offset, length uint32) []*Obj {
 	if id == 0 {
 		return []*Obj{{"", size, offset, length}}
@@ -301,6 +324,51 @@ type chunkObj struct {
 
 func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
 	switch cmd {
+	case meta.RemoteDurability:
+		if ctx.Uid() != 0 && ctx.Uid() != uint32(utils.GetCurrentUID()) {
+			_, _ = out.Write([]byte{byte(syscall.EACCES & 0xff)})
+			return
+		}
+		store, ok := v.Store.(chunk.RemoteDurabilityStore)
+		if !ok {
+			_, _ = out.Write([]byte{byte(syscall.EOPNOTSUPP & 0xff)})
+			return
+		}
+		if r.Left() < 1 {
+			_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})
+			return
+		}
+		action := r.Get8()
+		if action == 1 {
+			if r.HasMore() {
+				_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})
+				return
+			}
+			writeDurabilityResponse(out, store.RemoteDurabilityStatus(), nil)
+			return
+		}
+		if action != 0 || r.Left() != 8 {
+			_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})
+			return
+		}
+		timeoutMillis := r.Get64()
+		if timeoutMillis > uint64((time.Duration(1<<63-1))/time.Millisecond) {
+			_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})
+			return
+		}
+		timeout := time.Duration(timeoutMillis) * time.Millisecond
+		if err := v.FlushAll(""); err != nil {
+			writeDurabilityResponse(out, store.RemoteDurabilityStatus(), fmt.Errorf("flush buffered data: %w", err))
+			return
+		}
+		barrierCtx := context.Context(ctx)
+		if timeout > 0 {
+			var cancel context.CancelFunc
+			barrierCtx, cancel = context.WithTimeout(barrierCtx, timeout)
+			defer cancel()
+		}
+		status, err := store.RemoteDurability(barrierCtx)
+		writeDurabilityResponse(out, status, err)
 	case meta.Rmr:
 		done := make(chan struct{})
 		inode := Ino(r.Get64())
