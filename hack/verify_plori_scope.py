@@ -164,6 +164,8 @@ def verify(root: pathlib.Path) -> list[str]:
         errors.append("Plori workflow does not verify the release directory allowlist")
     if workflow.count("hack/verify-plori-csi-image.sh") < 2:
         errors.append("Plori workflow must verify the CSI image contract before release")
+    if "hack/resolve_plori_platform_image.py" not in workflow:
+        errors.append("Plori workflow must resolve exact platform manifests before scanning")
     return errors
 
 

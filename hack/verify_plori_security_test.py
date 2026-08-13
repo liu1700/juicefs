@@ -22,6 +22,9 @@ def load_module(name: str, path: pathlib.Path):
 scope = load_module("verify_plori_scope", ROOT / "hack/verify_plori_scope.py")
 release = load_module("verify_plori_release", ROOT / "hack/verify_plori_release.py")
 sbom = load_module("verify_plori_sbom", ROOT / "hack/verify_plori_sbom.py")
+platform_image = load_module(
+    "resolve_plori_platform_image", ROOT / "hack/resolve_plori_platform_image.py"
+)
 
 
 class ScopeTest(unittest.TestCase):
@@ -150,6 +153,52 @@ class ReleaseTest(unittest.TestCase):
         (self.directory / "juicefs-hadoop.jar").write_bytes(b"test")
         errors = release.verify(self.directory, self.version, self.policy)
         self.assertTrue(any("unexpected release files" in error for error in errors))
+
+
+class PlatformImageTest(unittest.TestCase):
+    image = "ghcr.io/liu1700/juicefs-plori@sha256:" + "a" * 64
+
+    def document(self):
+        return {
+            "manifests": [
+                {
+                    "digest": "sha256:" + "b" * 64,
+                    "platform": {"os": "linux", "architecture": "amd64"},
+                },
+                {
+                    "digest": "sha256:" + "c" * 64,
+                    "platform": {"os": "linux", "architecture": "arm64"},
+                },
+                {
+                    "digest": "sha256:" + "d" * 64,
+                    "platform": {"os": "unknown", "architecture": "unknown"},
+                },
+            ]
+        }
+
+    def test_resolves_exact_platform_manifest(self):
+        self.assertEqual(
+            platform_image.resolve(self.document(), self.image, "linux/arm64"),
+            "ghcr.io/liu1700/juicefs-plori@sha256:" + "c" * 64,
+        )
+
+    def test_missing_platform_is_rejected(self):
+        document = self.document()
+        document["manifests"] = document["manifests"][:1]
+        with self.assertRaisesRegex(ValueError, "found 0"):
+            platform_image.resolve(document, self.image, "linux/arm64")
+
+    def test_duplicate_platform_is_rejected(self):
+        document = self.document()
+        document["manifests"].append(document["manifests"][0].copy())
+        with self.assertRaisesRegex(ValueError, "found 2"):
+            platform_image.resolve(document, self.image, "linux/amd64")
+
+    def test_mutable_index_reference_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "index digest"):
+            platform_image.resolve(
+                self.document(), "ghcr.io/liu1700/juicefs-plori:latest", "linux/amd64"
+            )
 
 
 if __name__ == "__main__":

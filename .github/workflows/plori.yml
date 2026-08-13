@@ -11,6 +11,7 @@ on:
       - "hack/check-govulncheck.py"
       - "hack/check_govulncheck_test.py"
       - "hack/install-plori-scanners.sh"
+      - "hack/resolve_plori_platform_image.py"
       - "hack/verify-plori-binary.sh"
       - "hack/verify-plori-csi-image.sh"
       - "hack/verify_plori_release.py"
@@ -269,16 +270,20 @@ jobs:
 
       - name: Scan published image
         run: |
+          image="${{ steps.meta.outputs.image }}@${{ steps.image.outputs.digest }}"
           for platform in linux/amd64 linux/arm64; do
             arch="${platform#*/}"
-            hack/verify-plori-csi-image.sh \
-              "${{ steps.meta.outputs.image }}@${{ steps.image.outputs.digest }}" "$platform"
+            platform_image="$(
+              docker buildx imagetools inspect --raw "$image" |
+                python3 hack/resolve_plori_platform_image.py "$image" "$platform"
+            )"
+            hack/verify-plori-csi-image.sh "$platform_image" "$platform"
             trivy image --platform "$platform" --scanners vuln --ignore-unfixed \
               --severity HIGH,CRITICAL --exit-code 1 \
               --format json --output "dist/trivy-image-$arch.json" \
-              "${{ steps.meta.outputs.image }}@${{ steps.image.outputs.digest }}"
+              "$platform_image"
             syft scan --platform "$platform" \
-              "registry:${{ steps.meta.outputs.image }}@${{ steps.image.outputs.digest }}" \
+              "registry:$platform_image" \
               -o "spdx-json=dist/juicefs-plori-container-$arch.spdx.json"
             python3 hack/verify_plori_sbom.py \
               "dist/juicefs-plori-container-$arch.spdx.json"
