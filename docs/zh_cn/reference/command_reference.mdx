@@ -732,6 +732,29 @@ juicefs umount /mnt/jfs
 |-|-|
 |`-f, --force`|强制卸载一个忙碌的文件系统 (默认：false)|
 |`--flush` <VersionAdd>1.1</VersionAdd>|等待所有暂存块被刷新 (默认值：false)|
+|`--flush-timeout value`|等待 `--flush` 的最长时间；0 表示不设超时（默认值：10m）|
+
+### `juicefs durability` {#durability}
+
+等待 writeback 模式暂存的数据持久化到对象存储，或查看当前写回状态。该命令
+只能由 root 或挂载进程的所属用户执行。
+
+#### 概要
+
+```shell
+juicefs durability [command options] MOUNTPOINT
+
+juicefs durability --timeout 10m /mnt/jfs
+juicefs durability --status --json /mnt/jfs
+```
+
+#### 参数
+
+|项 | 说明|
+|-|-|
+|`--status`|仅查看当前写回持久化状态，不等待|
+|`--timeout value`|等待屏障的最长时间；0 表示不设超时（默认值：10m）|
+|`--json`|以 JSON 输出结果|
 
 ### `juicefs gateway` {#gateway}
 

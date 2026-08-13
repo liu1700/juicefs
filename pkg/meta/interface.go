@@ -57,6 +57,8 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// RemoteDurability is a message to inspect or wait for writeback durability.
+	RemoteDurability = 1009
 )
 
 const (

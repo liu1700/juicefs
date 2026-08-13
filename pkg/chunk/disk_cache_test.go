@@ -523,7 +523,7 @@ func TestUnknownInodeStatsShouldNotMarkCacheAsRawFull(t *testing.T) {
 		require.Never(t, func() bool {
 			s.Lock()
 			defer s.Unlock()
-			return s.rawFull
+			return s.rawFull.Load()
 		}, 1500*time.Millisecond, 100*time.Millisecond)
 	})
 }

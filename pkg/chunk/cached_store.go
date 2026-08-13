@@ -49,7 +49,12 @@ type pendingItem struct {
 	key       string
 	fpath     string    // full path of local file corresponding to the key
 	ts        time.Time // timestamp when this item is added
+	seq       uint64
+	size      uint64
+	failures  uint64
+	lastError string
 	uploading atomic.Bool
+	forced    atomic.Bool
 }
 
 // slice for read and remove
@@ -440,21 +445,27 @@ func (s *wSlice) upload(indx int) {
 					logger.Warnf("write %s to disk: %s, upload it directly", key, err)
 				}
 			} else {
+				item := s.store.registerPending(key, stagingPath, time.Now())
 				s.errors <- nil
 				if s.store.conf.UploadDelay == 0 && s.store.canUpload() {
-					select {
-					case s.store.currentUpload <- struct{}{}:
-						defer func() { <-s.store.currentUpload }()
-						if err = s.store.upload(ctx, key, block, nil); err == nil {
-							s.store.bcache.uploaded(key, blen)
-							if err := s.store.bcache.removeStage(key); err != nil {
-								logger.Warnf("failed to remove stage %s in upload", stagingPath)
+					if item.uploading.CompareAndSwap(false, true) {
+						select {
+						case s.store.currentUpload <- struct{}{}:
+							defer func() { <-s.store.currentUpload }()
+							defer s.store.finishPendingUpload(item)
+							if err = s.store.upload(ctx, key, block, nil); err == nil {
+								s.store.bcache.uploaded(key, blen)
+								s.store.removePending(key, item)
+								if err := s.store.bcache.removeStage(key); err != nil {
+									logger.Warnf("failed to remove stage %s in upload", stagingPath)
+								}
+							} else {
+								s.store.recordPendingError(item, err)
 							}
-						} else { // add to delay list and wait for later scanning
-							s.store.addDelayedStaging(key, stagingPath, time.Now(), false)
+							return
+						default:
+							item.uploading.Store(false)
 						}
-						return
-					default:
 					}
 				}
 				block.Release()
@@ -674,6 +685,12 @@ type cachedStore struct {
 	pendingCh       chan *pendingItem
 	pendingKeys     map[string]*pendingItem
 	pendingMutex    sync.Mutex
+	pendingChanged  chan struct{}
+	nextPendingSeq  uint64
+	failedUploads   uint64
+	lastUploadError string
+	lastSuccessSeq  uint64
+	lastSuccessAt   time.Time
 	startHour       int
 	endHour         int
 	compressor      compress.Compressor
@@ -846,6 +863,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		seekable:        compressor.CompressBound(0) == 0,
 		pendingCh:       make(chan *pendingItem, 100*config.MaxUpload),
 		pendingKeys:     make(map[string]*pendingItem),
+		pendingChanged:  make(chan struct{}),
 		group:           NewController(),
 	}
 	if config.UploadLimit > 0 {
@@ -1013,6 +1031,21 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 		func() float64 {
 			return float64(len(store.currentUpload))
 		}))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{Name: "writeback_pending_blocks", Help: "number of staged blocks not yet durable in object storage"},
+		func() float64 { return float64(store.RemoteDurabilityStatus().PendingBlocks) }))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{Name: "writeback_pending_bytes", Help: "bytes staged but not yet durable in object storage"},
+		func() float64 { return float64(store.RemoteDurabilityStatus().PendingBytes) }))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{Name: "writeback_oldest_pending_age_seconds", Help: "age of the oldest staged block not yet durable in object storage"},
+		func() float64 { return float64(store.RemoteDurabilityStatus().OldestPendingAgeMillis) / 1000 }))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{Name: "writeback_failed_uploads", Help: "number of failed staged-block upload attempts"},
+		func() float64 { return float64(store.RemoteDurabilityStatus().FailedUploads) }))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{Name: "writeback_last_successful_barrier_unixtime", Help: "Unix time of the last successful remote durability barrier"},
+		func() float64 { return float64(store.RemoteDurabilityStatus().LastSuccessfulBarrierUnixMs) / 1000 }))
 }
 
 func (store *cachedStore) shouldCache(size int) bool {
@@ -1025,34 +1058,30 @@ func parseObjOrigSize(key string) int {
 	return l
 }
 
-func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
+func (store *cachedStore) uploadStagingFile(item *pendingItem) {
 	store.currentUpload <- struct{}{}
 	defer func() {
 		<-store.currentUpload
 	}()
+	defer store.finishPendingUpload(item)
 
-	store.pendingMutex.Lock()
-	item, ok := store.pendingKeys[key]
-	store.pendingMutex.Unlock()
-	if !ok {
-		logger.Debugf("Key %s is not needed, drop it", key)
-		return
-	}
-	defer func() {
-		item.uploading.Store(false)
-	}()
-
-	if !store.canUpload() {
+	if !store.isPendingValid(item.key, item) {
+		logger.Debugf("Key %s is not needed, drop it", item.key)
 		return
 	}
 
-	blen := parseObjOrigSize(key)
-	f, err := openCacheFile(stagingPath, blen, store.conf.CacheChecksum)
+	if !item.forced.Swap(false) && !store.canUpload() {
+		return
+	}
+
+	blen := int(item.size)
+	f, err := openCacheFile(item.fpath, blen, store.conf.CacheChecksum)
 	if err != nil {
-		if store.isPendingValid(key) {
-			logger.Errorf("Open staging file %s: %s", stagingPath, err)
+		if store.isPendingValid(item.key, item) {
+			store.recordPendingError(item, err)
+			logger.Errorf("Open staging file %s: %s", item.fpath, err)
 		} else {
-			logger.Debugf("Key %s is not needed, drop it", key)
+			logger.Debugf("Key %s is not needed, drop it", item.key)
 		}
 		return
 	}
@@ -1062,7 +1091,7 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	if err == nil {
 		footer := &stageFooter{}
 		if ferr := footer.unmarshal(f); ferr != nil {
-			logger.Warnf("Parse stage footer of %s failed, upload with default tier: %s", stagingPath, ferr)
+			logger.Warnf("Parse stage footer of %s failed, upload with default tier: %s", item.fpath, ferr)
 		} else {
 			tierID = footer.Tier
 		}
@@ -1070,45 +1099,75 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	_ = f.Close()
 	if err != nil {
 		block.Release()
-		logger.Errorf("Read staging file %s: %s", stagingPath, err)
+		store.recordPendingError(item, err)
+		logger.Errorf("Read staging file %s: %s", item.fpath, err)
 		return
 	}
-	if !store.isPendingValid(key) {
+	if !store.isPendingValid(item.key, item) {
 		block.Release()
-		logger.Debugf("Key %s is not needed, drop it", key)
+		logger.Debugf("Key %s is not needed, drop it", item.key)
 		return
 	}
 	ctx := context.WithValue(context.Background(), object.TierKey{}, tierID)
 	store.stageBlockDelay.Add(time.Since(item.ts).Seconds())
-	if err = store.upload(ctx, key, block, nil); err == nil {
-		if !store.isPendingValid(key) { // Delete leaked objects if it's already deleted by other goroutines
-			err := store.delete(key)
-			logger.Infof("Key %s is not needed, abandoned, err: %v", key, err)
+	if err = store.upload(ctx, item.key, block, nil); err == nil {
+		if !store.isPendingValid(item.key, item) { // Delete leaked objects if it's already deleted by other goroutines
+			err := store.delete(item.key)
+			logger.Infof("Key %s is not needed, abandoned, err: %v", item.key, err)
 		} else {
-			store.bcache.uploaded(key, blen)
-			store.removePending(key)
-			if err := store.bcache.removeStage(key); err != nil {
-				logger.Warnf("failed to remove stage %s, in upload staging file", stagingPath)
+			store.bcache.uploaded(item.key, blen)
+			store.removePending(item.key, item)
+			if err := store.bcache.removeStage(item.key); err != nil {
+				logger.Warnf("failed to remove stage %s, in upload staging file", item.fpath)
 			}
 		}
+	} else {
+		store.recordPendingError(item, err)
 	}
 }
 
-func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.Time, force bool) bool {
+func (store *cachedStore) signalPendingLocked() {
+	close(store.pendingChanged)
+	store.pendingChanged = make(chan struct{})
+}
+
+func (store *cachedStore) registerPending(key, stagingPath string, added time.Time) *pendingItem {
 	store.pendingMutex.Lock()
 	item := store.pendingKeys[key]
 	if item == nil {
-		item = &pendingItem{key, stagingPath, added, atomic.Bool{}}
+		size := parseObjOrigSize(key)
+		if size < 0 {
+			size = 0
+		}
+		store.nextPendingSeq++
+		item = &pendingItem{
+			key:   key,
+			fpath: stagingPath,
+			ts:    added,
+			seq:   store.nextPendingSeq,
+			size:  uint64(size),
+		}
 		store.pendingKeys[key] = item
+		store.signalPendingLocked()
 	}
 	store.pendingMutex.Unlock()
-	if force || store.canUpload() && time.Since(added) > store.conf.UploadDelay {
+	return item
+}
+
+func (store *cachedStore) queuePending(item *pendingItem, force bool) bool {
+	if force {
+		item.forced.Store(true)
+	}
+	if force || store.canUpload() && time.Since(item.ts) > store.conf.UploadDelay {
 		if item.uploading.CompareAndSwap(false, true) {
 			select {
 			case store.pendingCh <- item:
 				return true
 			default:
 				item.uploading.Store(false)
+				store.pendingMutex.Lock()
+				store.signalPendingLocked()
+				store.pendingMutex.Unlock()
 			}
 		} else {
 			return true
@@ -1117,17 +1176,43 @@ func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.
 	return false
 }
 
-func (store *cachedStore) removePending(key string) {
+func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.Time, force bool) bool {
+	return store.queuePending(store.registerPending(key, stagingPath, added), force)
+}
+
+func (store *cachedStore) finishPendingUpload(item *pendingItem) {
+	item.uploading.Store(false)
 	store.pendingMutex.Lock()
-	delete(store.pendingKeys, key)
+	store.signalPendingLocked()
 	store.pendingMutex.Unlock()
 }
 
-func (store *cachedStore) isPendingValid(key string) bool {
+func (store *cachedStore) recordPendingError(item *pendingItem, err error) {
+	store.pendingMutex.Lock()
+	if store.pendingKeys[item.key] == item {
+		item.failures++
+		item.lastError = err.Error()
+		store.failedUploads++
+		store.lastUploadError = item.lastError
+		store.signalPendingLocked()
+	}
+	store.pendingMutex.Unlock()
+}
+
+func (store *cachedStore) removePending(key string, expected ...*pendingItem) {
+	store.pendingMutex.Lock()
+	item := store.pendingKeys[key]
+	if item != nil && (len(expected) == 0 || item == expected[0]) {
+		delete(store.pendingKeys, key)
+		store.signalPendingLocked()
+	}
+	store.pendingMutex.Unlock()
+}
+
+func (store *cachedStore) isPendingValid(key string, item *pendingItem) bool {
 	store.pendingMutex.Lock()
 	defer store.pendingMutex.Unlock()
-	_, ok := store.pendingKeys[key]
-	return ok
+	return store.pendingKeys[key] == item
 }
 
 func (store *cachedStore) scanDelayedStaging() {
@@ -1136,19 +1221,21 @@ func (store *cachedStore) scanDelayedStaging() {
 	}
 	cutoff := time.Now().Add(-store.conf.UploadDelay)
 	store.pendingMutex.Lock()
-	defer store.pendingMutex.Unlock()
+	items := make([]*pendingItem, 0, len(store.pendingKeys))
 	for _, item := range store.pendingKeys {
-		store.pendingMutex.Unlock()
-		if item.ts.Before(cutoff) && item.uploading.CompareAndSwap(false, true) {
-			store.pendingCh <- item
+		if item.ts.Before(cutoff) {
+			items = append(items, item)
 		}
-		store.pendingMutex.Lock()
+	}
+	store.pendingMutex.Unlock()
+	for _, item := range items {
+		store.queuePending(item, false)
 	}
 }
 
 func (store *cachedStore) uploader() {
 	for it := range store.pendingCh {
-		store.uploadStagingFile(it.key, it.fpath)
+		store.uploadStagingFile(it)
 	}
 }
 
@@ -1159,6 +1246,92 @@ func (store *cachedStore) canUpload() bool {
 	h := time.Now().Hour()
 	return store.startHour < store.endHour && h >= store.startHour && h < store.endHour ||
 		store.startHour > store.endHour && (h >= store.startHour || h < store.endHour)
+}
+
+func (store *cachedStore) durabilityStatusLocked(fence uint64) DurabilityStatus {
+	status := DurabilityStatus{
+		Fence:                       fence,
+		FailedUploads:               store.failedUploads,
+		LastError:                   store.lastUploadError,
+		LastSuccessfulFence:         store.lastSuccessSeq,
+		LastSuccessfulBarrierUnixMs: store.lastSuccessAt.UnixMilli(),
+	}
+	if store.lastSuccessAt.IsZero() {
+		status.LastSuccessfulBarrierUnixMs = 0
+	}
+	now := time.Now()
+	var oldest time.Time
+	for _, item := range store.pendingKeys {
+		status.PendingBlocks++
+		status.PendingBytes += item.size
+		if oldest.IsZero() || item.ts.Before(oldest) {
+			oldest = item.ts
+		}
+	}
+	if !oldest.IsZero() {
+		status.OldestPendingAgeMillis = now.Sub(oldest).Milliseconds()
+	}
+	return status
+}
+
+func (store *cachedStore) RemoteDurabilityStatus() DurabilityStatus {
+	store.pendingMutex.Lock()
+	defer store.pendingMutex.Unlock()
+	return store.durabilityStatusLocked(store.nextPendingSeq)
+}
+
+func (store *cachedStore) RemoteDurability(ctx context.Context) (DurabilityStatus, error) {
+	store.pendingMutex.Lock()
+	fence := store.nextPendingSeq
+	baseline := make(map[uint64]uint64)
+	for _, item := range store.pendingKeys {
+		if item.seq <= fence {
+			baseline[item.seq] = item.failures
+		}
+	}
+	store.pendingMutex.Unlock()
+
+	for {
+		store.pendingMutex.Lock()
+		var targets []*pendingItem
+		var failed *pendingItem
+		for _, item := range store.pendingKeys {
+			if item.seq > fence {
+				continue
+			}
+			targets = append(targets, item)
+			if item.failures > baseline[item.seq] && failed == nil {
+				failed = item
+			}
+		}
+		if failed != nil {
+			status := store.durabilityStatusLocked(fence)
+			err := fmt.Errorf("remote durability fence %d failed for %s: %s", fence, failed.key, failed.lastError)
+			store.pendingMutex.Unlock()
+			return status, err
+		}
+		if len(targets) == 0 {
+			store.lastSuccessSeq = fence
+			store.lastSuccessAt = time.Now()
+			status := store.durabilityStatusLocked(fence)
+			store.pendingMutex.Unlock()
+			return status, nil
+		}
+		changed := store.pendingChanged
+		store.pendingMutex.Unlock()
+
+		for _, item := range targets {
+			store.queuePending(item, true)
+		}
+		select {
+		case <-ctx.Done():
+			store.pendingMutex.Lock()
+			status := store.durabilityStatusLocked(fence)
+			store.pendingMutex.Unlock()
+			return status, fmt.Errorf("remote durability fence %d: %w", fence, ctx.Err())
+		case <-changed:
+		}
+	}
 }
 
 func (store *cachedStore) NewReader(id uint64, length int) Reader {
@@ -1250,3 +1423,4 @@ func (store *cachedStore) BlobStorage() object.ObjectStorage {
 }
 
 var _ ChunkStore = (*cachedStore)(nil)
+var _ RemoteDurabilityStore = (*cachedStore)(nil)

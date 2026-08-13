@@ -154,6 +154,7 @@ func Main(args []string) error {
 			cmdInfo(),
 			cmdMount(),
 			cmdUmount(),
+			cmdDurability(),
 			cmdGateway(),
 			cmdWebDav(),
 			cmdBench(),

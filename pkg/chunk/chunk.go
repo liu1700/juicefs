@@ -48,3 +48,22 @@ type ChunkStore interface {
 	UpdateLimit(upload, download int64)
 	BlobStorage() object.ObjectStorage
 }
+
+// DurabilityStatus describes writeback data that has not reached object storage.
+type DurabilityStatus struct {
+	Fence                       uint64 `json:"fence"`
+	PendingBlocks               uint64 `json:"pendingBlocks"`
+	PendingBytes                uint64 `json:"pendingBytes"`
+	OldestPendingAgeMillis      int64  `json:"oldestPendingAgeMillis"`
+	FailedUploads               uint64 `json:"failedUploads"`
+	LastError                   string `json:"lastError,omitempty"`
+	LastSuccessfulFence         uint64 `json:"lastSuccessfulFence"`
+	LastSuccessfulBarrierUnixMs int64  `json:"lastSuccessfulBarrierUnixMs,omitempty"`
+}
+
+// RemoteDurabilityStore supports an explicit writeback barrier. Implementations
+// wait only for data staged before the barrier's fence was captured.
+type RemoteDurabilityStore interface {
+	RemoteDurability(context.Context) (DurabilityStatus, error)
+	RemoteDurabilityStatus() DurabilityStatus
+}

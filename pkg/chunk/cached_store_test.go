@@ -252,6 +252,156 @@ func TestForceUpload(t *testing.T) {
 	}
 }
 
+type controlledPutStore struct {
+	object.ObjectStorage
+	started chan string
+	release <-chan struct{}
+	fail    bool
+}
+
+func (s *controlledPutStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+	if s.started != nil {
+		s.started <- key
+	}
+	if s.release != nil {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if s.fail {
+		return errors.New("injected object upload failure")
+	}
+	return s.ObjectStorage.Put(ctx, key, in, getters...)
+}
+
+func newDurabilityTestStore(t *testing.T, blob object.ObjectStorage) ChunkStore {
+	t.Helper()
+	config := defaultConf
+	config.CacheDir = t.TempDir()
+	config.Writeback = true
+	config.WritebackThresholdSize = config.BlockSize + 1
+	config.UploadDelay = time.Hour
+	config.PutTimeout = 10 * time.Second
+	return NewCachedStore(blob, config, nil)
+}
+
+func writeDurabilityTestSlice(t *testing.T, store ChunkStore, id uint64, data []byte) {
+	t.Helper()
+	w := store.NewWriter(id, 0)
+	_, err := w.WriteAt(data, 0)
+	require.NoError(t, err)
+	require.NoError(t, w.Finish(len(data)))
+}
+
+func TestRemoteDurabilityFence(t *testing.T) {
+	mem, err := object.CreateStorage("mem", "", "", "", "")
+	require.NoError(t, err)
+	release := make(chan struct{})
+	controlled := &controlledPutStore{
+		ObjectStorage: mem,
+		started:       make(chan string, 4),
+		release:       release,
+	}
+	store := newDurabilityTestStore(t, controlled)
+	durable := store.(RemoteDurabilityStore)
+	data := bytes.Repeat([]byte("d"), defaultConf.BlockSize)
+
+	writeDurabilityTestSlice(t, store, 101, data)
+	status := durable.RemoteDurabilityStatus()
+	require.Equal(t, uint64(1), status.PendingBlocks)
+	select {
+	case key := <-controlled.started:
+		t.Fatalf("Finish unexpectedly waited for remote upload of %s", key)
+	default:
+	}
+
+	type barrierResult struct {
+		status DurabilityStatus
+		err    error
+	}
+	result := make(chan barrierResult, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		st, err := durable.RemoteDurability(ctx)
+		result <- barrierResult{st, err}
+	}()
+
+	select {
+	case <-controlled.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("durability fence did not force the delayed upload")
+	}
+	writeDurabilityTestSlice(t, store, 102, data)
+	select {
+	case got := <-result:
+		t.Fatalf("durability fence returned before the captured upload completed: %v", got.err)
+	default:
+	}
+	close(release)
+
+	got := <-result
+	require.NoError(t, got.err)
+	require.Equal(t, uint64(1), got.status.PendingBlocks, "writes after the captured fence must not delay it")
+	require.NotZero(t, got.status.LastSuccessfulBarrierUnixMs)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	got.status, got.err = durable.RemoteDurability(ctx)
+	require.NoError(t, got.err)
+	require.Zero(t, got.status.PendingBlocks)
+
+	require.NoError(t, store.EvictCache(101, uint32(len(data))))
+	p := NewPage(make([]byte, len(data)))
+	defer p.Release()
+	n, err := store.NewReader(101, len(data)).ReadAt(context.Background(), p, 0)
+	require.NoError(t, err)
+	require.Equal(t, len(data), n)
+	require.Equal(t, data, p.Data)
+}
+
+func TestRemoteDurabilityReportsUploadFailure(t *testing.T) {
+	mem, err := object.CreateStorage("mem", "", "", "", "")
+	require.NoError(t, err)
+	controlled := &controlledPutStore{ObjectStorage: mem, fail: true}
+	store := newDurabilityTestStore(t, controlled)
+	durable := store.(RemoteDurabilityStore)
+	writeDurabilityTestSlice(t, store, 103, []byte("failure"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	status, err := durable.RemoteDurability(ctx)
+	require.ErrorContains(t, err, "injected object upload failure")
+	require.Equal(t, uint64(1), status.PendingBlocks)
+	require.Equal(t, uint64(1), status.FailedUploads)
+	require.Contains(t, status.LastError, "injected object upload failure")
+}
+
+func TestRemoteDurabilityTimeout(t *testing.T) {
+	mem, err := object.CreateStorage("mem", "", "", "", "")
+	require.NoError(t, err)
+	release := make(chan struct{})
+	controlled := &controlledPutStore{ObjectStorage: mem, release: release}
+	store := newDurabilityTestStore(t, controlled)
+	durable := store.(RemoteDurabilityStore)
+	writeDurabilityTestSlice(t, store, 104, []byte("timeout"))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	status, err := durable.RemoteDurability(ctx)
+	cancel()
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, uint64(1), status.PendingBlocks)
+
+	close(release)
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	status, err = durable.RemoteDurability(ctx)
+	require.NoError(t, err)
+	require.Zero(t, status.PendingBlocks)
+}
+
 func TestStoreDelayed(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf
