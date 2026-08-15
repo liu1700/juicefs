@@ -67,6 +67,7 @@ jobs:
       - name: Checkout old version
         uses: actions/checkout@v3
         with:
+          repository: juicedata/juicefs
           ref: ${{matrix.old_juicefs_version}}
           path: ${{matrix.old_juicefs_version}}
 

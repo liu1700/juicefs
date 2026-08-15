@@ -19,7 +19,7 @@ on:
       - "hack/verify_plori_scope.py"
       - "hack/verify_plori_security_test.py"
       - "pkg/**"
-      - ".dockerignore"
+      - "Dockerfile.plori.dockerignore"
       - ".go-version"
       - "Dockerfile.plori"
       - "Makefile"
