@@ -25,7 +25,7 @@ class CommandOperation:
         self.name = name
         self.mp = mp
         self.root_dir = root_dir
-        self.meta_url = self.get_meta_url(mp)
+        self.meta_url = shlex.quote(self.get_meta_url(mp))
                 
     def guess_password(self, meta_url):
         if '****' not in meta_url:
