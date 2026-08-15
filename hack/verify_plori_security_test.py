@@ -32,7 +32,7 @@ class ScopeTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = pathlib.Path(self.temp.name)
         for path in (
-            ".dockerignore",
+            "Dockerfile.plori.dockerignore",
             "Dockerfile.plori",
             "Makefile",
             ".github/workflows/plori.yml",

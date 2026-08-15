@@ -139,11 +139,11 @@ def verify(root: pathlib.Path) -> list[str]:
 
     dockerignore = {
         line.strip()
-        for line in (root / ".dockerignore").read_text(encoding="utf-8").splitlines()
+        for line in (root / "Dockerfile.plori.dockerignore").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     }
     if dockerignore != EXPECTED_DOCKERIGNORE:
-        errors.append(".dockerignore must expose only the audited Plori Go build inputs")
+        errors.append("Dockerfile.plori.dockerignore must expose only the audited Plori Go build inputs")
 
     makefile = (root / "Makefile").read_text(encoding="utf-8")
     tags_match = re.search(r"^PLORI_TAGS\s*:=\s*(.+)$", makefile, re.MULTILINE)
