@@ -55,7 +55,7 @@ class CommandOperation:
         if '|' in command or '>' in command or '&' in command:
             output = subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=stderr)
         else:
-            output = subprocess.run(command.split(), check=True, stdout=subprocess.PIPE, stderr=stderr)
+            output = subprocess.run(shlex.split(command), check=True, stdout=subprocess.PIPE, stderr=stderr)
         return output.stdout.decode()
 
     def seteuid(self, user):
