@@ -53,15 +53,9 @@ class CommandOperation:
     def run_cmd(self, command:str, stderr=subprocess.STDOUT) -> str:
         self.logger.info(f'run_cmd: {command}')
         if '|' in command or '>' in command or '&' in command:
-            ret=os.system(command)
-            if ret == 0:
-                return ret
-            else: 
-                raise Exception(f"run command {command} failed with {ret}")
-        try:
+            output = subprocess.run(command, shell=True, check=True, stdout=subprocess.PIPE, stderr=stderr)
+        else:
             output = subprocess.run(command.split(), check=True, stdout=subprocess.PIPE, stderr=stderr)
-        except subprocess.CalledProcessError as e:
-            raise e
         return output.stdout.decode()
 
     def seteuid(self, user):
@@ -341,7 +335,7 @@ class CommandOperation:
     
     def do_config(self, capacity, inodes, trash_days, enable_acl, encrypt_secret, force, yes, user):
         try:
-            cmd = f'sudo -u {user} ./juicefs config {self.meta_url} --capacity {capacity} --inodes {inodes} --trash-days {trash_days} --enable-acl {enable_acl} --encrypt-secret {encrypt_secret}'
+            cmd = f'sudo -u {user} ./juicefs config {self.meta_url} --capacity {capacity} --inodes {inodes} --trash-days {trash_days} --enable-acl={enable_acl} --encrypt-secret={encrypt_secret}'
             if force:
                 cmd += ' --force'
             if yes:
