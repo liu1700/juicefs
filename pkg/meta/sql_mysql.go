@@ -66,6 +66,7 @@ func createMySQLEngine(dsn string) (*xorm.Engine, error) {
 		if err != nil {
 			return nil, fmt.Errorf("unable to create engine: %s", err)
 		}
+		setXormLogger(engine)
 
 		if err = engine.Ping(); err == nil {
 			return engine, nil

@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -412,6 +413,24 @@ func (m *dbMeta) initStatement() {
 
 var engineCreator = make(map[string]func(string) (*xorm.Engine, error))
 
+// setXormLogger sends xorm logs to stderr (stdout may carry command output,
+// e.g. `juicefs dump`) and makes xorm less verbose.
+func setXormLogger(engine *xorm.Engine) {
+	engine.SetLogger(log.NewSimpleLogger(os.Stderr))
+	switch logger.Level {
+	case logrus.TraceLevel:
+		engine.SetLogLevel(log.LOG_DEBUG)
+	case logrus.DebugLevel:
+		engine.SetLogLevel(log.LOG_INFO)
+	case logrus.InfoLevel, logrus.WarnLevel:
+		engine.SetLogLevel(log.LOG_WARNING)
+	case logrus.ErrorLevel:
+		engine.SetLogLevel(log.LOG_ERR)
+	default:
+		engine.SetLogLevel(log.LOG_OFF)
+	}
+}
+
 func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 	var searchPath string
 
@@ -493,18 +512,7 @@ func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 		return nil, fmt.Errorf("unable to use data source %s: %s", driver, err)
 	}
 
-	switch logger.Level { // make xorm less verbose
-	case logrus.TraceLevel:
-		engine.SetLogLevel(log.LOG_DEBUG)
-	case logrus.DebugLevel:
-		engine.SetLogLevel(log.LOG_INFO)
-	case logrus.InfoLevel, logrus.WarnLevel:
-		engine.SetLogLevel(log.LOG_WARNING)
-	case logrus.ErrorLevel:
-		engine.SetLogLevel(log.LOG_ERR)
-	default:
-		engine.SetLogLevel(log.LOG_OFF)
-	}
+	setXormLogger(engine)
 	start := time.Now()
 	if err = engine.Ping(); err != nil {
 		return nil, fmt.Errorf("ping database: %s", err)
