@@ -3,6 +3,9 @@ source .github/scripts/common/common.sh
 
 [[ -z "$META" ]] && META=sqlite3
 [[ -z "$SUBDIR" ]] && SUBDIR=false
+# the IAM of the gateway is reloaded from the volume every 5 minutes by default,
+# which makes the random test compare a stale policy/user list against MinIO
+export MINIO_REFRESH_IAM_INTERVAL=3s
 source .github/scripts/start_meta_engine.sh
 start_meta_engine $META
 META_URL=$(get_meta_url $META)

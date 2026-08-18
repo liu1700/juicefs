@@ -379,6 +379,61 @@ func TestResolveRelativeSymlinkAfterRedirection(t *testing.T) {
 	}
 }
 
+func TestResolveHardlinkedSymlinkIsNotALoop(t *testing.T) {
+	fs := createTestFS(t)
+	ctx := meta.NewContext(1, 1, []uint32{2})
+
+	f, err := fs.Create(ctx, "/b", 0666, 022)
+	if err != 0 {
+		t.Fatalf("create /b: %s", err)
+	}
+	if err := f.Close(ctx); err != 0 {
+		t.Fatalf("close /b: %s", err)
+	}
+	if err := fs.Mkdir(ctx, "/a", 0777, 022); err != 0 {
+		t.Fatalf("mkdir /a: %s", err)
+	}
+	if err := fs.Symlink(ctx, "b", "/aa"); err != 0 {
+		t.Fatalf("symlink /aa: %s", err)
+	}
+	if err := fs.Symlink(ctx, "../aa", "/a/b"); err != 0 {
+		t.Fatalf("symlink /a/b: %s", err)
+	}
+	// /a/a and /aa share the same symlink inode, but resolving through both
+	// makes progress because their relative target is resolved in different
+	// directories: /a/a -> /a/b -> /aa -> /b
+	if err := fs.Link(ctx, "/aa", "/a/a"); err != 0 {
+		t.Fatalf("link /a/a: %s", err)
+	}
+	if fi, err := fs.Stat(ctx, "/a/a"); err != 0 {
+		t.Fatalf("stat /a/a: %s", err)
+	} else if fi.IsSymlink() || fi.name != "a" {
+		t.Fatalf("unexpected stat of /a/a: %+v", fi)
+	}
+}
+
+func TestResolveSymlinkLoopReturnsELOOP(t *testing.T) {
+	fs := createTestFS(t)
+	ctx := meta.NewContext(1, 1, []uint32{2})
+
+	if err := fs.Symlink(ctx, "self", "/self"); err != 0 {
+		t.Fatalf("symlink /self: %s", err)
+	}
+	if _, err := fs.Stat(ctx, "/self"); err != syscall.ELOOP {
+		t.Fatalf("stat /self: expect ELOOP, got %s", err)
+	}
+
+	if err := fs.Symlink(ctx, "loop2", "/loop1"); err != 0 {
+		t.Fatalf("symlink /loop1: %s", err)
+	}
+	if err := fs.Symlink(ctx, "loop1", "/loop2"); err != 0 {
+		t.Fatalf("symlink /loop2: %s", err)
+	}
+	if _, err := fs.Stat(ctx, "/loop1"); err != syscall.ELOOP {
+		t.Fatalf("stat /loop1: expect ELOOP, got %s", err)
+	}
+}
+
 func createTestFS(t testing.TB) *FileSystem {
 	m := meta.NewClient("memkv://", nil)
 	format := &meta.Format{

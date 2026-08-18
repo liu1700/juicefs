@@ -887,11 +887,17 @@ func (fs *FileSystem) lookup(ctx meta.Context, parent Ino, name string, inode *I
 	return err
 }
 
+// maxSymlinkDepth is the number of symlinks followed while resolving one path,
+// the same limit as Linux (SYMLOOP_MAX). Hard links may make the same symlink
+// inode appear more than once in a chain that still terminates, so the depth,
+// not the visited inodes, decides when to give up.
+const maxSymlinkDepth = 40
+
 func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool) (fi *FileStat, err syscall.Errno) {
-	return fs.doResolve(ctx, p, followLastSymlink, make(map[Ino]struct{}))
+	return fs.doResolve(ctx, p, followLastSymlink, 0)
 }
 
-func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bool, visited map[Ino]struct{}) (fi *FileStat, err syscall.Errno) {
+func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bool, depth int) (fi *FileStat, err syscall.Errno) {
 	p = path.Clean(p)
 
 	// Check if path is allowed by any of the configured subdirs
@@ -967,11 +973,9 @@ func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bo
 		}
 		fi = AttrToFileInfo(inode, attr)
 		if (!isLastComponent || followLastSymlink) && fi.IsSymlink() {
-			if _, ok := visited[inode]; ok {
-				logger.Errorf("find a loop symlink: %d", inode)
+			if depth >= maxSymlinkDepth {
+				logger.Errorf("too many levels of symbolic links: %s", p)
 				return nil, syscall.ELOOP
-			} else {
-				visited[inode] = struct{}{}
 			}
 			var buf []byte
 			err = fs.m.ReadLink(ctx, inode, &buf)
@@ -1004,7 +1008,7 @@ func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bo
 			if !isLastComponent {
 				target += "/" + strings.Join(ss[i+1:], "/")
 			}
-			fi, err = fs.doResolve(ctx, target, followLastSymlink, visited)
+			fi, err = fs.doResolve(ctx, target, followLastSymlink, depth+1)
 			if err == 0 && isLastComponent {
 				fi.name = name
 			}
