@@ -22,15 +22,46 @@ retry() {
     done
 }
 
+# tcli exits 0 even when its command failed, and it can block for 20 minutes when
+# the cluster is only half up, so ask PD directly instead of trusting tcli alone.
+tikv_ready(){
+    local stores
+    curl -fsS --max-time 5 http://127.0.0.1:2379/pd/api/v1/health >/dev/null 2>&1 || return 1
+    stores=$(curl -fsS --max-time 5 http://127.0.0.1:2379/pd/api/v1/stores 2>/dev/null) || return 1
+    if ! echo "$stores" | grep -qE '"state_name":[[:space:]]*"Up"'; then
+        return 1
+    fi
+    echo 'head -1' > /tmp/head.txt
+    if ! timeout 30 tcli -pd 127.0.0.1:2379 < /tmp/head.txt > /tmp/tcli.out 2>&1; then
+        tail -5 /tmp/tcli.out || true
+        return 1
+    fi
+    if grep -q "Error:" /tmp/tcli.out; then
+        tail -5 /tmp/tcli.out || true
+        return 1
+    fi
+    return 0
+}
+
+stop_tiup_playground(){
+    pkill -9 -f 'tiup-playground' 2>/dev/null || true
+    pkill -9 -f 'component playground' 2>/dev/null || true
+    for p in pd-server tikv-server tidb-server tiflash; do
+        pkill -9 -x $p 2>/dev/null || true
+    done
+    sleep 3
+}
+
 install_tikv(){
     [[ ! -d tcli ]] && git clone https://github.com/c4pt0r/tcli
     make -C tcli && sudo cp tcli/bin/tcli /usr/local/bin
     # retry because of: https://github.com/pingcap/tiup/issues/2057
-    echo 'head -1' > /tmp/head.txt
-    if lsof -i:2379 && pgrep pd-server && tcli -pd 127.0.0.1:2379 < /tmp/head.txt; then
+    if tikv_ready; then
         echo "TiKV is already running and healthy"
         return 0
     fi
+    # a half-started cluster keeps the ports busy and makes the next attempt fail too
+    stop_tiup_playground
     user=$(whoami)
     echo user is $user
     if [[ "$user" == "root" ]]; then
@@ -43,42 +74,46 @@ install_tikv(){
         tiup=/home/runner/.tiup/bin/tiup
     else
         echo "Unknown user $user"
-        exit 1
+        return 1
     fi
     echo tiup is $tiup
     echo $(whoami) $(pwd)
     # TODO update to latest TiDB 
     $tiup playground 8.5.5 --mode tikv-slim > tikv.log 2>&1  &
     pid=$!
-    timeout=60
-    count=0
+    timeout=180
+    deadline=$((SECONDS+timeout))
     while true; do
         # Check if tiup playground process is still alive
         if ! kill -0 $pid 2>/dev/null; then
             echo "tiup playground process (pid=$pid) exited unexpectedly."
             echo "=== tikv.log ==="
             cat tikv.log || true
-            exit 1
+            stop_tiup_playground
+            return 1
         fi
-        echo 'head -1' > /tmp/head.txt
-        lsof -i:2379 && pgrep pd-server && tcli -pd 127.0.0.1:2379 < /tmp/head.txt && exit_code=0 || exit_code=$?
-        if [ $exit_code -eq 0 ]; then
+        if tikv_ready; then
             echo "TiKV is running."
-            exit 0
+            return 0
         fi
         sleep 1
-        count=$((count+1))
-        if [ $count -eq $timeout ]; then
+        if [ $SECONDS -ge $deadline ]; then
             echo "TiKV failed to start within $timeout seconds."
             echo "=== tikv.log ==="
             tail -50 tikv.log || true
             kill -9 $pid || true
-            exit 1
+            stop_tiup_playground
+            return 1
         fi
     done
 }
 
 install_tidb(){
+    if timeout 10 mysql --connect-timeout=5 -h127.0.0.1 -P4000 -uroot -e "select version();"; then
+        echo "TiDB is already running"
+        return 0
+    fi
+    stop_tiup_playground
     user=$(whoami)
     echo user is $user
     if [[ "$user" == "root" ]]; then
@@ -89,26 +124,34 @@ install_tidb(){
         tiup=/home/runner/.tiup/bin/tiup
     else
         echo "Unknown user $user"
-        exit 1
+        return 1
     fi
     echo tiup is $tiup
     
     $tiup playground 8.5.5 > tidb.log 2>&1  &
     pid=$!
-    timeout=60
-    count=0
+    timeout=180
+    deadline=$((SECONDS+timeout))
     while true; do
-        lsof -i:4000 && pgrep pd-server && mysql -h127.0.0.1 -P4000 -uroot -e "select version();" && exit_code=0 || exit_code=$?
-        if [ $exit_code -eq 0 ]; then
+        if ! kill -0 $pid 2>/dev/null; then
+            echo "tiup playground process (pid=$pid) exited unexpectedly."
+            echo "=== tidb.log ==="
+            cat tidb.log || true
+            stop_tiup_playground
+            return 1
+        fi
+        if timeout 10 mysql --connect-timeout=5 -h127.0.0.1 -P4000 -uroot -e "select version();"; then
             echo "TiDB is running."
-            exit 0
+            return 0
         fi
         sleep 1
-        count=$((count+1))
-        if [ $count -eq $timeout ]; then
+        if [ $SECONDS -ge $deadline ]; then
             echo "TiDB failed to start within $timeout seconds."
+            echo "=== tidb.log ==="
+            tail -50 tidb.log || true
             kill -9 $pid || true
-            exit 1
+            stop_tiup_playground
+            return 1
         fi
     done
 }
