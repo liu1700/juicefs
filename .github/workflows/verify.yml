@@ -29,6 +29,10 @@ on:
   schedule:
     - cron: "0 17 * * 0"
 
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   lint:
     runs-on: ubuntu-22.04
@@ -57,6 +61,9 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v3
+
+      - name: Configure fast APT mirror
+        uses: vegardit/fast-apt-mirror.sh@1.4.5
 
       - name: Set up Go
         uses: actions/setup-go@v3

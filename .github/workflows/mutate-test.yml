@@ -24,6 +24,10 @@ on:
         required: false
         default: false  
 
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
 
   build-matrix:
@@ -33,10 +37,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Configure fast APT mirror
+        uses: vegardit/fast-apt-mirror.sh@1.4.5
+
       - name: Set up Go
         uses: actions/setup-go@v3
         with:
-          go-version: 'oldstable'
+          go-version: '1.25.0'
 
       - name: install go-mutesting
         run: |

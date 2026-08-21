@@ -23,6 +23,10 @@ on:
   schedule:
     - cron:  '0 20 * * *'        
 
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   chaos-test:
     timeout-minutes: 60
@@ -39,9 +43,12 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Configure fast APT mirror
+        uses: vegardit/fast-apt-mirror.sh@1.4.5
+
       - uses: actions/setup-go@v3
         with:
-          go-version: 'oldstable'
+          go-version: '1.25.0'
           cache: true
 
       - name: Build
