@@ -35,7 +35,10 @@ hack/verify-plori-binary.sh ./juicefs.plori
 ```
 
 `make test.plori.profile` fails if any metadata engine other than Redis or any
-object storage driver other than S3 is registered. The binary verifier also
+remote object storage driver other than S3 is registered. The local `file`
+backend stays registered on purpose: `vfs.Backup` stages every `--backup-meta`
+metadata dump through it before uploading, and `juicefs sync` resolves local
+paths with it (issue #27). The binary verifier also
 rejects dependencies belonging to excluded backend families. The security
 test verifies the restricted Docker build context, `nohdfs` build tag,
 workflow commands, SBOM denylist, and release-file allowlist.

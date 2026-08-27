@@ -30,8 +30,10 @@ make test.plori.security
 hack/verify-plori-binary.sh ./juicefs.plori
 ```
 
-如果运行时注册了 Redis 以外的元数据引擎或 S3 以外的对象存储，
-`make test.plori.profile` 会失败。二进制验证脚本还会拒绝被裁剪后端家族的依赖。
+如果运行时注册了 Redis 以外的元数据引擎或 S3 以外的远端对象存储，
+`make test.plori.profile` 会失败。本地 `file` 后端是有意保留的：
+`vfs.Backup` 的每次 `--backup-meta` 元数据备份都要先经它落盘再上传，
+`juicefs sync` 的本地路径也依赖它（issue #27）。二进制验证脚本还会拒绝被裁剪后端家族的依赖。
 安全测试会验证受限的 Docker 构建上下文、`nohdfs` 构建标签、工作流命令、
 SBOM 拒绝清单和发布文件白名单。
 
