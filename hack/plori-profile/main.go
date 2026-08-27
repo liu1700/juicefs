@@ -39,8 +39,13 @@ func main() {
 		require("metadata", name, meta.IsSupported(name), false)
 	}
 	require("object storage", "s3", object.IsSupported("s3"), true)
+	// `file` is not a remote backend: vfs.Backup stages every metadata dump
+	// through CreateStorage("file", ...) before uploading it, so the profile
+	// must keep it registered (issue #27 — excluding it silently disabled
+	// --backup-meta in production).
+	require("object storage", "file", object.IsSupported("file"), true)
 	for _, name := range []string{
-		"azure", "b2", "bos", "cifs", "cos", "dragonfly", "eos", "etcd", "file", "gs", "hdfs",
+		"azure", "b2", "bos", "cifs", "cos", "dragonfly", "eos", "etcd", "gs", "hdfs",
 		"ibmcos", "jfs", "ks3", "mem", "minio", "mysql", "nfs", "obs", "oos", "oss", "postgres",
 		"qingstor", "qiniu", "redis", "scw", "sftp", "space", "sqlite3", "storj", "swift", "tikv",
 		"tos", "ufile", "wasabi", "webdav",
@@ -50,5 +55,5 @@ func main() {
 	if failed {
 		os.Exit(1)
 	}
-	fmt.Println("Plori build profile exposes only Redis metadata and S3 object storage")
+	fmt.Println("Plori build profile exposes only Redis metadata and S3 remote object storage (plus the local file backend that vfs.Backup and sync stage through)")
 }
