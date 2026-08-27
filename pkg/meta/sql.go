@@ -276,7 +276,7 @@ type dbMeta struct {
 	spool *sync.Pool
 	snap  *dbSnap
 
-	noReadOnlyTxn bool
+	noReadOnlyTxn atomic.Bool
 	statement     map[string]string
 	tablePrefix   string
 }
@@ -1280,7 +1280,7 @@ func (m *dbMeta) roTxn(ctx context.Context, f func(s *xorm.Session) error) error
 	s := m.db.NewSession()
 	defer s.Close()
 	var opt sql.TxOptions
-	if !m.noReadOnlyTxn {
+	if !m.noReadOnlyTxn.Load() {
 		opt.ReadOnly = true
 		opt.Isolation = sql.LevelRepeatableRead
 	}
@@ -1305,7 +1305,7 @@ func (m *dbMeta) roTxn(ctx context.Context, f func(s *xorm.Session) error) error
 		err := s.BeginTx(&opt)
 		if err != nil && opt.ReadOnly && (strings.Contains(err.Error(), "READ") || strings.Contains(err.Error(), "driver does not support read-only transactions")) {
 			logger.Warnf("the database does not support read-only transaction")
-			m.noReadOnlyTxn = true
+			m.noReadOnlyTxn.Store(true)
 			opt = sql.TxOptions{} // use default level
 			err = s.BeginTx(&opt)
 		}
@@ -2442,6 +2442,8 @@ func (m *dbMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				}
 			} else if de.Inode == se.Inode {
 				return nil
+			} else if ctx.Uid() != 0 && spn.Mode&01000 != 0 && ctx.Uid() != spn.Uid && ctx.Uid() != sn.Uid {
+				return syscall.EACCES
 			} else if se.Type == TypeDirectory && de.Type != TypeDirectory {
 				return syscall.ENOTDIR
 			} else if de.Type == TypeDirectory {
@@ -2801,7 +2803,6 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		n         *node  // n edges : 1 inode
 		trashName string // cached trash entry name when hard links go to trash
 	}
-	var entryInfos []*entryInfo
 	type dNode struct {
 		opened bool
 		length uint64
@@ -2825,11 +2826,15 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		var batchDirLength, batchDirSpace, batchDirInodes int64
 		var batchTrashLength, batchTrashSpace, batchTrashInodes int64
 		var deltas ugQuotaDeltas
+		var batchDelNodes map[Ino]*dNode
+		var invalidatedInodes map[Ino]struct{}
 		err := m.txn(func(s *xorm.Session) error {
 			batchDirLength, batchDirSpace, batchDirInodes = 0, 0, 0
 			batchFsSpace, batchFsInodes = 0, 0
 			batchTrashLength, batchTrashSpace, batchTrashInodes = 0, 0, 0
 			deltas = make(ugQuotaDeltas)
+			batchDelNodes = make(map[Ino]*dNode)
+			invalidatedInodes = make(map[Ino]struct{})
 			pn := node{Inode: parent}
 			ok, err := s.Get(&pn)
 			if err != nil {
@@ -2850,7 +2855,7 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 				return syscall.EPERM
 			}
 			now := time.Now().UnixNano()
-			entryInfos = make([]*entryInfo, 0, len(batch))
+			entryInfos := make([]*entryInfo, 0, len(batch))
 			names := make([][]byte, 0, len(batch))
 			for _, entry := range batch {
 				names = append(names, entry.Name)
@@ -2943,7 +2948,7 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 					if m.sid > 0 {
 						opened = m.of.IsOpen(info.n.Inode)
 					}
-					delNodes[info.n.Inode] = &dNode{opened, info.n.Length}
+					batchDelNodes[info.n.Inode] = &dNode{opened, info.n.Length}
 				}
 			}
 
@@ -2990,7 +2995,7 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 						switch info.n.Type {
 						case TypeFile:
 							entrySpace = align4K(info.n.Length)
-							if dnode, ok := delNodes[info.n.Inode]; ok && dnode.opened {
+							if dnode, ok := batchDelNodes[info.n.Inode]; ok && dnode.opened {
 								sustainedIns = append(sustainedIns, &sustained{Sid: m.sid, Inode: info.e.Inode})
 								if _, err := s.Cols("nlink", "ctime", "ctimensec").Update(info.n, &node{Inode: info.n.Inode}); err != nil {
 									return err
@@ -3029,7 +3034,7 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 						}
 						xattrsDel = append(xattrsDel, info.e.Inode)
 					}
-					m.of.InvalidateChunk(info.e.Inode, invalidateAttrOnly)
+					invalidatedInodes[info.e.Inode] = struct{}{}
 				}
 				if info.n.Nlink > 0 && info.trash > 0 {
 					// still has links and should be moved to trash; create new trash edge
@@ -3130,6 +3135,12 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 
 		if err != nil {
 			return errno(err)
+		}
+		for inode, info := range batchDelNodes {
+			delNodes[inode] = info
+		}
+		for inode := range invalidatedInodes {
+			m.of.InvalidateChunk(inode, invalidateAttrOnly)
 		}
 
 		delta.length += batchDirLength
@@ -3969,9 +3980,6 @@ func (m *dbMeta) scanAllChunks(ctx Context, ch chan<- cchunk, bar *utils.Bar) er
 }
 
 func (m *dbMeta) ScanSlices(ctx Context, opt *ScanSlicesOption, fn func(Ino, Slice) error) syscall.Errno {
-	if opt.Delete {
-		_ = m.doCleanupSlices(ctx, nil)
-	}
 	err := m.simpleTxn(ctx, func(s *xorm.Session) error {
 		var cs []chunk
 		err := s.Find(&cs)
@@ -4054,8 +4062,9 @@ func (m *dbMeta) scanTrashSlices(ctx Context, scan trashSliceScan) error {
 	}
 	var ss []Slice
 	for _, ds := range dss {
-		var clean bool
+		var claimed bool
 		err = m.txn(func(tx *xorm.Session) error {
+			claimed = false
 			ss = ss[:0]
 			del := delslices{Id: ds.Id}
 			found, err := tx.Get(&del)
@@ -4066,25 +4075,38 @@ func (m *dbMeta) scanTrashSlices(ctx Context, scan trashSliceScan) error {
 				return nil
 			}
 			m.decodeDelayedSlices(del.Slices, &ss)
-			clean, err = scan(ss, del.Deleted)
+			clean, err := scan(ss, del.Deleted)
 			if err != nil {
 				return err
 			}
-			if clean {
-				for _, s := range ss {
-					if _, e := tx.Exec(m.sqlConv("update chunk_ref set refs=refs-1 where chunkid=? AND size=?"), s.Id, s.Size); e != nil {
-						return e
-					}
-				}
-				_, err = tx.Delete(del)
-				m.genLog(ctx, tx, time.Now().UnixNano(), "CLEANUP_TRASH_SLICES(%d,%d)", del.Id, del.Deleted)
+			if !clean {
+				return nil
 			}
-			return err
+
+			// Deleting the delayed row claims cleanup; rollback restores it on failure.
+			affected, err := tx.Delete(&delslices{Id: del.Id})
+			if err != nil {
+				return errors.Wrapf(err, "claim delayed slice %d", del.Id)
+			}
+			if affected == 0 {
+				return nil
+			}
+			if affected != 1 {
+				return fmt.Errorf("delete delayed slice %d affected %d rows", del.Id, affected)
+			}
+			for _, s := range ss {
+				if _, e := tx.Exec(m.sqlConv("update chunk_ref set refs=refs-1 where chunkid=? AND size=?"), s.Id, s.Size); e != nil {
+					return e
+				}
+			}
+			m.genLog(ctx, tx, time.Now().UnixNano(), "CLEANUP_TRASH_SLICES(%d,%d)", del.Id, del.Deleted)
+			claimed = true
+			return nil
 		})
 		if err != nil {
 			return err
 		}
-		if clean {
+		if claimed {
 			for _, s := range ss {
 				var ref = sliceRef{Id: s.Id}
 				err := m.simpleTxn(ctx, func(tx *xorm.Session) error {
@@ -4254,6 +4276,9 @@ func (m *dbMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno 
 
 func (m *dbMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
 	return errno(m.txn(func(s *xorm.Session) error {
+		if err := m.getNodesForUpdate(s, &node{Inode: inode}); err != nil {
+			return err
+		}
 		var k = &xattr{Inode: inode, Name: name}
 		var x = xattr{Inode: inode, Name: name, Value: value}
 		ok, err := s.ForUpdate().Get(k)
@@ -4289,6 +4314,9 @@ func (m *dbMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 
 func (m *dbMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
 	return errno(m.txn(func(s *xorm.Session) error {
+		if err := m.getNodesForUpdate(s, &node{Inode: inode}); err != nil {
+			return err
+		}
 		n, err := s.Delete(&xattr{Inode: inode, Name: name})
 		if err != nil {
 			return err

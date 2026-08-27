@@ -2488,16 +2488,8 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 		if err := tx.Watch(ctx, keys...).Err(); err != nil {
 			return err
 		}
-		if dino > 0 {
-			if ino == dino {
-				return errno(nil)
-			}
-			if exchange {
-			} else if typ == TypeDirectory && dtyp != TypeDirectory {
-				return syscall.ENOTDIR
-			} else if typ != TypeDirectory && dtyp == TypeDirectory {
-				return syscall.EISDIR
-			}
+		if dino > 0 && ino == dino {
+			return errno(nil)
 		}
 
 		keys = []string{m.inodeKey(parentSrc), m.inodeKey(parentDst), m.inodeKey(ino)}
@@ -2540,6 +2532,15 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 		if parentSrc != parentDst && sattr.Mode&0o1000 != 0 && ctx.Uid() != 0 &&
 			ctx.Uid() != iattr.Uid && (ctx.Uid() != sattr.Uid || iattr.Typ == TypeDirectory) {
 			return syscall.EACCES
+		}
+		if dino > 0 && !exchange {
+			if ctx.Uid() != 0 && sattr.Mode&01000 != 0 && ctx.Uid() != sattr.Uid && ctx.Uid() != iattr.Uid {
+				return syscall.EACCES
+			} else if typ == TypeDirectory && dtyp != TypeDirectory {
+				return syscall.ENOTDIR
+			} else if typ != TypeDirectory && dtyp == TypeDirectory {
+				return syscall.EISDIR
+			}
 		}
 
 		var supdate, dupdate bool
@@ -3427,7 +3428,7 @@ func (m *redisMeta) doGetDirStat(ctx Context, ino Ino, trySync bool) (*dirStat, 
 		return nil, errno(errSpace)
 	}
 	usedInodes, errInodes := m.rdb.HGet(ctx, m.dirUsedInodesKey(), field).Int64()
-	if errInodes != nil && errSpace != redis.Nil {
+	if errInodes != nil && errInodes != redis.Nil {
 		return nil, errno(errInodes)
 	}
 	if errLength != redis.Nil && errSpace != redis.Nil && errInodes != redis.Nil {
@@ -3987,14 +3988,15 @@ func (m *redisMeta) hscanToMap(ctx context.Context, key string) (map[string]stri
 	return result, nil
 }
 
-func (m *redisMeta) ScanSlices(ctx Context, opt *ScanSlicesOption, fn func(Ino, Slice) error) syscall.Errno {
+func (m *redisMeta) CleanupSlices(ctx Context) syscall.Errno {
 	logger.Debugf("start cleanup...")
-	m.cleanupLeakedInodes(opt.Delete)
-	m.cleanupLeakedChunks(opt.Delete)
-	m.cleanupOldSliceRefs(opt.Delete)
-	if opt.Delete {
-		_ = m.doCleanupSlices(ctx, nil)
-	}
+	m.cleanupLeakedInodes(true)
+	m.cleanupLeakedChunks(true)
+	m.cleanupOldSliceRefs(true)
+	return m.baseMeta.CleanupSlices(ctx)
+}
+
+func (m *redisMeta) ScanSlices(ctx Context, opt *ScanSlicesOption, fn func(Ino, Slice) error) syscall.Errno {
 	logger.Debugf("start scanning slices...")
 
 	p := m.rdb.Pipeline()
@@ -4306,11 +4308,19 @@ func (m *redisMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Err
 }
 
 func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
-	key := m.xattrKey(inode)
+	inodeKey := m.inodeKey(inode)
+	xattrKey := m.xattrKey(inode)
 	return errno(m.txn(ctx, func(tx *redis.Tx) error {
+		exists, err := tx.Exists(ctx, inodeKey).Result()
+		if err != nil {
+			return err
+		}
+		if exists == 0 {
+			return syscall.ENOENT
+		}
 		switch flags {
 		case XattrCreate:
-			ok, err := tx.HExists(ctx, key, name).Result()
+			ok, err := tx.HExists(ctx, xattrKey, name).Result()
 			if err != nil {
 				return err
 			}
@@ -4318,7 +4328,7 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 				return syscall.EEXIST
 			}
 		case XattrReplace:
-			ok, err := tx.HExists(ctx, key, name).Result()
+			ok, err := tx.HExists(ctx, xattrKey, name).Result()
 			if err != nil {
 				return err
 			}
@@ -4326,20 +4336,29 @@ func (m *redisMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte
 				return ENOATTR
 			}
 		}
-		_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.HSet(ctx, key, name, value)
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HSet(ctx, xattrKey, name, value)
 			m.genLog(ctx, pipe, time.Now(), "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
 			return nil
 		})
 		return err
-	}, key))
+	}, inodeKey, xattrKey))
 }
 
 func (m *redisMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
+	inodeKey := m.inodeKey(inode)
+	xattrKey := m.xattrKey(inode)
 	var n int64
 	err := m.txn(ctx, func(tx *redis.Tx) error {
-		cmd, err := tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.HDel(ctx, m.xattrKey(inode), name)
+		exists, err := tx.Exists(ctx, inodeKey).Result()
+		if err != nil {
+			return err
+		}
+		if exists == 0 {
+			return syscall.ENOENT
+		}
+		cmd, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.HDel(ctx, xattrKey, name)
 			m.genLog(ctx, pipe, time.Now(), "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
 			return nil
 		})
@@ -4349,7 +4368,7 @@ func (m *redisMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.E
 			}
 		}
 		return err
-	}, m.xattrKey(inode))
+	}, inodeKey, xattrKey)
 	if err != nil {
 		return errno(err)
 	} else if n == 0 {
