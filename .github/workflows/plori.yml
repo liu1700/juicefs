@@ -120,6 +120,15 @@ jobs:
           test "$(sudo cat /mnt/plori-ci/probe)" = durable
           sudo ./juicefs.plori umount --flush --flush-timeout 2m /mnt/plori-ci
 
+      - name: Regression - metadata backup under the plori profile
+        env:
+          PLORI_TEST_META_URL: redis://127.0.0.1:6379/2
+          PLORI_TEST_BLOB_URL: http://127.0.0.1:9000/plori-ci-backup
+          AWS_ACCESS_KEY_ID: plori-ci
+          AWS_SECRET_ACCESS_KEY: plori-ci-secret
+          AWS_REGION: us-east-1
+        run: make test.plori.backup
+
       - name: Install checksum-pinned artifact scanners
         run: |
           install -d "$RUNNER_TEMP/scanners"

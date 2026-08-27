@@ -58,6 +58,9 @@ test.plori.profile:
 test.plori.benchmark:
 	python3 -m unittest discover -s hack/plori-benchmark -p 'test_*.py'
 
+test.plori.backup:
+	go test -count=1 -v -tags "$(PLORI_TAGS)" ./pkg/vfs/ -run TestBackupPloriProfile
+
 test.plori.security:
 	python3 hack/verify_plori_security_test.py
 	python3 hack/verify_plori_scope.py
@@ -111,7 +114,7 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.security test.java.security plori.tags
+.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.backup test.plori.security test.java.security plori.tags
 
 plori.tags:
 	@printf '%s\n' "$(PLORI_TAGS)"
