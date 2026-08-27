@@ -2256,6 +2256,8 @@ func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				}
 			} else if dino == ino {
 				return nil
+			} else if ctx.Uid() != 0 && sattr.Mode&01000 != 0 && ctx.Uid() != sattr.Uid && ctx.Uid() != iattr.Uid {
+				return syscall.EACCES
 			} else if typ == TypeDirectory && dtyp != TypeDirectory {
 				return syscall.ENOTDIR
 			} else if typ != TypeDirectory && dtyp == TypeDirectory {
@@ -3192,9 +3194,6 @@ func (m *kvMeta) scanAllChunks(ctx Context, ch chan<- cchunk, bar *utils.Bar) er
 }
 
 func (m *kvMeta) ScanSlices(ctx Context, opt *ScanSlicesOption, fn func(Ino, Slice) error) syscall.Errno {
-	if opt.Delete {
-		_ = m.doCleanupSlices(ctx, nil)
-	}
 	// AiiiiiiiiCnnnn     file chunks
 	klen := 1 + 8 + 1 + 4
 	var cbErr error
@@ -3437,6 +3436,9 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 	}
 	key := m.xattrKey(inode, name)
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		if tx.get(m.inodeKey(inode)) == nil {
+			return syscall.ENOENT
+		}
 		v := tx.get(key)
 		switch flags {
 		case XattrCreate:
@@ -3453,12 +3455,15 @@ func (m *kvMeta) doSetXattr(ctx Context, inode Ino, name string, value []byte, f
 		}
 		m.genLog(tx, time.Now(), "SETXATTR(%d,%s,%s,%d)", inode, logEncode2(name), logEncode(value), flags)
 		return nil
-	}))
+	}, inode))
 }
 
 func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
 	key := m.xattrKey(inode, name)
 	return errno(m.txn(ctx, func(tx *kvTxn) error {
+		if tx.get(m.inodeKey(inode)) == nil {
+			return syscall.ENOENT
+		}
 		value := tx.get(key)
 		if value == nil {
 			return ENOATTR
@@ -3466,7 +3471,7 @@ func (m *kvMeta) doRemoveXattr(ctx Context, inode Ino, name string) syscall.Errn
 		tx.delete(key)
 		m.genLog(tx, time.Now(), "REMOVEXATTR(%d,%s)", inode, logEncode2(name))
 		return nil
-	}))
+	}, inode))
 }
 
 func (m *kvMeta) getQuotaKey(qtype uint32, key uint64) ([]byte, error) {
