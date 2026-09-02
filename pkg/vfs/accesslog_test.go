@@ -55,11 +55,14 @@ func TestAccessLog(t *testing.T) {
 	logs := string(buf[:10+n])
 
 	// check format
-	ts, err := time.Parse("2006.01.02 15:04:05.000000", logs[:26])
+	// accesslog.go:88 stamps the line with utils.Now(), i.e. local wall
+	// clock, and the layout carries no zone: parsing it as UTC makes the line
+	// look stale by the host's UTC offset on every non-UTC machine.
+	ts, err := time.ParseInLocation("2006.01.02 15:04:05.000000", logs[:26], time.Local)
 	if err != nil {
 		t.Fatalf("invalid time %s: %s", logs, err)
 	}
-	if now.Sub(ts.Local()) > time.Millisecond*10 {
+	if now.Sub(ts) > time.Millisecond*10 {
 		t.Fatalf("stale time: %s now: %s", ts, time.Now())
 	}
 	if !strings.HasPrefix(logs[26:len(logs)-1], " [uid:1,gid:2,pid:10] method test - OK <0.") {

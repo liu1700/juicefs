@@ -121,9 +121,9 @@ var defaultConf = Config{
 var ctx = context.Background()
 
 func TestStoreDefault(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	_ = os.RemoveAll(defaultConf.CacheDir)
-	store := NewCachedStore(mem, defaultConf, nil)
+	store := NewCachedStore(blob, defaultConf, nil)
 	testStore(t, store)
 	if used := store.UsedMemory(); used != 0 {
 		t.Fatalf("used memory %d != expect 0", used)
@@ -134,10 +134,10 @@ func TestStoreDefault(t *testing.T) {
 }
 
 func TestStoreMemCache(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	conf := defaultConf
 	conf.CacheDir = "memory"
-	store := NewCachedStore(mem, conf, nil)
+	store := NewCachedStore(blob, conf, nil)
 	testStore(t, store)
 	if used := store.UsedMemory(); used != 0 {
 		t.Fatalf("used memory %d != expect 0", used)
@@ -147,41 +147,41 @@ func TestStoreMemCache(t *testing.T) {
 	}
 }
 func TestStoreCompressed(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	conf := defaultConf
 	conf.Compress = "lz4"
 	conf.AutoCreate = false
-	store := NewCachedStore(mem, conf, nil)
+	store := NewCachedStore(blob, conf, nil)
 	testStore(t, store)
 }
 
 func TestStoreLimited(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	conf := defaultConf
 	conf.UploadLimit = 1e6
 	conf.DownloadLimit = 1e6
-	store := NewCachedStore(mem, conf, nil)
+	store := NewCachedStore(blob, conf, nil)
 	testStore(t, store)
 }
 
 func TestStoreFull(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	conf := defaultConf
 	conf.FreeSpace = 0.9999
-	store := NewCachedStore(mem, conf, nil)
+	store := NewCachedStore(blob, conf, nil)
 	testStore(t, store)
 }
 
 func TestStoreSmallBuffer(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	conf := defaultConf
 	conf.BufferSize = 1 << 20
-	store := NewCachedStore(mem, conf, nil)
+	store := NewCachedStore(blob, conf, nil)
 	testStore(t, store)
 }
 
 func TestStoreAsync(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	conf := defaultConf
 	conf.Writeback = true
 	p := filepath.Join(conf.CacheDir, stagingDir, "chunks/0/0/123_0_4")
@@ -189,9 +189,9 @@ func TestStoreAsync(t *testing.T) {
 	f, _ := os.Create(p)
 	f.WriteString("good")
 	f.Close()
-	store := NewCachedStore(mem, conf, nil)
+	store := NewCachedStore(blob, conf, nil)
 	time.Sleep(time.Millisecond * 50) // wait for scan to finish
-	in, err := mem.Get(ctx, "chunks/0/0/123_0_4", 0, -1)
+	in, err := blob.Get(ctx, "chunks/0/0/123_0_4", 0, -1)
 	if err != nil {
 		t.Fatalf("staging object should be upload")
 	}
@@ -203,7 +203,7 @@ func TestStoreAsync(t *testing.T) {
 }
 
 func TestForceUpload(t *testing.T) {
-	blob, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	config := defaultConf
 	_ = os.RemoveAll(config.CacheDir)
 	config.Writeback = true
@@ -296,11 +296,10 @@ func writeDurabilityTestSlice(t *testing.T, store ChunkStore, id uint64, data []
 }
 
 func TestRemoteDurabilityFence(t *testing.T) {
-	mem, err := object.CreateStorage("mem", "", "", "", "")
-	require.NoError(t, err)
+	blob := newTestStorage(t)
 	release := make(chan struct{})
 	controlled := &controlledPutStore{
-		ObjectStorage: mem,
+		ObjectStorage: blob,
 		started:       make(chan string, 4),
 		release:       release,
 	}
@@ -363,9 +362,8 @@ func TestRemoteDurabilityFence(t *testing.T) {
 }
 
 func TestRemoteDurabilityReportsUploadFailure(t *testing.T) {
-	mem, err := object.CreateStorage("mem", "", "", "", "")
-	require.NoError(t, err)
-	controlled := &controlledPutStore{ObjectStorage: mem, fail: true}
+	blob := newTestStorage(t)
+	controlled := &controlledPutStore{ObjectStorage: blob, fail: true}
 	store := newDurabilityTestStore(t, controlled)
 	durable := store.(RemoteDurabilityStore)
 	writeDurabilityTestSlice(t, store, 103, []byte("failure"))
@@ -380,10 +378,9 @@ func TestRemoteDurabilityReportsUploadFailure(t *testing.T) {
 }
 
 func TestRemoteDurabilityTimeout(t *testing.T) {
-	mem, err := object.CreateStorage("mem", "", "", "", "")
-	require.NoError(t, err)
+	blob := newTestStorage(t)
 	release := make(chan struct{})
-	controlled := &controlledPutStore{ObjectStorage: mem, release: release}
+	controlled := &controlledPutStore{ObjectStorage: blob, release: release}
 	store := newDurabilityTestStore(t, controlled)
 	durable := store.(RemoteDurabilityStore)
 	writeDurabilityTestSlice(t, store, 104, []byte("timeout"))
@@ -403,11 +400,11 @@ func TestRemoteDurabilityTimeout(t *testing.T) {
 }
 
 func TestStoreDelayed(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	conf := defaultConf
 	conf.Writeback = true
 	conf.UploadDelay = time.Millisecond * 200
-	store := NewCachedStore(mem, conf, nil)
+	store := NewCachedStore(blob, conf, nil)
 	time.Sleep(time.Second) // waiting for cache scanned
 	testStore(t, store)
 	if err := forgetSlice(store, 10, 1024); err != nil {
@@ -415,26 +412,26 @@ func TestStoreDelayed(t *testing.T) {
 	}
 	defer store.Remove(10, 1024)
 	time.Sleep(time.Second) // waiting for upload
-	if _, err := mem.Head(ctx, "chunks/0/0/10_0_1024"); err != nil {
+	if _, err := blob.Head(ctx, "chunks/0/0/10_0_1024"); err != nil {
 		t.Fatalf("head object 10_0_1024: %s", err)
 	}
 }
 
 func TestStoreMultiBuckets(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	conf := defaultConf
 	conf.HashPrefix = true
-	store := NewCachedStore(mem, conf, nil)
+	store := NewCachedStore(blob, conf, nil)
 	testStore(t, store)
 }
 
 func TestFillCache(t *testing.T) {
-	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(t)
 	conf := defaultConf
 	conf.CacheSize = 10 << 20
 	conf.FreeSpace = 0.01
 	_ = os.RemoveAll(conf.CacheDir)
-	store := NewCachedStore(mem, conf, nil)
+	store := NewCachedStore(blob, conf, nil)
 	if err := forgetSlice(store, 10, 1024); err != nil {
 		t.Fatalf("forge slice 10 1024: %s", err)
 	}
@@ -495,7 +492,7 @@ func TestFillCache(t *testing.T) {
 }
 
 func BenchmarkCachedRead(b *testing.B) {
-	blob, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(b)
 	config := defaultConf
 	config.BlockSize = 4 << 20
 	store := NewCachedStore(blob, config, nil)
@@ -518,7 +515,7 @@ func BenchmarkCachedRead(b *testing.B) {
 }
 
 func BenchmarkUncachedRead(b *testing.B) {
-	blob, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage(b)
 	config := defaultConf
 	config.BlockSize = 4 << 20
 	config.CacheSize = 0

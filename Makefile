@@ -85,13 +85,63 @@ test.plori.sqlite:
 # unknown driver, so either one aborts the whole test binary instead of failing
 # just itself. Everything else is expected to pass: keep this a skip list, not
 # a -run allowlist, so a new upstream test is picked up by default.
-# ./pkg/plori/... rides along: it is the per-Agent restore/repair code and is
-# compiled out of every other build by the `plori` tag, so this gate is the
-# only place its tests run. It needs no Redis.
+#
+# ./pkg/plori/... is NOT here. PLO-320 put it in this target because at the time
+# it was the only gate that ran anything under the release tag set; PLO-368's
+# test.plori.unit below is now that gate for every non-meta package, and listing
+# ./pkg/plori in both would run it twice. Keep it in one place -- and this is
+# the wrong one: SKIP_NON_CORE and the -skip regex above name ./pkg/meta tests.
 test.plori.meta:
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 20m \
-		-tags "$(PLORI_TAGS)" -skip '^TestLoadDump$$|^TestLoadDumpV2$$' \
-		./pkg/meta/ ./pkg/plori/...
+		-tags "$(PLORI_TAGS)" -skip '^TestLoadDump$$|^TestLoadDumpV2$$' ./pkg/meta/
+
+# ./pkg/chunk and ./pkg/vfs under the release tag set: the writeback store, the
+# durability barrier and the VFS the plori-mount supervisor is built on.
+#
+# Both packages need an object storage and (for the VFS) a metadata engine, and
+# the harness used to reach for the two backends the profile excludes: `mem`
+# resolved to a nil ObjectStorage and crashed the binary on the first upload,
+# and `memkv://` hit logger.Fatalf in meta.NewClient and killed it outright
+# (PLO-368). The test doubles now pick `file` and sqlite3, both in the profile.
+#
+# ./pkg/plori is here for the other half of the same gap: every file in it is
+# `//go:build plori`, so it exists only under this tag set. It holds the
+# plori-mount supervisor (PLO-321) and the restore/repair code (PLO-320), and
+# `...` picks up whatever lands under it next. This is its one gate -- see the
+# note on test.plori.meta above.
+#
+# Needs the same Redis server on 127.0.0.1:6379 as test.plori.meta for the Redis
+# rows of the readdir engine matrix. TestBackupPloriProfile skips itself unless
+# PLORI_TEST_META_URL and PLORI_TEST_BLOB_URL are set; test.plori.backup is the
+# step that sets them.
+test.plori.unit:
+	$(PLORI_CGO) go test -count=1 -timeout 20m \
+		-tags "$(PLORI_TAGS)" ./pkg/chunk/... ./pkg/vfs/... ./pkg/plori/...
+
+# Upstream's own unit tests on the default build. Nothing in the Plori workflow
+# ran a default-build `go test`, which is why pkg/chunk/cached_store_test.go sat
+# uncompilable from fork PR #13 until PLO-358 tripped over it (PLO-368).
+#
+# ./pkg/meta is deliberately absent. Its default-build test package is already
+# compiled, and TestSQLitePragma run, by test.plori.sqlite, and its whole body
+# is run under the release tag set by test.plori.meta -- so it has the
+# compile-rot gate ./pkg/chunk was missing. What the default build adds on top
+# is the engines the Plori profile removes, and those want servers this job does
+# not run: measured with only Redis up, TestTiKVClient burns ~100s of PD retries
+# and fails, TestMySQLClient fails, and TestLoadDump's tikv row reaches
+# logger.Fatalf in meta.NewClient (pkg/meta/interface.go:675) and kills the test
+# binary outright -- 243s, red, for engines we do not ship.
+#
+# ./pkg/plori is absent for the opposite reason: every file in it is
+# `//go:build plori`, so on the default build the pattern matches no packages at
+# all. test.plori.unit is where it runs.
+#
+# SKIP_NON_CORE is upstream's gate for the cases that need a KeyDB or a Redis
+# cluster. ./pkg/object's remote backends skip themselves when their credentials
+# are absent (38 of them).
+test.plori.upstream:
+	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 25m \
+		./pkg/chunk/... ./pkg/vfs/... ./pkg/object/...
 
 test.plori.security:
 	python3 hack/verify_plori_security_test.py
@@ -146,7 +196,7 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.backup test.plori.sqlite test.plori.meta test.plori.security test.java.security plori.tags
+.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.backup test.plori.sqlite test.plori.meta test.plori.unit test.plori.upstream test.plori.security test.java.security plori.tags
 
 plori.tags:
 	@printf '%s\n' "$(PLORI_TAGS)"
