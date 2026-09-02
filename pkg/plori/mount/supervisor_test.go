@@ -231,6 +231,23 @@ func testSpec() *MountSpec {
 	return spec
 }
 
+// bootstrapSpec is a brand-new Agent's first mount: an `allocating` volume whose
+// lease IS the formatting lease (PLO-373). The three fields move together —
+// `may_format` is the authorisation, and it is granted exactly when no
+// Format.UUID has been recorded, in either of the two places the wire spells it.
+func bootstrapSpec() *MountSpec {
+	spec := testSpec()
+	spec.Generation = 1
+	spec.VolumeState = VolumeStateAllocating
+	spec.MayFormat = true
+	spec.FormatUUID = ""
+	spec.Format.ExpectedUUID = ""
+	if err := spec.Validate(); err != nil {
+		panic(err)
+	}
+	return spec
+}
+
 func newSup(t *testing.T, spec *MountSpec, fs *fakeFS, cp *fakeCP, rep *fakeReplicator, fencer Fencer) *Supervisor {
 	t.Helper()
 	dir := t.TempDir()
@@ -334,10 +351,7 @@ func TestStartupRefusalsExit70(t *testing.T) {
 // filesystem with an empty one.
 func TestEmptyReplicaFormatsOnlyOnAFirstGeneration(t *testing.T) {
 	t.Run("first generation formats", func(t *testing.T) {
-		spec := testSpec()
-		spec.Generation = 1
-		spec.VolumeState = VolumeStateFormatted
-		spec.FormatUUID = ""
+		spec := bootstrapSpec()
 		fs := &fakeFS{vol: healthyVolume()}
 		rep := &fakeReplicator{restoreErr: ErrReplicaEmpty}
 		sup := newSup(t, spec, fs, &fakeCP{}, rep, &fakeFencer{})
@@ -632,10 +646,7 @@ func TestRepairRunsOnlyAfterAnUncleanGeneration(t *testing.T) {
 	})
 
 	t.Run("a freshly formatted volume does not repair", func(t *testing.T) {
-		spec := testSpec()
-		spec.Generation = 1
-		spec.VolumeState = VolumeStateFormatted
-		spec.FormatUUID = ""
+		spec := bootstrapSpec()
 		vol := healthyVolume()
 		sup := newSup(t, spec, &fakeFS{vol: vol}, &fakeCP{},
 			&fakeReplicator{restoreErr: ErrReplicaEmpty}, &fakeFencer{})

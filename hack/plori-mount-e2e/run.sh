@@ -61,15 +61,36 @@ write_spec() {
   local epoch=$1 out=$2 format_uuid=$3
   # A lease that is long relative to the test, with a renew interval short
   # enough that the loop actually runs several times before SIGTERM.
+  # The field set below is the control-plane's, not a convenient subset of it:
+  # services/control-plane/internal/storagespec emits every key here, and its
+  # golden fixture (internal/storagespec/testdata/*.golden.json) is the
+  # authority this file tracks. A spec that omits `format` or `may_format` is
+  # refused with exit 64 (PLO-395), which is exactly what this harness must not
+  # be able to hide.
   python3 - "$epoch" "$out" "$format_uuid" <<PY
 import datetime, json, sys
 epoch, out, format_uuid = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 expires = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=120)
+endpoint, bucket = "$S3_ENDPOINT".rstrip("/"), "$S3_BUCKET".strip("/")
+fmt = {
+  "volume_id": "$VOLUME_ID",
+  "bucket": endpoint + "/" + bucket,
+  "data_prefix": "agents/$VOLUME_ID/",
+  "meta_prefix": "agents-meta/$VOLUME_ID/",
+  "trash_days": 1,
+  "capacity_bytes": 1 << 30,
+  "inodes": 100000,
+  "grant_epoch": 1,
+}
+if format_uuid:
+  fmt["expected_uuid"] = format_uuid
 spec = {
   "storage_volume_id": "$VOLUME_ID",
   "format_uuid": format_uuid,
   "generation": 1,
-  "volume_state": "formatted" if not format_uuid else "active",
+  # An unformatted volume is `allocating`, and that lease IS the formatting
+  # lease (PLO-373); once the control-plane has a Format.UUID it is `active`.
+  "volume_state": "allocating" if not format_uuid else "active",
   "fence_epoch": epoch,
   "lease_expires_at": expires.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
   "lease_renew_interval": "2s",
@@ -79,11 +100,13 @@ spec = {
   "fence_marker_key": "agents-meta/$VOLUME_ID/g%d/fence" % epoch,
   "grant": {"bytes": 1 << 30, "inodes": 100000, "epoch": 1, "acked_epoch": 0},
   "object_store": {
-    "endpoint": "$S3_ENDPOINT",
-    "bucket": "$S3_BUCKET",
+    "endpoint": endpoint,
+    "bucket": bucket,
     "region": "${AWS_REGION:-us-east-1}",
     "credential_source": "node_secret",
   },
+  "format": fmt,
+  "may_format": not format_uuid,
   "mount_options": ["writeback", "heartbeat=30", "barrier_interval=5"],
   "issued_at": expires.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
 }
