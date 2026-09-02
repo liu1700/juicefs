@@ -204,16 +204,41 @@ func (s *Supervisor) start(ctx context.Context) error {
 }
 
 func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
-	// A durable point left by a previous generation ON THIS NODE is the
-	// restore anchor. On a fresh node there is none; the control-plane holds
-	// the authoritative copy but does not hand it back in the MountSpec yet,
-	// so the fallback is "restore the latest transaction" and PLO-326 owes
-	// the E_RESTORED_TO_BARRIER path (see docs/en/development/plori_mount.md).
-	var anchor time.Time
+	// There are up to two known durable points, and the newer one wins WHOLE:
+	// both the prefix to restore from and the instant to stop at come from the
+	// same point, never one from each.
+	//
+	//   * the control-plane's, in the MountSpec. Authoritative, and the only
+	//     one a Pod rescheduled onto a different node can see.
+	//   * the local `durable-point.json`, left by whichever generation last ran
+	//     HERE. reportDurablePoint persists it BEFORE it posts, deliberately,
+	//     so a generation that barriers and then loses the network leaves a
+	//     local point the server never heard about.
+	//
+	// That last case is why they must not be mixed. Taking the local anchor
+	// with the server's prefix would restore epoch N-2's replica up to a point
+	// epoch N-1 established, silently dropping everything N-1 wrote — worse
+	// than either source alone. Epoch is the comparison, not the timestamp: it
+	// is the one coordinate in this design that does not depend on a clock.
+	//
+	// With neither, the restore takes the replica's latest transaction, which
+	// is what every mount did before the server carried a point (PLO-391).
+	var (
+		anchor time.Time
+		source string
+		from   int64
+	)
+	if dp := s.Spec.DurablePoint; dp != nil {
+		anchor, from, source = dp.DurableAt, dp.FenceEpoch, s.Spec.RestoreFromPrefix
+		s.log("restore_anchor", "durable_at", anchor, "from_epoch", from, "known_by", "mount_spec")
+	}
 	if dp, err := ReadDurablePoint(s.Paths.DurablePointPath()); err == nil && dp != nil {
-		if dp.Volume == s.Spec.StorageVolumeID && dp.FenceEpoch < s.Spec.FenceEpoch {
-			anchor = dp.DurableAt
-			s.log("restore_anchor", "durable_at", anchor, "from_epoch", dp.FenceEpoch)
+		if dp.Volume == s.Spec.StorageVolumeID && dp.FenceEpoch < s.Spec.FenceEpoch && dp.FenceEpoch > from {
+			// Its prefix is populated by construction: the file is written
+			// only after a barrier, and a barrier only happens once
+			// replication is running under that epoch's prefix.
+			anchor, from, source = dp.DurableAt, dp.FenceEpoch, s.Spec.MetaPrefixForEpoch(dp.FenceEpoch)
+			s.log("restore_anchor", "durable_at", anchor, "from_epoch", from, "known_by", "state_dir")
 		}
 	}
 	// A previous generation that did not write the clean marker died without
@@ -227,19 +252,30 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	_ = os.Remove(s.Paths.CleanStopPath())
 
 	// The metadata root is partitioned per writer epoch, so this epoch's own
-	// prefix is empty by construction and the bytes live under the previous
-	// one. The MountSpec names only the current prefix, so the source is
-	// discovered from the store; MetaRoot() is the parent both share.
-	source, err := s.Deps.Fencer.PriorMetaPrefix(ctx, s.Spec.MetaRoot(), s.Spec.FenceEpoch)
-	if err != nil {
-		return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true,
-			"find the metadata generation to restore from: %s", err)
-	}
+	// prefix is empty by construction and the bytes live under an earlier one.
+	// The prefix of the winning durable point above IS that earlier one, which
+	// is why the source is settled there rather than derived a second time.
+	//
+	// With no durable point at all the source is discovered by listing the
+	// metadata root and taking the newest prefix below this epoch that holds
+	// more than a fence marker. That listing stays: it is the only correct
+	// answer for a volume no writer has ever reported a durable point for, and
+	// it is what makes `epoch - 1` unnecessary — an epoch that claimed a fence
+	// and replicated nothing is skipped by both paths.
 	if source != "" {
-		s.log("restore_source", "prefix", source)
+		s.log("restore_source", "prefix", source, "discovery", "durable_point")
+	} else {
+		var err error
+		if source, err = s.Deps.Fencer.PriorMetaPrefix(ctx, s.Spec.MetaRoot(), s.Spec.FenceEpoch); err != nil {
+			return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true,
+				"find the metadata generation to restore from: %s", err)
+		}
+		if source != "" {
+			s.log("restore_source", "prefix", source, "discovery", "list")
+		}
 	}
 
-	err = s.Deps.Replicator.Restore(ctx, source, anchor)
+	err := s.Deps.Replicator.Restore(ctx, source, anchor)
 	switch {
 	case err == nil:
 		if s.restoredUnclean {

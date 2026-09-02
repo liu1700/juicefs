@@ -112,6 +112,20 @@ type FormatSpec struct {
 	Storage string `json:"storage,omitempty"`
 }
 
+// DurablePointSpec is the control-plane's copy of the recovery anchor: the
+// pre-barrier wall clock T_before everything written before is provably durable
+// past, the replica transaction observed at that barrier, and the fencing epoch
+// that produced both — which is the epoch segment of RestoreFromPrefix.
+//
+// Same three fields as the local DurablePoint this worker writes to its state
+// dir (health.go); a separate type because this one is a wire contract the
+// server owns and the local one is a file this process owns.
+type DurablePointSpec struct {
+	DurableAt   time.Time `json:"durable_at"`
+	ReplicaTxID string    `json:"replica_txid,omitempty"`
+	FenceEpoch  int64     `json:"fence_epoch"`
+}
+
 // MountSpec is the whole authority a trusted mount worker receives for one
 // writer generation of one Agent's volume. Field-for-field the control-plane's
 // storagespec.MountSpec; see docs/design/per-agent-juicefs/mountspec.md §3.
@@ -129,6 +143,29 @@ type MountSpec struct {
 	DataPrefix     string `json:"data_prefix"`
 	MetaPrefix     string `json:"meta_prefix"`
 	FenceMarkerKey string `json:"fence_marker_key"`
+
+	// RestoreFromPrefix is the metadata prefix this generation must restore
+	// FROM — the prefix of the epoch whose replica produced DurablePoint below.
+	// MetaPrefix names only the prefix this writer replicates INTO, which is
+	// empty by construction at startup.
+	//
+	// Empty means the control-plane has no recorded durable point for the
+	// volume and therefore no source to name; the worker then discovers one by
+	// listing the metadata root (Fencer.PriorMetaPrefix), which is what it did
+	// for every mount before this field existed. The server does NOT fall back
+	// to `epoch - 1`: an epoch that replicated nothing leaves a prefix holding
+	// only its fence marker, and restoring from that would replace a live
+	// filesystem with an empty one (PLO-391).
+	RestoreFromPrefix string `json:"restore_from_prefix,omitempty"`
+	// DurablePoint is the last barrier-backed restore point the control-plane
+	// was told about. Nil when there is none.
+	//
+	// The worker persists its own copy next to the state dir, so this field
+	// matters on exactly the case that copy cannot cover: a Pod rescheduled
+	// onto a DIFFERENT node, where restoring without an anchor means restoring
+	// the newest transaction in the replica rather than the newest provably
+	// durable one.
+	DurablePoint *DurablePointSpec `json:"durable_point,omitempty"`
 
 	Grant       GrantSpec   `json:"grant"`
 	ObjectStore ObjectStore `json:"object_store"`
@@ -215,6 +252,18 @@ func (s *MountSpec) Validate() error {
 		return fmt.Errorf("%w: data_prefix %q and meta_prefix %q must be disjoint",
 			ErrSpec, s.DataPrefix, s.MetaPrefix)
 	}
+	// `restore_from_prefix` and `durable_point` are two halves of one
+	// instruction — restore THIS prefix TO THIS point — and half of it is worse
+	// than none: a prefix with no anchor restores the newest transaction it
+	// holds rather than the newest durable one, and an anchor with no prefix
+	// has nothing to apply to. The control-plane sends both or neither for that
+	// reason (PLO-391); a spec that arrives with one means the two sides
+	// disagree about the restore, and this worker refuses rather than acting on
+	// the half it got. Neither present is the normal case on a fresh volume:
+	// the source is then discovered by listing.
+	if err := s.validateRestoreInstruction(); err != nil {
+		return err
+	}
 	if s.ObjectStore.CredentialSource != CredentialSourceNodeSecret {
 		return fmt.Errorf("%w: unsupported credential_source %q (this worker only understands %q)",
 			ErrSpec, s.ObjectStore.CredentialSource, CredentialSourceNodeSecret)
@@ -243,6 +292,56 @@ func (s *MountSpec) Validate() error {
 		}
 	}
 	return nil
+}
+
+// validateRestoreInstruction checks the rev-3 pair. Everything it refuses is a
+// server that contradicted itself, which is exit 64 territory: the alternative
+// is mounting on a restore instruction nobody can vouch for.
+func (s *MountSpec) validateRestoreInstruction() error {
+	dp := s.DurablePoint
+	if s.RestoreFromPrefix == "" && dp == nil {
+		return nil
+	}
+	if s.RestoreFromPrefix == "" || dp == nil {
+		return fmt.Errorf("%w: restore_from_prefix and durable_point must be sent together, got %q and %v",
+			ErrSpec, s.RestoreFromPrefix, dp)
+	}
+	if err := validPrefix("restore_from_prefix", s.RestoreFromPrefix); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(s.RestoreFromPrefix, s.MetaRoot()) {
+		return fmt.Errorf("%w: restore_from_prefix %q is outside this volume's metadata root %q",
+			ErrSpec, s.RestoreFromPrefix, s.MetaRoot())
+	}
+	if dp.FenceEpoch <= 0 {
+		return fmt.Errorf("%w: durable_point.fence_epoch must be positive, got %d", ErrSpec, dp.FenceEpoch)
+	}
+	// A durable point from an epoch at or ahead of this one means another
+	// writer is live at an epoch this worker was told it holds. That is the
+	// fencing invariant, not a restore detail, so it fails the spec.
+	if dp.FenceEpoch > s.FenceEpoch {
+		return fmt.Errorf("%w: durable_point.fence_epoch %d is ahead of this writer's epoch %d",
+			ErrSpec, dp.FenceEpoch, s.FenceEpoch)
+	}
+	if dp.DurableAt.IsZero() {
+		return fmt.Errorf("%w: durable_point.durable_at is unset", ErrSpec)
+	}
+	// The prefix must name the epoch inside the point. Two spellings of one
+	// fact is a spelling too many; if they disagree the restore would read one
+	// epoch's replica and stop at another epoch's transaction.
+	if want := s.MetaPrefixForEpoch(dp.FenceEpoch); s.RestoreFromPrefix != want {
+		return fmt.Errorf("%w: restore_from_prefix %q does not name durable_point.fence_epoch %d (expected %q)",
+			ErrSpec, s.RestoreFromPrefix, dp.FenceEpoch, want)
+	}
+	return nil
+}
+
+// MetaPrefixForEpoch is where the writer holding `epoch` replicates this
+// volume's metadata: the same composition the control-plane performs
+// (storagevol/prefix.go MetaPrefix). One spelling, derived from MetaRoot so it
+// cannot drift from the prefix this writer was issued.
+func (s *MountSpec) MetaPrefixForEpoch(epoch int64) string {
+	return fmt.Sprintf("%sg%d/", s.MetaRoot(), epoch)
 }
 
 func validPrefix(name, prefix string) error {
