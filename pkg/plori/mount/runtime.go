@@ -160,7 +160,23 @@ type Volume interface {
 	// ApplyGrant writes a new quota ceiling into the metadata. It must load a
 	// fresh Format from the engine rather than persisting the in-memory one,
 	// which carries the injected credential.
+	//
+	// It takes effect on the next metadata operation: the ceiling is read from
+	// an atomic pointer per call, so there is no remount and no window in which
+	// half the mount enforces the old number (meta.PloriApplyGrant, proved by
+	// meta.TestTheCeilingIsReadPerOperationSoAGrantNeedsNoRemount and
+	// vfs.TestPloriGrantAppliesLiveThroughTheVFS).
 	ApplyGrant(ctx context.Context, bytes, inodes int64) error
+	// QuotaTrips is how many operations the VOLUME ceiling has refused since
+	// this process started. It is monotonic, so the supervisor can tell "the
+	// grant ran out since the last tick" from "the grant ran out once, an hour
+	// ago" — which is the difference between asking the control-plane to grow
+	// the grant and asking it once a tick forever (PLO-324).
+	//
+	// Only the volume ceiling counts. A directory, user or group quota answers
+	// EDQUOT and is not a ceiling the account allocator can raise, so growing
+	// the grant would not help.
+	QuotaTrips() uint64
 	// SetWriteExpiry publishes the monotonic instant at which this mount's
 	// lease dies. The metadata engine re-reads it before every gated
 	// operation, which is the per-submission deadline check threat-model.md
@@ -191,13 +207,20 @@ type Volume interface {
 	Close() error
 }
 
-// ControlPlane is the six-call contract of docs/design/per-agent-juicefs/mountspec.md §3.
+// ControlPlane is the five-call contract of docs/design/per-agent-juicefs/mountspec.md §3.
+//
+// The grant conversation rides RenewLease in both directions rather than owning
+// routes of its own. Renewal is the only regular round trip a live mount makes,
+// it is already authorised as the lease holder, and both halves of the grant
+// exchange — "I have applied epoch N" and "I need more" — are facts about the
+// holder that are only true while it holds the lease. A separate /grant-ack
+// call was a second authorisation of the same claim and a second round trip per
+// grant; it is gone (PLO-324).
 type ControlPlane interface {
-	RenewLease(ctx context.Context, volumeID string, epoch int64) (LeaseResponse, error)
+	RenewLease(ctx context.Context, volumeID string, epoch int64, req RenewRequest) (LeaseResponse, error)
 	ReleaseLease(ctx context.Context, volumeID string, epoch int64, reason string) error
 	ReportUsage(ctx context.Context, volumeID string, epoch int64, u Usage, at time.Time) error
 	ReportDurablePoint(ctx context.Context, volumeID string, epoch int64, r BarrierResult, replicaTxID string) error
-	AckGrant(ctx context.Context, volumeID string, epoch, grantEpoch int64) error
 }
 
 // Replicator is the metadata-replica half.

@@ -206,7 +206,7 @@ type asHolder struct {
 	pod string
 }
 
-func (h asHolder) RenewLease(_ context.Context, _ string, epoch int64) (LeaseResponse, error) {
+func (h asHolder) RenewLease(_ context.Context, _ string, epoch int64, _ RenewRequest) (LeaseResponse, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if epoch < h.current {
@@ -246,7 +246,7 @@ func (a *leaseAuthority) markFenced(epoch int64) {
 	}
 }
 
-func (a *leaseAuthority) RenewLease(_ context.Context, _ string, epoch int64) (LeaseResponse, error) {
+func (a *leaseAuthority) RenewLease(_ context.Context, _ string, epoch int64, _ RenewRequest) (LeaseResponse, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if epoch < a.current {
@@ -273,8 +273,6 @@ func (a *leaseAuthority) ReportUsage(context.Context, string, int64, Usage, time
 func (a *leaseAuthority) ReportDurablePoint(context.Context, string, int64, BarrierResult, string) error {
 	return nil
 }
-
-func (a *leaseAuthority) AckGrant(context.Context, string, int64, int64) error { return nil }
 
 // releasedWith reports whether any worker on this epoch handed the lease back
 // with the given reason.

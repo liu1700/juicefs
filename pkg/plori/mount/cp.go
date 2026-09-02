@@ -68,6 +68,24 @@ func (e *CPError) Fenced() bool {
 	return e.Code == CPCodeStaleEpoch || e.Code == CPCodeLeaseHeld || e.Code == CPCodeIdentityMismatch
 }
 
+// RenewRequest is what the worker tells the control-plane on a renew beyond
+// "I am still here". Both fields are about the grant, and both ride the renew
+// because renewal is the only regular round trip a live mount makes: one call,
+// one authorisation, one place where a fenced writer stops being heard.
+type RenewRequest struct {
+	// AckedGrantEpoch is the grant epoch this worker has applied locally, or 0
+	// when there is nothing new to acknowledge. The allocator counts an
+	// un-acknowledged grant as reserved but not enforced, so this is what lets
+	// it tell an issued ceiling from a live one.
+	AckedGrantEpoch int64 `json:"acked_grant_epoch,omitempty"`
+	// Grow asks for one more increment because the volume ceiling has refused
+	// an operation since the last renew. It carries no size: how much a volume
+	// may grow is an account-budget decision, and a number chosen by the mount
+	// would be request input deciding an allocation (threat-model R14). The
+	// worker says "I am full"; the control-plane says how much that is worth.
+	Grow bool `json:"grow,omitempty"`
+}
+
 // LeaseResponse is the answer to renew and release.
 type LeaseResponse struct {
 	StorageVolumeID string    `json:"storage_volume_id"`
@@ -75,9 +93,15 @@ type LeaseResponse struct {
 	LeaseExpiresAt  time.Time `json:"lease_expires_at"`
 	Grant           GrantSpec `json:"grant"`
 	Released        bool      `json:"released"`
+	// OverBudget answers a Grow the account could not fund: the grant epoch is
+	// unchanged, the worker keeps the ceiling it has, and the user sees the
+	// quota-full surface (PLO-337). It is deliberately not an error — a renew
+	// that failed because the account is full would fence a mount over a
+	// billing state.
+	OverBudget bool `json:"over_budget"`
 }
 
-// Client speaks the five follow-up routes of /v1/internal/storage. It never
+// Client speaks the four follow-up routes of /v1/internal/storage. It never
 // calls /mount-spec: by the time the worker runs, the plugin has already
 // spent that call and the resulting spec is in --spec-file.
 type Client struct {
@@ -159,11 +183,13 @@ func (c *Client) post(ctx context.Context, route string, body, out any) error {
 	return nil
 }
 
-func (c *Client) RenewLease(ctx context.Context, volumeID string, epoch int64) (LeaseResponse, error) {
+func (c *Client) RenewLease(ctx context.Context, volumeID string, epoch int64, req RenewRequest) (LeaseResponse, error) {
 	var out LeaseResponse
 	err := c.post(ctx, "/v1/internal/storage/lease/renew", map[string]any{
-		"volume_id":   volumeID,
-		"fence_epoch": epoch,
+		"volume_id":         volumeID,
+		"fence_epoch":       epoch,
+		"acked_grant_epoch": req.AckedGrantEpoch,
+		"grow":              req.Grow,
 	}, &out)
 	return out, err
 }
@@ -193,13 +219,5 @@ func (c *Client) ReportDurablePoint(ctx context.Context, volumeID string, epoch 
 		"durable_at":   r.DurableAt,
 		"barrier_at":   r.BarrierAt,
 		"replica_txid": replicaTxID,
-	}, nil)
-}
-
-func (c *Client) AckGrant(ctx context.Context, volumeID string, epoch, grantEpoch int64) error {
-	return c.post(ctx, "/v1/internal/storage/grant-ack", map[string]any{
-		"volume_id":   volumeID,
-		"fence_epoch": epoch,
-		"grant_epoch": grantEpoch,
 	}, nil)
 }

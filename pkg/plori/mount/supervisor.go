@@ -65,6 +65,10 @@ type Supervisor struct {
 	lastBarrier     BarrierResult
 	lastTxID        string
 	grantApplied    int64
+	pendingAck      int64
+	quotaTrips      uint64
+	quotaExhausted  bool
+	growAsked       bool
 	restoredUnclean bool
 	lastUsage       Usage
 	lastRenewOK     bool
@@ -207,7 +211,13 @@ func (s *Supervisor) start(ctx context.Context) error {
 		}
 		s.reportDurablePoint(ctx, BarrierResult{DurableAt: s.now().UTC(), BarrierAt: s.now().UTC()})
 	}
-	if g := s.Spec.Grant; g.Epoch > g.AckedEpoch {
+	// The spec's grant is authoritative; the restored replica's Format carries
+	// whatever ceiling the PREVIOUS generation persisted, which the allocator
+	// may have moved while this volume had no writer. Applying it before the
+	// mount serves anything is one metadata write (~1.1 ms, zero object
+	// requests — meta.TestPloriApplyGrantCostsOneMetadataWrite) and it removes
+	// the window in which a resumed Agent enforces a stale ceiling.
+	if g := s.Spec.Grant; g.Epoch > 0 {
 		s.applyGrant(ctx, g)
 	}
 	return nil
@@ -257,7 +267,10 @@ func (s *Supervisor) reclaimOwnMarker(ctx context.Context) *Fatal {
 			"marker_volume", m.Volume, "marker_epoch", m.Epoch)
 		return held
 	}
-	if _, err := s.Deps.CP.RenewLease(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch); err != nil {
+	// An empty request: this renew is an identity PROOF, not a grant
+	// conversation. Nothing has been applied yet — the volume is not even open
+	// — so there is no acknowledgement to carry and nothing to ask for.
+	if _, err := s.Deps.CP.RenewLease(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, RenewRequest{}); err != nil {
 		s.log("fence_marker_not_ours", "key", s.Spec.FenceMarkerKey, "error", err.Error())
 		return held
 	}
@@ -598,7 +611,8 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 		case <-renew.C:
 			ticks++
 			before := s.now()
-			resp, err := s.Deps.CP.RenewLease(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch)
+			s.noteQuotaTrips()
+			resp, err := s.Deps.CP.RenewLease(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, s.renewRequest())
 			if err != nil {
 				var cpErr *CPError
 				if errors.As(err, &cpErr) && cpErr.Fenced() {
@@ -618,11 +632,14 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 				continue
 			}
 			s.setRenewOK(true)
+			s.ackDelivered(resp.Grant.AckedEpoch)
 			renewedAt = before
 			s.deadline.Update(resp.LeaseExpiresAt, s.Spec.WriteStopMargin.D(), before)
 			s.publishWriteExpiry()
 			if resp.Grant.Epoch > s.appliedGrant() {
 				s.applyGrant(ctx, resp.Grant)
+			} else if resp.OverBudget {
+				s.growRefused()
 			}
 			if ticks%DefaultUsageReportEvery == 0 {
 				s.reportUsage(ctx)
@@ -696,22 +713,92 @@ func (s *Supervisor) reportDurablePoint(ctx context.Context, res BarrierResult) 
 	}
 }
 
+// applyGrant enforces a new ceiling locally and queues the acknowledgement.
+//
+// The apply is synchronous and the ack is not: the ack rides the next renew
+// (renewRequest below), because renewal is the only regular round trip this
+// process makes and a second HTTP call to say "done" is a second
+// authorisation of a fact the lease already proves. The lag it costs is one
+// renew interval, and it is a SAFE lag in one direction only — the allocator
+// counts an un-acknowledged grant as the larger of issued and acknowledged, so
+// an increase in flight is reserved but not double-spent, and a DECREASE is
+// never issued to a volume a writer holds at all (storagequota
+// ErrGrantHeldByWriter).
+//
+// A failed apply leaves grantApplied where it was, so the next renew carries
+// the same grant and tries again. That is the correct retry: the ceiling the
+// control-plane issued is not enforced until this succeeds, and pretending
+// otherwise would let the allocator hand the difference to a sibling.
 func (s *Supervisor) applyGrant(ctx context.Context, g GrantSpec) {
 	if err := s.vol.ApplyGrant(ctx, g.Bytes, g.Inodes); err != nil {
 		s.log("grant_apply_failed", "epoch", g.Epoch, "error", err.Error())
 		return
 	}
-	if err := s.Deps.CP.AckGrant(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, g.Epoch); err != nil {
-		// The ack is the allocator's signal that the ceiling is locally
-		// enforced. Failing to send it is safe — the allocator keeps counting
-		// the larger of the two grants — so the local application stands.
-		s.log("grant_ack_failed", "epoch", g.Epoch, "error", err.Error())
-		return
-	}
 	s.mu.Lock()
 	s.grantApplied = g.Epoch
+	if g.Epoch > g.AckedEpoch {
+		s.pendingAck = g.Epoch
+	}
+	// A larger ceiling is the answer to whatever refused the last write, so the
+	// exhausted state and the outstanding request both close here. If the new
+	// ceiling is still too small the very next refusal reopens them.
+	s.quotaExhausted = false
+	s.growAsked = false
 	s.mu.Unlock()
 	s.log("grant_applied", "epoch", g.Epoch, "bytes", g.Bytes, "inodes", g.Inodes)
+}
+
+// noteQuotaTrips samples the metadata engine's refusal counter. A counter
+// rather than a flag because the engine has no idea what a grant epoch is: the
+// supervisor has to be able to tell "the ceiling refused something SINCE I last
+// looked" from "the ceiling refused something at some point", and only a
+// monotonic number carries that.
+func (s *Supervisor) noteQuotaTrips() {
+	n := s.vol.QuotaTrips()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > s.quotaTrips {
+		s.quotaTrips = n
+		s.quotaExhausted = true
+	}
+}
+
+// renewRequest is what this tick tells the control-plane about the grant: the
+// epoch it has applied since the last renew, and whether it needs more room.
+//
+// The Grow flag is raised at most once per grant epoch. The ceiling refuses
+// every write of a filesystem that is full — a `git clone` against a full
+// volume trips it thousands of times a second — so a request per refusal would
+// be a request storm against a per-owner advisory lock. One per epoch is
+// enough because the answer to the request is a new epoch.
+func (s *Supervisor) renewRequest() RenewRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	req := RenewRequest{AckedGrantEpoch: s.pendingAck}
+	if s.quotaExhausted && !s.growAsked {
+		req.Grow = true
+		s.growAsked = true
+	}
+	return req
+}
+
+// growRefused records that the account could not fund the last request, which
+// re-arms it.
+//
+// Re-arming looks like the storm the once-per-epoch rule exists to prevent, and
+// is not: the request rides a renew that was going to happen anyway, so it
+// costs no round trip, and it is bounded at one per renew interval per volume
+// that is genuinely full. It is also the only way out of the state. Buying disk
+// raises the account budget, and the billing hook's Rebalance reclaims and
+// compacts — it does not GROW a volume that is already at its ceiling
+// (storagequota.Rebalance). So an Agent that asked once, was refused, and never
+// asked again would stay stuck after the user paid to unstick it.
+func (s *Supervisor) growRefused() {
+	s.mu.Lock()
+	s.growAsked = false
+	epoch := s.grantApplied
+	s.mu.Unlock()
+	s.log("grant_over_budget", "epoch", epoch)
 }
 
 func (s *Supervisor) reportUsage(ctx context.Context) {
@@ -965,7 +1052,21 @@ func (s *Supervisor) appliedGrant() int64 {
 	return s.grantApplied
 }
 
+// ackDelivered clears the queued acknowledgement once the control-plane's own
+// answer proves it landed. The renew response carries acked_epoch as the server
+// recorded it, so the worker drops the ack only on the server's word rather
+// than on "I sent it" — a renew whose request was written and whose response
+// was lost leaves the ack queued, and the next renew re-sends it.
+func (s *Supervisor) ackDelivered(recorded int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingAck > 0 && recorded >= s.pendingAck {
+		s.pendingAck = 0
+	}
+}
+
 func (s *Supervisor) writeHealth() {
+	s.noteQuotaTrips()
 	s.mu.Lock()
 	h := Health{
 		Epoch:             s.Spec.FenceEpoch,
@@ -976,6 +1077,7 @@ func (s *Supervisor) writeHealth() {
 		UsedBytes:         s.lastUsage.Bytes,
 		UsedInodes:        s.lastUsage.Inodes,
 		GrantEpochApplied: s.grantApplied,
+		QuotaExhausted:    s.quotaExhausted,
 		Fenced:            s.fenced,
 	}
 	if !s.lastBarrier.BarrierAt.IsZero() {

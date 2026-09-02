@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -50,6 +51,9 @@ type fakeVolume struct {
 	writeExpiry time.Time
 	calls       []string
 	serve       chan error
+	grants      [][2]int64
+	grantErr    error
+	quotaTrips  atomic.Uint64
 }
 
 func (f *fakeVolume) record(name string) {
@@ -95,9 +99,28 @@ func (f *fakeVolume) Barrier(ctx context.Context) (BarrierResult, error) {
 }
 func (f *fakeVolume) PendingBlocks() uint64                { return 0 }
 func (f *fakeVolume) Usage(context.Context) (Usage, error) { return f.usage, nil }
-func (f *fakeVolume) ApplyGrant(context.Context, int64, int64) error {
+func (f *fakeVolume) ApplyGrant(_ context.Context, bytes, inodes int64) error {
 	f.record("apply_grant")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.grantErr != nil {
+		return f.grantErr
+	}
+	f.grants = append(f.grants, [2]int64{bytes, inodes})
 	return nil
+}
+
+// QuotaTrips is the metadata engine's refusal counter. The double exposes it as
+// a settable number rather than a "the volume is full" flag for the same reason
+// the engine does: the supervisor has to distinguish a NEW refusal from an old
+// one, and only a monotonic counter carries that (PLO-324).
+func (f *fakeVolume) QuotaTrips() uint64 { return f.quotaTrips.Load() }
+
+// appliedGrants is every ceiling ApplyGrant was asked for, in order.
+func (f *fakeVolume) appliedGrants() [][2]int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][2]int64(nil), f.grants...)
 }
 func (f *fakeVolume) FenceWrites() {
 	f.mu.Lock()
@@ -133,11 +156,16 @@ func (f *fakeFS) Open(context.Context, *MountSpec) (Volume, error) {
 }
 
 type fakeCP struct {
-	mu       sync.Mutex
-	calls    []string
-	renewErr error
-	expiry   func() time.Time
-	grant    GrantSpec
+	mu         sync.Mutex
+	calls      []string
+	renewErr   error
+	expiry     func() time.Time
+	grant      GrantSpec
+	overBudget bool
+	// onGrow is the allocator: it answers a RenewRequest carrying Grow with
+	// whatever the account can fund. nil means an allocator that never moves.
+	onGrow   func(GrantSpec) GrantSpec
+	renews   []RenewRequest
 	released string
 }
 
@@ -147,8 +175,18 @@ func (c *fakeCP) order() []string {
 	defer c.mu.Unlock()
 	return append([]string(nil), c.calls...)
 }
-func (c *fakeCP) RenewLease(context.Context, string, int64) (LeaseResponse, error) {
+func (c *fakeCP) RenewLease(_ context.Context, _ string, _ int64, req RenewRequest) (LeaseResponse, error) {
 	c.record("renew")
+	c.mu.Lock()
+	c.renews = append(c.renews, req)
+	if req.Grow && c.onGrow != nil {
+		c.grant = c.onGrow(c.grant)
+	}
+	if req.AckedGrantEpoch > c.grant.AckedEpoch {
+		c.grant.AckedEpoch = req.AckedGrantEpoch
+	}
+	grant, overBudget := c.grant, c.overBudget
+	c.mu.Unlock()
 	if c.renewErr != nil {
 		return LeaseResponse{}, c.renewErr
 	}
@@ -156,7 +194,14 @@ func (c *fakeCP) RenewLease(context.Context, string, int64) (LeaseResponse, erro
 	if c.expiry != nil {
 		exp = c.expiry()
 	}
-	return LeaseResponse{LeaseExpiresAt: exp, Grant: c.grant}, nil
+	return LeaseResponse{LeaseExpiresAt: exp, Grant: grant, OverBudget: overBudget}, nil
+}
+
+// renewRequests is every RenewRequest the worker sent, in order.
+func (c *fakeCP) renewRequests() []RenewRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]RenewRequest(nil), c.renews...)
 }
 func (c *fakeCP) ReleaseLease(_ context.Context, _ string, _ int64, reason string) error {
 	c.mu.Lock()
@@ -171,10 +216,6 @@ func (c *fakeCP) ReportUsage(context.Context, string, int64, Usage, time.Time) e
 }
 func (c *fakeCP) ReportDurablePoint(context.Context, string, int64, BarrierResult, string) error {
 	c.record("durable_point")
-	return nil
-}
-func (c *fakeCP) AckGrant(context.Context, string, int64, int64) error {
-	c.record("grant_ack")
 	return nil
 }
 
