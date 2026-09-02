@@ -39,8 +39,13 @@ credentials are exit 68.
 ## The MountSpec
 
 The spec file is the control-plane's `storagespec.MountSpec`, decoded verbatim
-with `DisallowUnknownFields`. The control-plane is the authority on that wire;
-`pkg/plori/mount.MountSpec` is a copy of it, and the copy is checked by decoding
+with `DisallowUnknownFields`. The types live in `pkg/plori/mountspec`, which is
+the one package under `pkg/plori/` with **no** `plori` build tag: a wire
+contract is plain data, and the other end of it has to be able to decode it
+without inheriting the release profile. `pkg/plori/mount` re-exports the names
+(`MountSpec`, `LoadSpec`, …) as aliases, so the supervisor reads the same as
+before. The control-plane is the authority on that wire;
+`mountspec.MountSpec` is a copy of it, and the copy is checked by decoding
 the control-plane's own generated golden
 (`services/control-plane/internal/storagespec/testdata/*.golden.json`) in
 plori-runtime's `services/storage-worker`. Two ends built from prose drifted

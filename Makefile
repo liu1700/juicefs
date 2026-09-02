@@ -104,11 +104,15 @@ test.plori.meta:
 # and `memkv://` hit logger.Fatalf in meta.NewClient and killed it outright
 # (PLO-368). The test doubles now pick `file` and sqlite3, both in the profile.
 #
-# ./pkg/plori is here for the other half of the same gap: every file in it is
-# `//go:build plori`, so it exists only under this tag set. It holds the
-# plori-mount supervisor (PLO-321) and the restore/repair code (PLO-320), and
-# `...` picks up whatever lands under it next. This is its one gate -- see the
-# note on test.plori.meta above.
+# ./pkg/plori is here for the other half of the same gap. Every file in it is
+# `//go:build plori` EXCEPT ./pkg/plori/mountspec, which is the plori-mount wire
+# contract and carries no tag on purpose (PLO-395: the other end of that
+# contract, plori-runtime's storage-worker, has to decode it on a plain build).
+# So this target is the one gate for the tagged half -- the supervisor (PLO-321)
+# and the restore/repair code (PLO-320) -- and `...` picks up whatever lands
+# under it next; mountspec is gated on the default build by test.plori.upstream
+# as well, which is where its own tests have to pass. See the note on
+# test.plori.meta above.
 #
 # Needs the same Redis server on 127.0.0.1:6379 as test.plori.meta for the Redis
 # rows of the readdir engine matrix. TestBackupPloriProfile skips itself unless
@@ -132,16 +136,20 @@ test.plori.unit:
 # logger.Fatalf in meta.NewClient (pkg/meta/interface.go:675) and kills the test
 # binary outright -- 243s, red, for engines we do not ship.
 #
-# ./pkg/plori is absent for the opposite reason: every file in it is
-# `//go:build plori`, so on the default build the pattern matches no packages at
-# all. test.plori.unit is where it runs.
+# ./pkg/plori/mountspec is the one package under ./pkg/plori that is NOT
+# `//go:build plori`: it is the plori-mount wire contract, and it is untagged
+# precisely so the other end -- plori-runtime's services/storage-worker -- can
+# decode a control-plane MountSpec without inheriting the release profile
+# (PLO-395). That makes the default build its real build, so it is gated here.
+# The rest of ./pkg/plori matches no packages at all without the tag and runs in
+# test.plori.unit.
 #
 # SKIP_NON_CORE is upstream's gate for the cases that need a KeyDB or a Redis
 # cluster. ./pkg/object's remote backends skip themselves when their credentials
 # are absent (38 of them).
 test.plori.upstream:
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 25m \
-		./pkg/chunk/... ./pkg/vfs/... ./pkg/object/...
+		./pkg/chunk/... ./pkg/vfs/... ./pkg/object/... ./pkg/plori/mountspec/...
 
 test.plori.security:
 	python3 hack/verify_plori_security_test.py
