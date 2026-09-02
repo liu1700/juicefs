@@ -221,11 +221,15 @@ directory-watch config is the open question there.
   the worker exposes no Prometheus surface of its own, and the JuiceFS metrics
   listener is disabled because one listener per mount does not fit a node
   running many. Owner: PLO-325.
-* **Recovery to `T_before` across nodes.** The anchor is persisted locally and
-  reported to the control-plane, but the MountSpec does not hand it back, so a
-  worker starting on a different node restores the latest transaction rather
-  than the last proven durable point. Owner: PLO-326, and it needs a MountSpec
-  field.
+* ~~**Recovery to `T_before` across nodes.**~~ Implemented by PLO-391. The
+  MountSpec carries `durable_point` (the anchor, with the fencing epoch that
+  produced it) and `restore_from_prefix` (that epoch's metadata prefix), so a
+  worker starting on a node with no local `durable-point.json` restores the last
+  proven durable point rather than the latest transaction. Both are omitted when
+  the control-plane has no durable point on record, and the `PriorMetaPrefix`
+  listing stays as the fallback for that case. One gap remains: the anchor is a
+  wall-clock instant, so `replica_txid` is carried but not yet used — restoring
+  BY TXID needs a `Replicator.Restore` that takes one.
 * **A live quota hook.** A grant change is applied by rewriting the Format's
   capacity and inode ceiling, which the running client picks up on its next
   reload rather than immediately. Owner: PLO-324.

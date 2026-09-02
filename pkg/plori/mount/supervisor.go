@@ -204,16 +204,26 @@ func (s *Supervisor) start(ctx context.Context) error {
 }
 
 func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
-	// A durable point left by a previous generation ON THIS NODE is the
-	// restore anchor. On a fresh node there is none; the control-plane holds
-	// the authoritative copy but does not hand it back in the MountSpec yet,
-	// so the fallback is "restore the latest transaction" and PLO-326 owes
-	// the E_RESTORED_TO_BARRIER path (see docs/en/development/plori_mount.md).
-	var anchor time.Time
+	// The restore anchor comes from the control-plane when it has one: it is
+	// the authoritative copy, and it is the only one a Pod rescheduled onto a
+	// different node can see. The local file is the same fact written by
+	// whichever generation last ran HERE, and it wins only when it is strictly
+	// newer — which happens when that generation completed its barrier and
+	// then failed to report it, exactly the crash this anchor exists for. With
+	// neither, the restore takes the replica's latest transaction, which is
+	// what every mount did before the server carried the point (PLO-391).
+	var (
+		anchor time.Time
+		from   int64
+	)
+	if dp := s.Spec.DurablePoint; dp != nil {
+		anchor, from = dp.DurableAt, dp.FenceEpoch
+		s.log("restore_anchor", "durable_at", anchor, "from_epoch", from, "source", "mount_spec")
+	}
 	if dp, err := ReadDurablePoint(s.Paths.DurablePointPath()); err == nil && dp != nil {
-		if dp.Volume == s.Spec.StorageVolumeID && dp.FenceEpoch < s.Spec.FenceEpoch {
-			anchor = dp.DurableAt
-			s.log("restore_anchor", "durable_at", anchor, "from_epoch", dp.FenceEpoch)
+		if dp.Volume == s.Spec.StorageVolumeID && dp.FenceEpoch < s.Spec.FenceEpoch && dp.DurableAt.After(anchor) {
+			anchor, from = dp.DurableAt, dp.FenceEpoch
+			s.log("restore_anchor", "durable_at", anchor, "from_epoch", from, "source", "state_dir")
 		}
 	}
 	// A previous generation that did not write the clean marker died without
@@ -227,19 +237,33 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	_ = os.Remove(s.Paths.CleanStopPath())
 
 	// The metadata root is partitioned per writer epoch, so this epoch's own
-	// prefix is empty by construction and the bytes live under the previous
-	// one. The MountSpec names only the current prefix, so the source is
-	// discovered from the store; MetaRoot() is the parent both share.
-	source, err := s.Deps.Fencer.PriorMetaPrefix(ctx, s.Spec.MetaRoot(), s.Spec.FenceEpoch)
-	if err != nil {
-		return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true,
-			"find the metadata generation to restore from: %s", err)
-	}
+	// prefix is empty by construction and the bytes live under an earlier one.
+	// The server names it when it knows it — `restore_from_prefix` is the
+	// prefix of the epoch that produced the durable point above, so the source
+	// and the point it is restored to are one answer rather than two
+	// independently derived ones.
+	//
+	// Without it the source is discovered by listing the metadata root and
+	// taking the newest prefix below this epoch that holds more than a fence
+	// marker. That listing stays: it is the only correct answer for a volume
+	// no writer has ever reported a durable point for, and it is what makes
+	// `epoch - 1` unnecessary — an epoch that claimed a fence and replicated
+	// nothing is skipped by both paths.
+	source := s.Spec.RestoreFromPrefix
 	if source != "" {
-		s.log("restore_source", "prefix", source)
+		s.log("restore_source", "prefix", source, "discovery", "mount_spec")
+	} else {
+		var err error
+		if source, err = s.Deps.Fencer.PriorMetaPrefix(ctx, s.Spec.MetaRoot(), s.Spec.FenceEpoch); err != nil {
+			return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true,
+				"find the metadata generation to restore from: %s", err)
+		}
+		if source != "" {
+			s.log("restore_source", "prefix", source, "discovery", "list")
+		}
 	}
 
-	err = s.Deps.Replicator.Restore(ctx, source, anchor)
+	err := s.Deps.Replicator.Restore(ctx, source, anchor)
 	switch {
 	case err == nil:
 		if s.restoredUnclean {
