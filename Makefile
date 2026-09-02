@@ -85,13 +85,15 @@ test.plori.sqlite:
 # unknown driver, so either one aborts the whole test binary instead of failing
 # just itself. Everything else is expected to pass: keep this a skip list, not
 # a -run allowlist, so a new upstream test is picked up by default.
-# ./pkg/plori/... rides along: it is the per-Agent restore/repair code and is
-# compiled out of every other build by the `plori` tag, so this gate is the
-# only place its tests run. It needs no Redis.
+#
+# ./pkg/plori/... is NOT here. PLO-320 put it in this target because at the time
+# it was the only gate that ran anything under the release tag set; PLO-368's
+# test.plori.unit below is now that gate for every non-meta package, and listing
+# ./pkg/plori in both would run it twice. Keep it in one place -- and this is
+# the wrong one: SKIP_NON_CORE and the -skip regex above name ./pkg/meta tests.
 test.plori.meta:
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 20m \
-		-tags "$(PLORI_TAGS)" -skip '^TestLoadDump$$|^TestLoadDumpV2$$' \
-		./pkg/meta/ ./pkg/plori/...
+		-tags "$(PLORI_TAGS)" -skip '^TestLoadDump$$|^TestLoadDumpV2$$' ./pkg/meta/
 
 # ./pkg/chunk and ./pkg/vfs under the release tag set: the writeback store, the
 # durability barrier and the VFS the plori-mount supervisor is built on.
@@ -103,9 +105,10 @@ test.plori.meta:
 # (PLO-368). The test doubles now pick `file` and sqlite3, both in the profile.
 #
 # ./pkg/plori is here for the other half of the same gap: every file in it is
-# `//go:build plori`, so it exists only under this tag set and no target ran its
-# tests at all. It holds the plori-mount supervisor (PLO-321) -- lease, fence,
-# restore and ordered stop -- and costs ~1.5s.
+# `//go:build plori`, so it exists only under this tag set. It holds the
+# plori-mount supervisor (PLO-321) and the restore/repair code (PLO-320), and
+# `...` picks up whatever lands under it next. This is its one gate -- see the
+# note on test.plori.meta above.
 #
 # Needs the same Redis server on 127.0.0.1:6379 as test.plori.meta for the Redis
 # rows of the readdir engine matrix. TestBackupPloriProfile skips itself unless
