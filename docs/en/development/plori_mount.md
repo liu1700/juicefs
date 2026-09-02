@@ -210,13 +210,10 @@ directory-watch config is the open question there.
 
 ## Not implemented
 
-* **Restore-time missing-block repair.** An unclean generation is detected and
-  logged as `E_RESTORED_TO_BARRIER`, but nothing repairs metadata that
-  references an object the previous writer never uploaded. The intended repair
-  is an unconditional full `fsck` of the restored metadata against the objects,
-  never a path-scoped one, which was measured at roughly 870 ms, 12 LIST calls
-  and 34 MiB on an 11k-object volume against 15 times that for the path-scoped
-  form. Owner: PLO-320.
+* ~~**Restore-time missing-block repair.**~~ Implemented by PLO-320 in
+  `pkg/plori/restore`; see [`plori_restore.md`](plori_restore.md). The
+  supervisor calls `Volume.RepairAfterRestore` after an unclean generation,
+  between the session purge and the start of replication.
 * **Litestream retention policy.** Snapshot interval, L0 retention and the
   compaction levels are set, but nothing prunes an abandoned epoch's metadata
   prefix after its volume is retired. Owner: PLO-320.

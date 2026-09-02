@@ -77,6 +77,25 @@ type BarrierResult struct {
 	PendingBlocks uint64
 }
 
+// RepairReport is one restore-time repair pass over the data plane
+// (crash-consistency.md §7 d3). It is logged and reported, never swallowed:
+// an Agent whose files were cut short has to be able to find out why.
+type RepairReport struct {
+	// Scanned is the number of slices the scan considered.
+	Scanned int `json:"scanned"`
+	// Checked is the number of blocks the scan asked the object store about.
+	Checked int `json:"checked"`
+	// Missing is the number of blocks the store did not hold.
+	Missing int `json:"missing"`
+	// Files is the number of inodes affected.
+	Files int `json:"files"`
+	// Truncated is how many of those were cut back to their last readable
+	// byte; the rest carry the marker only.
+	Truncated int `json:"truncated"`
+	// Elapsed is the wall time of the scan and repair.
+	Elapsed time.Duration `json:"elapsed"`
+}
+
 // Usage is the volume's consumption as the metadata engine sees it.
 type Usage struct {
 	Bytes  int64
@@ -110,6 +129,16 @@ type Volume interface {
 	// this metadata claims to be, and this object says which volume actually
 	// owns the data prefix (threat-model F-10 / R11).
 	StoredUUID(ctx context.Context) (string, error)
+	// RepairAfterRestore scans the restored metadata against the object store
+	// and quarantines every file that references a block the store does not
+	// hold (crash-consistency.md §7 d3). `juicefs fsck` detects this condition
+	// but its --repair only fixes directories, so the repair action itself
+	// lives in pkg/plori/restore.
+	//
+	// It runs only after an unclean generation, and only before replication
+	// starts, so its metadata writes are part of the first transaction this
+	// epoch replicates and no Agent ever sees the stat-ok/read-EIO file.
+	RepairAfterRestore(ctx context.Context) (RepairReport, error)
 	// PurgeSessions deletes every client session recorded in the restored
 	// metadata before this process opens its own (PLO-362). With
 	// --heartbeat 300 the previous writer's row does not expire for 25

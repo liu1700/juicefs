@@ -41,6 +41,9 @@ type fakeVolume struct {
 	integrity error
 	purgeErr  error
 	purged    int
+	repair    RepairReport
+	repairErr error
+	repaired  int
 	barrier   func(context.Context) (BarrierResult, error)
 	usage     Usage
 	fenced    bool
@@ -63,6 +66,13 @@ func (f *fakeVolume) order() []string {
 func (f *fakeVolume) Identity() FormatIdentity                   { return f.id }
 func (f *fakeVolume) IntegrityCheck(context.Context) error       { return f.integrity }
 func (f *fakeVolume) StoredUUID(context.Context) (string, error) { return f.storedID, f.storedErr }
+func (f *fakeVolume) RepairAfterRestore(context.Context) (RepairReport, error) {
+	f.record("repair")
+	f.mu.Lock()
+	f.repaired++
+	f.mu.Unlock()
+	return f.repair, f.repairErr
+}
 func (f *fakeVolume) PurgeSessions(context.Context) (int, error) {
 	f.record("purge_sessions")
 	return f.purged, f.purgeErr
@@ -579,4 +589,83 @@ func TestPriorPrefixCandidatesAreNewestFirstAndBelowTheEpoch(t *testing.T) {
 	if len(priorPrefixCandidates([]string{root + "g1/"}, root, 1)) != 0 {
 		t.Error("a writer must never restore from its own or a later epoch")
 	}
+}
+
+// The restore-time repair is the crux fix (crash-consistency.md §7 d3): it has
+// to run exactly when the previous generation died mid-flight, and never when
+// it stopped cleanly, because a full scan on every warm start would pay 870 ms
+// and 12 LIST operations for nothing.
+func TestRepairRunsOnlyAfterAnUncleanGeneration(t *testing.T) {
+	t.Run("unclean generation repairs before replication starts", func(t *testing.T) {
+		vol := healthyVolume()
+		vol.repair = RepairReport{Scanned: 12, Checked: 30, Missing: 1, Files: 1, Truncated: 1}
+		sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+		// No clean marker: the previous writer did not finish its stop.
+		if err := sup.start(context.Background()); err != nil {
+			t.Fatalf("startup: %+v", err)
+		}
+		if vol.repaired != 1 {
+			t.Fatalf("repair ran %d times, want 1", vol.repaired)
+		}
+		order := vol.order()
+		repairAt, purgeAt := indexOf(order, "repair"), indexOf(order, "purge_sessions")
+		if repairAt < 0 || purgeAt < 0 || repairAt < purgeAt {
+			t.Fatalf("repair must follow the session purge, got %v", order)
+		}
+	})
+
+	t.Run("clean generation does not repair", func(t *testing.T) {
+		vol := healthyVolume()
+		sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+		if err := os.MkdirAll(sup.Paths.StateDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(sup.Paths.CleanStopPath(), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := sup.start(context.Background()); err != nil {
+			t.Fatalf("startup: %+v", err)
+		}
+		if vol.repaired != 0 {
+			t.Fatalf("a clean stop must not trigger a repair, ran %d times", vol.repaired)
+		}
+	})
+
+	t.Run("a freshly formatted volume does not repair", func(t *testing.T) {
+		spec := testSpec()
+		spec.Generation = 1
+		spec.VolumeState = VolumeStateFormatted
+		spec.FormatUUID = ""
+		vol := healthyVolume()
+		sup := newSup(t, spec, &fakeFS{vol: vol}, &fakeCP{},
+			&fakeReplicator{restoreErr: ErrReplicaEmpty}, &fakeFencer{})
+		if err := sup.start(context.Background()); err != nil {
+			t.Fatalf("startup: %+v", err)
+		}
+		if vol.repaired != 0 {
+			t.Fatalf("a volume with no history has nothing to repair, ran %d times", vol.repaired)
+		}
+	})
+
+	t.Run("a repair failure refuses the mount", func(t *testing.T) {
+		vol := healthyVolume()
+		vol.repairErr = errors.New("object store said 503")
+		sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+		err := sup.start(context.Background())
+		if err == nil {
+			t.Fatal("a failed repair must refuse the mount")
+		}
+		if f := Classify(err); f.ErrCode != ErrCodeRestoredToBarrier {
+			t.Fatalf("got %v / %s, want %s", err, f.ErrCode, ErrCodeRestoredToBarrier)
+		}
+	})
+}
+
+func indexOf(a []string, want string) int {
+	for i, s := range a {
+		if s == want {
+			return i
+		}
+	}
+	return -1
 }

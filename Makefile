@@ -85,9 +85,13 @@ test.plori.sqlite:
 # unknown driver, so either one aborts the whole test binary instead of failing
 # just itself. Everything else is expected to pass: keep this a skip list, not
 # a -run allowlist, so a new upstream test is picked up by default.
+# ./pkg/plori/... rides along: it is the per-Agent restore/repair code and is
+# compiled out of every other build by the `plori` tag, so this gate is the
+# only place its tests run. It needs no Redis.
 test.plori.meta:
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 20m \
-		-tags "$(PLORI_TAGS)" -skip '^TestLoadDump$$|^TestLoadDumpV2$$' ./pkg/meta/
+		-tags "$(PLORI_TAGS)" -skip '^TestLoadDump$$|^TestLoadDumpV2$$' \
+		./pkg/meta/ ./pkg/plori/...
 
 test.plori.security:
 	python3 hack/verify_plori_security_test.py
