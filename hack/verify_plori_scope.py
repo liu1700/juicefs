@@ -27,9 +27,9 @@ EXPECTED_DOCKERIGNORE = {
 }
 EXPECTED_POLICY = {
     "schemaVersion": 1,
-    "profile": "redis-s3-fuse",
+    "profile": "redis-sqlite3-s3-fuse",
     "supportedInterfaces": ["fuse"],
-    "supportedMetadataEngines": ["redis"],
+    "supportedMetadataEngines": ["redis", "sqlite3"],
     "supportedObjectStores": ["s3"],
     "excludedSecurityDomains": ["hadoop-java-sdk", "ranger-authorization"],
 }
@@ -39,6 +39,22 @@ FORBIDDEN_WORKFLOW = re.compile(
     r"gradlew|jar|openjdk)(?:[\s/:@]|$))",
     re.IGNORECASE | re.MULTILINE,
 )
+# `sqlite_omit_load_extension` compiles out `sqlite3_enable_load_extension` and
+# the `load_extension()` SQL function (mattn/go-sqlite3
+# `sqlite3_load_extension_omit.go:6,12` -> `-DSQLITE_OMIT_LOAD_EXTENSION`), so a
+# per-Agent metadata DB cannot be turned into a code-loading primitive.
+REQUIRED_TAGS = {"plori", "nohdfs", "sqlite_omit_load_extension"}
+# Build tags that would compile out an engine the support policy promises.
+FORBIDDEN_TAGS = {"nosqlite"}
+# Metadata engine -> the build tag that removes it.
+ENGINE_EXCLUSION_TAG = {
+    "sqlite3": "nosqlite",
+    "mysql": "nomysql",
+    "postgres": "nopg",
+    "tikv": "notikv",
+    "etcd": "noetcd",
+    "badger": "nobadger",
+}
 EXPECTED_STAGE_COPIES = {
     ("build", "/src/juicefs.plori", "/juicefs"),
     ("scan-build", "/src/juicefs.plori.scan", "/juicefs.scan"),
@@ -111,7 +127,7 @@ def verify(root: pathlib.Path) -> list[str]:
     policy_path = root / ".github/security/plori-support-policy.json"
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
     if policy != EXPECTED_POLICY:
-        errors.append("Plori support policy differs from the audited Redis + S3 + FUSE contract")
+        errors.append("Plori support policy differs from the audited Redis + SQLite + S3 + FUSE contract")
 
     dockerfile_path = root / "Dockerfile.plori"
     context_sources, stage_copies, docker_errors = copied_sources(dockerfile_path)
@@ -148,8 +164,28 @@ def verify(root: pathlib.Path) -> list[str]:
     makefile = (root / "Makefile").read_text(encoding="utf-8")
     tags_match = re.search(r"^PLORI_TAGS\s*:=\s*(.+)$", makefile, re.MULTILINE)
     tags = set(tags_match.group(1).split(",")) if tags_match else set()
-    if not {"plori", "nohdfs"}.issubset(tags):
-        errors.append("PLORI_TAGS must include plori and nohdfs")
+    if not REQUIRED_TAGS.issubset(tags):
+        errors.append(
+            "PLORI_TAGS must include " + ", ".join(sorted(REQUIRED_TAGS))
+        )
+    # The support policy and the build tags must not be able to drift apart.
+    # A binary built with `nosqlite` has no SQLite driver, yet would still
+    # report the Plori version and ship a policy that promises `sqlite3`.
+    forbidden_tags = sorted(FORBIDDEN_TAGS & tags)
+    if forbidden_tags:
+        errors.append(
+            "PLORI_TAGS must not exclude a supported metadata engine: "
+            + ", ".join(forbidden_tags)
+        )
+    for engine, exclusion in ENGINE_EXCLUSION_TAG.items():
+        supported = engine in EXPECTED_POLICY["supportedMetadataEngines"]
+        excluded = exclusion in tags
+        if supported == excluded:
+            errors.append(
+                f"metadata engine {engine!r} is "
+                + ("supported by the policy" if supported else "not in the policy")
+                + f" but the build tag {exclusion!r} says otherwise"
+            )
 
     workflow = (root / ".github/workflows/plori.yml").read_text(encoding="utf-8")
     forbidden = FORBIDDEN_WORKFLOW.search(workflow)
@@ -183,7 +219,7 @@ def main() -> int:
         for error in errors:
             print(f"Plori scope verification failed: {error}", file=sys.stderr)
         return 1
-    print("Plori support scope verified (Redis + S3 + FUSE; Hadoop/Java excluded)")
+    print("Plori support scope verified (Redis + SQLite + S3 + FUSE; Hadoop/Java excluded)")
     return 0
 
 

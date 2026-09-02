@@ -5,7 +5,15 @@ all: juicefs
 REVISION := $(shell git rev-parse --short HEAD 2>/dev/null)
 REVISIONDATE := $(shell git log -1 --pretty=format:'%cd' --date short 2>/dev/null)
 PKG := github.com/juicedata/juicefs/pkg/version
-PLORI_TAGS := plori,nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nosqlite,nomysql,nopg,notikv,nobadger,noetcd,nocifs,nostorj,noqiniu,notos,noks3
+# The Plori profile keeps two metadata engines: `redis` (shared volume) and
+# `sqlite3` (per-Agent volume, PLO-319). `sqlite_omit_load_extension` is a
+# mattn/go-sqlite3 tag that compiles the amalgamation with
+# -DSQLITE_OMIT_LOAD_EXTENSION, removing `sqlite3_enable_load_extension` and the
+# `load_extension()` SQL function, so a metadata DB cannot load a shared object.
+PLORI_TAGS := plori,sqlite_omit_load_extension,nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,nostorj,noqiniu,notos,noks3
+# SQLite is cgo. Set it explicitly so a toolchain that defaults CGO_ENABLED to 0
+# fails the build instead of silently producing a binary without SQLite.
+PLORI_CGO := CGO_ENABLED=1
 GCFLAGS =
 LDFLAGS =
 BUILD ?= release
@@ -45,21 +53,29 @@ juicefs.lite: Makefile cmd/*.go pkg/*/*.go
 
 juicefs.plori: Makefile cmd/*.go pkg/*/*.go go.*
 	go version
-	go build -trimpath -buildvcs=true -tags "$(PLORI_TAGS)" \
+	$(PLORI_CGO) go build -trimpath -buildvcs=true -tags "$(PLORI_TAGS)" \
 		-gcflags="$(GCFLAGS)" -ldflags="$(LDFLAGS)" -o juicefs.plori .
 
 juicefs.plori.scan: Makefile cmd/*.go pkg/*/*.go go.*
-	go build -trimpath -buildvcs=true -tags "$(PLORI_TAGS)" \
+	$(PLORI_CGO) go build -trimpath -buildvcs=true -tags "$(PLORI_TAGS)" \
 		-gcflags="$(GCFLAGS)" -ldflags="$(filter-out -s -w,$(LDFLAGS))" -o juicefs.plori.scan .
 
 test.plori.profile:
-	go run -tags "$(PLORI_TAGS)" ./hack/plori-profile
+	$(PLORI_CGO) go run -tags "$(PLORI_TAGS)" ./hack/plori-profile
 
 test.plori.benchmark:
 	python3 -m unittest discover -s hack/plori-benchmark -p 'test_*.py'
 
 test.plori.backup:
-	go test -count=1 -v -tags "$(PLORI_TAGS)" ./pkg/vfs/ -run TestBackupPloriProfile
+	$(PLORI_CGO) go test -count=1 -v -tags "$(PLORI_TAGS)" ./pkg/vfs/ -run TestBackupPloriProfile
+
+# The SQLite PRAGMA contract lives in tag-neutral code (pkg/meta/sql.go), so it
+# is tested on the default build. ./pkg/meta's test package does not compile
+# under PLORI_TAGS: tkv_test.go and sql_test.go reference symbols that
+# nobadger/noetcd/nomysql remove. That the release profile actually carries the
+# driver is covered by test.plori.profile and hack/verify-plori-binary.sh.
+test.plori.sqlite:
+	$(PLORI_CGO) go test -count=1 -v ./pkg/meta/ -run TestSQLitePragma
 
 test.plori.security:
 	python3 hack/verify_plori_security_test.py
@@ -114,7 +130,7 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.backup test.plori.security test.java.security plori.tags
+.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.backup test.plori.sqlite test.plori.security test.java.security plori.tags
 
 plori.tags:
 	@printf '%s\n' "$(PLORI_TAGS)"
