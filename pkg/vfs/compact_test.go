@@ -22,7 +22,6 @@ import (
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
-	"github.com/juicedata/juicefs/pkg/object"
 )
 
 func TestCompact(t *testing.T) {
@@ -35,7 +34,7 @@ func TestCompact(t *testing.T) {
 		CacheSize:   10 << 20,
 		CacheDir:    "memory",
 	}
-	blob, _ := object.CreateStorage("mem", "", "", "", "")
+	blob := newTestStorage()
 	store := chunk.NewCachedStore(blob, cconf, nil)
 
 	// prepare the slices
