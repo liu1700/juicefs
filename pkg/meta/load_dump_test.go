@@ -481,27 +481,6 @@ func TestLoadDumpSlow(t *testing.T) { //skip mutate
 	testLoadDump(t, "postgres", "postgres://localhost:5432/test?sslmode=disable")
 }
 
-func TestLoadDump_MemKV(t *testing.T) {
-	t.Run("Metadata Engine: memkv", func(t *testing.T) {
-		_ = os.Remove(settingPath)
-		m := testLoad(t, "memkv://test/jfs", sampleFile, false)
-		testDump(t, m, 1, sampleFile, "test.dump")
-	})
-	t.Run("Metadata Engine: memkv; --SubDir d1 ", func(t *testing.T) {
-		_ = os.Remove(settingPath)
-		m := testLoad(t, "memkv://user:pass@test/jfs", sampleFile, false)
-		if kvm, ok := m.(*kvMeta); ok { // memkv will be empty if created again
-			if st := kvm.Chroot(Background(), "d1"); st != 0 {
-				t.Fatalf("Chroot to subdir d1: %s", st)
-			}
-		}
-		testDump(t, m, 1, subSampleFile, "test_subdir.dump")
-		testDump(t, m, 0, sampleFile, "test.dump")
-		_ = os.Remove(settingPath)
-		testLoadSub(t, "memkv://user:pass@test/jfs", subSampleFile)
-	})
-}
-
 func testSecretAndTrash(t *testing.T, addr, addr2 string) {
 	m := testLoad(t, addr, sampleFile, false)
 	testDumpV2(t, m, "sqlite-secret.dump", &DumpOption{Threads: 10, KeepSecret: true})

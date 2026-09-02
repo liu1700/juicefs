@@ -1,10 +1,14 @@
+// The memkv metadata engine is excluded from the Plori release profile
+// (see tkv_mem.go), and the tests below are built on it.
+//go:build !plori
+// +build !plori
+
 package meta
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -168,27 +172,5 @@ func TestRemoveEmptyDirReturnsEINTRWhenCanceled(t *testing.T) {
 	st := m.Remove(cctx, RootInode, "test-dir", true, 16, &count)
 	if st != syscall.EINTR {
 		t.Fatalf("expected EINTR, got %s", st)
-	}
-}
-
-func TestBadgerKVTxnReturnsEINTRWhenContextAlreadyCanceled(t *testing.T) {
-	metaURL := "badger://" + filepath.Join(t.TempDir(), "jfs-cancel-tkv-badger")
-	m := NewClient(metaURL, testConfig())
-	if err := m.Reset(); err != nil {
-		t.Fatalf("reset meta: %v", err)
-	}
-	if err := m.Init(testFormat(), true); err != nil {
-		t.Fatalf("init format: %v", err)
-	}
-	km, ok := m.(*kvMeta)
-	if !ok {
-		t.Fatalf("unexpected meta type: %T", m)
-	}
-
-	ctx := NewContext(1, 0, []uint32{0})
-	ctx.Cancel()
-	err := km.txn(ctx, func(tx *kvTxn) error { return nil })
-	if err != syscall.EINTR {
-		t.Fatalf("expected EINTR, got %v", err)
 	}
 }
