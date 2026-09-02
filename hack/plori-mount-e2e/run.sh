@@ -126,7 +126,15 @@ run_worker() {
     --litestream-bin "$LITESTREAM_BIN" \
     > "$logfile" 2>&1 &
   WORKER_PID=$!
+  # The plugin starts each worker with Setpgid so it can signal the group; this
+  # harness has to reproduce that or the group signal above has nothing to aim
+  # at. `set -m` gives every background job its own group.
 }
+
+# Job control, so each background worker becomes its own process-group leader —
+# the shape the plugin creates with Setpgid, and the shape the stop assertions
+# above depend on (PLO-421).
+set -m
 
 await_ready() {
   local state=$1
@@ -183,12 +191,19 @@ assert h['epoch'] == 1, h
 assert h['grant_epoch_applied'] == 1, h
 " || fail "health.json does not show a healthy renew loop"
 
-kill -TERM "$WORKER_PID"
+# PLO-421: the plugin does not signal the worker, it signals the worker's
+# process GROUP — kill(-pid, SIGTERM) — because that is how it reaches anything
+# the worker forked. Signalling only the pid here would test a stop the
+# production path never takes, and it is exactly what hid the bug: the
+# litestream child was in that group, died a millisecond into the stop, and the
+# final `sync -wait` 26 ms later found no control socket. Exit 69, no `clean`,
+# lease left open, on EVERY ordered stop in a cluster.
+kill -TERM -- "-$WORKER_PID" 2>/dev/null || kill -TERM "$WORKER_PID"
 set +e
 wait "$WORKER_PID"; worker_exit=$?
 set -e
 WORKER_PID=""
-[ "$worker_exit" -eq 0 ] || { cat "$WORK/worker1.log"; fail "clean stop exited $worker_exit, want 0"; }
+[ "$worker_exit" -eq 0 ] || { cat "$WORK/worker1.log"; fail "clean stop exited $worker_exit, want 0 (a group-wide SIGTERM must still leave the replicator alive long enough to finish the final sync)"; }
 
 grep -q '/v1/internal/storage/lease/release' "$JOURNAL" || fail "the ordered stop never released the lease"
 grep -q '/v1/internal/storage/durable-point' "$JOURNAL" || fail "no durable point was ever reported"
@@ -199,6 +214,59 @@ grep -q 'UNAUTHORIZED' "$JOURNAL" && fail "the worker presented a token the cont
 format_uuid=$(python3 -c "import json;print(json.load(open('$WORK/state/durable-point.json'))['volume'])" >/dev/null 2>&1; \
   "$PLORI_BIN" status "sqlite3://$WORK/state/meta.db" | python3 -c "import json,sys;print(json.load(sys.stdin)['Setting']['UUID'])")
 [ -n "$format_uuid" ] || fail "could not read the format UUID back"
+
+echo "== remount on the same node after a clean stop (PLO-422) =="
+# The state directory is a hostPath: on the second mount of an Agent on a node
+# it has already run on, `meta.db` is still there. It used to make the restore
+# refuse and the worker exit 67, the kubelet retry, and a writer epoch burn per
+# retry — an Agent could be mounted exactly once per node. A clean
+# predecessor's database is the newest copy there is and must be adopted.
+write_spec 4 "$WORK/spec4.json" "$format_uuid"
+run_worker "$WORK/spec4.json" "$WORK/mnt" "$WORK/state" "$WORK/cache" "$WORK/worker4.log"
+await_ready "$WORK/state" || { cat "$WORK/worker4.log"; fail "the second mount on this state dir never reported ready"; }
+grep -q '"verdict":"adopted"' "$WORK/worker4.log" \
+  || { cat "$WORK/worker4.log"; fail "a cleanly stopped local database was not adopted"; }
+[ "$(cat "$WORK/mnt/probe")" = "durable-bytes-from-generation-1" ] \
+  || fail "the adopted database does not hold what generation 1 wrote"
+echo "written-by-generation-4" > "$WORK/mnt/probe4"
+kill -TERM -- "-$WORKER_PID" 2>/dev/null || kill -TERM "$WORKER_PID"
+set +e
+wait "$WORKER_PID"; worker_exit=$?
+set -e
+WORKER_PID=""
+[ "$worker_exit" -eq 0 ] || { cat "$WORK/worker4.log"; fail "the adopting worker exited $worker_exit, want 0"; }
+[ -f "$WORK/state/clean" ] || fail "the adopting worker did not write a clean marker"
+
+echo "== remount on the same node after a SIGKILL (PLO-422) =="
+# The other half: an unclean predecessor's database is only durable to its last
+# barrier, so it is set aside and the replica is restored over it. What must not
+# happen either way is a refusal.
+write_spec 5 "$WORK/spec5.json" "$format_uuid"
+run_worker "$WORK/spec5.json" "$WORK/mnt" "$WORK/state" "$WORK/cache" "$WORK/worker5.log"
+await_ready "$WORK/state" || { cat "$WORK/worker5.log"; fail "the third mount never reported ready"; }
+killed5="$WORKER_PID"
+kill -9 "$killed5"
+set +e
+wait "$killed5" 2>/dev/null
+set -e
+WORKER_PID=""
+fusermount3 -uz "$WORK/mnt" 2>/dev/null || true
+[ -f "$WORK/state/clean" ] && fail "a SIGKILLed worker left a clean marker"
+
+write_spec 6 "$WORK/spec6.json" "$format_uuid"
+run_worker "$WORK/spec6.json" "$WORK/mnt" "$WORK/state" "$WORK/cache" "$WORK/worker6.log"
+await_ready "$WORK/state" || { cat "$WORK/worker6.log"; fail "the mount after a SIGKILL never reported ready (exit 67 is the PLO-422 regression)"; }
+grep -q '"verdict":"set_aside"' "$WORK/worker6.log" \
+  || { cat "$WORK/worker6.log"; fail "an unclean local database was not set aside"; }
+[ -f "$WORK/state/meta.db.superseded" ] || fail "the superseded database was deleted rather than kept"
+[ "$(cat "$WORK/mnt/probe")" = "durable-bytes-from-generation-1" ] \
+  || fail "the restored database does not hold what generation 1 wrote"
+kill -TERM -- "-$WORKER_PID" 2>/dev/null || kill -TERM "$WORKER_PID"
+set +e
+wait "$WORKER_PID"; worker_exit=$?
+set -e
+WORKER_PID=""
+[ "$worker_exit" -eq 0 ] || { cat "$WORK/worker6.log"; fail "the restoring worker exited $worker_exit, want 0"; }
 
 echo "== generation 2: restore into a fresh state dir under a new epoch =="
 write_spec 2 "$WORK/spec2.json" "$format_uuid"
@@ -211,7 +279,7 @@ await_ready "$WORK/state2" || { cat "$WORK/worker2.log"; fail "restored worker n
 sha_after=$(sha256sum < "$WORK/mnt2/dir/nested/blob" | cut -d' ' -f1)
 [ "$sha_before" = "$sha_after" ] || fail "restored blob differs: $sha_before != $sha_after"
 
-kill -TERM "$WORKER_PID"
+kill -TERM -- "-$WORKER_PID" 2>/dev/null || kill -TERM "$WORKER_PID"
 set +e
 wait "$WORKER_PID"; worker_exit=$?
 set -e

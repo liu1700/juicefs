@@ -350,7 +350,8 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// — left this file itself, and it is the newest anchor there is. Restoring
 	// such a restart to the previous epoch's point drops everything epoch N had
 	// already made durable (PLO-323 F-6c).
-	if dp, err := ReadDurablePoint(s.Paths.DurablePointPath()); err == nil && dp != nil {
+	localPoint, _ := ReadDurablePoint(s.Paths.DurablePointPath())
+	if dp := localPoint; dp != nil {
 		if dp.Volume == s.Spec.StorageVolumeID && dp.FenceEpoch <= s.Spec.FenceEpoch && dp.FenceEpoch > from {
 			// Its prefix is populated by construction: the file is written
 			// only after a barrier, and a barrier only happens once
@@ -366,8 +367,32 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// (PLO-316 wave 2 measured 870 ms / 12 LIST / 34 MiB on 11k objects, so it
 	// is affordable unconditionally — never path-scoped, which is 15x worse).
 	// Until then the condition is reported, not repaired.
-	s.restoredUnclean = !fileExists(s.Paths.CleanStopPath())
+	cleanStop := fileExists(s.Paths.CleanStopPath())
+	s.restoredUnclean = !cleanStop
 	_ = os.Remove(s.Paths.CleanStopPath())
+
+	// The state directory is a host path and outlives the Pod, so on any mount
+	// after the first on this node there is already a `meta.db` here. Decide
+	// between it and the replica ONCE, on evidence, rather than refusing at the
+	// restore (PLO-422): a database this worker's own predecessor left behind
+	// after a clean stop is the newest copy there is, and restoring over a
+	// live or newer one is what must never happen.
+	var serverEpoch int64
+	if dp := s.Spec.DurablePoint; dp != nil {
+		serverEpoch = dp.FenceEpoch
+	}
+	verdict, why, rerr := reconcileLocalDatabase(s.Paths, s.Spec.StorageVolumeID, cleanStop, localPoint, serverEpoch)
+	if rerr != nil {
+		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "reconcile the local metadata database: %s", rerr)
+	}
+	if verdict != localDBAbsent {
+		s.log("local_database", "verdict", string(verdict), "reason", why)
+	}
+	if verdict == localDBAdopted {
+		// No restore: the local database is at least as durable as the replica,
+		// and the identity check that runs next proves it is this volume's.
+		return nil
+	}
 
 	// The metadata root is partitioned per writer epoch, so a FRESH epoch's own
 	// prefix is empty by construction and the bytes live under an earlier one.

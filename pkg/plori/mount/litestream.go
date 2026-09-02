@@ -339,6 +339,22 @@ func (l *Litestream) Start(ctx context.Context) error {
 	cmd.Stdout = os.Stderr // one stream; the plugin reads the last stderr line
 	cmd.Stderr = os.Stderr
 	cmd.Env = l.env()
+	// The child gets a process group of its OWN, and this one line is the
+	// difference between every ordered stop being clean and every ordered stop
+	// being exit 69 (PLO-421).
+	//
+	// The plugin stops a worker with kill(-pid, SIGTERM) — the whole process
+	// group, because that is how it reaches anything the worker forked. Without
+	// Setpgid the replicator is in that group, so it died about a millisecond
+	// into the stop, and the worker's final `sync -wait` 26 ms later found no
+	// control socket: exit 69, no `clean` marker, lease left open, and the next
+	// generation repairing for nothing. Measured on VPS minikube staging.
+	//
+	// The lifetime the child needs is the worker's SHUTDOWN, not the worker's
+	// process. Stop() below already owns it: final sync, then one SIGTERM, then
+	// wait. Leaving it out of the signalled group is what lets that sequence
+	// run at all.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start litestream: %w", err)
 	}
