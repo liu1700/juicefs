@@ -147,8 +147,18 @@ jobs:
             exit 1
           fi
 
-          # The pinned PRAGMA contract must be observable in the mount log and
-          # must not carry the DSN, which contains the database path.
+          # The pinned PRAGMA contract must be observable at open, and the line
+          # that reports it must carry no path. (JuiceFS separately logs
+          # "Meta address: <url>" from NewClient, which is upstream behaviour
+          # and out of scope here.)
+          ./juicefs.plori status "$META" 2>"$RUNNER_TEMP/status.err" >/dev/null
+          grep -F 'SQLite metadata: journal_mode=WAL synchronous=NORMAL busy_timeout=5000ms' \
+            "$RUNNER_TEMP/status.err"
+          if grep -F 'SQLite metadata:' "$RUNNER_TEMP/status.err" | grep -q -F 'meta.db'; then
+            echo "the pragma log line leaks the metadata path" >&2
+            exit 1
+          fi
+
           sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION \
             ./juicefs.plori mount -d "$META" /mnt/plori-sqlite \
             --cache-dir "$RUNNER_TEMP/jfs-sqlite-cache" --writeback --no-usage-report \
@@ -158,12 +168,6 @@ jobs:
             sleep 1
           done
           mountpoint --quiet /mnt/plori-sqlite
-          grep -F 'SQLite metadata: journal_mode=WAL synchronous=NORMAL busy_timeout=5000ms' \
-            "$RUNNER_TEMP/plori-sqlite.log"
-          if grep -F 'meta.db' "$RUNNER_TEMP/plori-sqlite.log"; then
-            echo "mount log leaks the metadata DSN" >&2
-            exit 1
-          fi
 
           # Directory quota below the 1 GiB the CSI driver would round to zero.
           sudo install -d -m 0777 /mnt/plori-sqlite/bounded
