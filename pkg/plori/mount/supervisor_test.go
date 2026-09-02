@@ -34,21 +34,22 @@ import (
 // ------------------------------------------------------------------ fakes ---
 
 type fakeVolume struct {
-	mu        sync.Mutex
-	id        FormatIdentity
-	storedID  string
-	storedErr error
-	integrity error
-	purgeErr  error
-	purged    int
-	repair    RepairReport
-	repairErr error
-	repaired  int
-	barrier   func(context.Context) (BarrierResult, error)
-	usage     Usage
-	fenced    bool
-	calls     []string
-	serve     chan error
+	mu          sync.Mutex
+	id          FormatIdentity
+	storedID    string
+	storedErr   error
+	integrity   error
+	purgeErr    error
+	purged      int
+	repair      RepairReport
+	repairErr   error
+	repaired    int
+	barrier     func(context.Context) (BarrierResult, error)
+	usage       Usage
+	fenced      bool
+	writeExpiry time.Time
+	calls       []string
+	serve       chan error
 }
 
 func (f *fakeVolume) record(name string) {
@@ -108,7 +109,13 @@ func (f *fakeVolume) FenceWrites() {
 }
 func (f *fakeVolume) Fenced() bool                  { f.mu.Lock(); defer f.mu.Unlock(); return f.fenced }
 func (f *fakeVolume) Unmount(context.Context) error { f.record("unmount"); return nil }
+func (f *fakeVolume) Detach(context.Context) error  { f.record("detach"); return nil }
 func (f *fakeVolume) Close() error                  { f.record("close"); return nil }
+func (f *fakeVolume) SetWriteExpiry(at time.Time) {
+	f.mu.Lock()
+	f.writeExpiry = at
+	f.mu.Unlock()
+}
 
 type fakeFS struct {
 	vol       *fakeVolume
@@ -197,14 +204,20 @@ func (r *fakeReplicator) SyncAndWait(context.Context) error { r.record("sync"); 
 func (r *fakeReplicator) TxID(context.Context) (string, error) {
 	return "0000000000000009", nil
 }
-func (r *fakeReplicator) Stop(context.Context) error { r.record("stop"); return nil }
+func (r *fakeReplicator) Stop(context.Context) error  { r.record("stop"); return nil }
+func (r *fakeReplicator) Abort(context.Context) error { r.record("abort"); return nil }
 
 type fakeFencer struct {
-	err   error
-	prior string
+	err    error
+	prior  string
+	marker FenceMarker
+	getErr error
 }
 
 func (f *fakeFencer) Claim(context.Context, string, []byte) error { return f.err }
+func (f *fakeFencer) ReadMarker(context.Context, string) (FenceMarker, error) {
+	return f.marker, f.getErr
+}
 func (f *fakeFencer) PriorMetaPrefix(_ context.Context, root string, epoch int64) (string, error) {
 	if f.prior != "" {
 		return f.prior, nil
@@ -267,8 +280,11 @@ func TestFenceMarkerConflictExitsFenced(t *testing.T) {
 	if got.ErrCode != ErrCodeFenceMarkerHeld {
 		t.Errorf("error code = %s, want %s", got.ErrCode, ErrCodeFenceMarkerHeld)
 	}
-	if cp.released != "fenced" {
-		t.Errorf("release reason = %q, want fenced", cp.released)
+	// A marker held by somebody else is the startup half of "this volume is
+	// not ours", so the lease goes back with the out-of-band reason rather
+	// than the deadline one (PLO-323 F-1).
+	if cp.released != ReasonFencedOutOfBand {
+		t.Errorf("release reason = %q, want %q", cp.released, ReasonFencedOutOfBand)
 	}
 }
 
@@ -378,7 +394,17 @@ func TestEmptyReplicaFormatsOnlyOnAFirstGeneration(t *testing.T) {
 }
 
 // The ordered stop of ADR / PLO-326, asserted as an order rather than as a set
-// of calls: fence, barrier, unmount, close, final sync, stop, then release.
+// of calls: barrier, unmount, fence, close, final sync, stop, then release.
+//
+// The seal sits AFTER the unmount, not before the barrier, and that position is
+// load-bearing. Since PLO-323 F-2 the fence covers the data path, so it also
+// stops the slice commit the barrier's FlushAll depends on: sealing first makes
+// `vfs.FlushAll` answer EROFS and turns every clean stop with a dirty buffer
+// into exit 69, reported data loss. The write-stop margin exists to pay for
+// exactly that drain (threat-model.md §7.5), so the drain runs first and the
+// seal lands the moment the mount is detached — the first instant at which no
+// further filesystem request can arrive. `pkg/vfs.TestPloriOrderedStopFlushes`
+// pins the same thing against the real VFS.
 func TestSigtermRunsTheOrderedShutdown(t *testing.T) {
 	vol := healthyVolume()
 	fs := &fakeFS{vol: vol}
@@ -392,7 +418,7 @@ func TestSigtermRunsTheOrderedShutdown(t *testing.T) {
 	if got.Exit != CodeOK {
 		t.Fatalf("exit = %d, want 0 (%v)", got.Exit, got.Err)
 	}
-	want := []string{"purge_sessions", "fence", "barrier", "unmount", "close"}
+	want := []string{"purge_sessions", "barrier", "unmount", "fence", "close"}
 	if diff := firstDiff(vol.order(), want); diff != "" {
 		t.Errorf("volume call order: %s", diff)
 	}
@@ -438,17 +464,24 @@ func TestFailedShutdownBarrierExits69ButReleasesTheLease(t *testing.T) {
 }
 
 // stale_epoch on renew is terminal by contract: it is never retried, because a
-// retry is the fenced writer still believing it holds the volume.
+// retry is the fenced writer still believing it holds the volume. It is also
+// the out-of-band case — the epoch was taken away, not allowed to run out — so
+// the typed identifier is E_FENCED_OUT_OF_BAND and the stop uploads nothing.
 func TestStaleEpochOnRenewFencesImmediately(t *testing.T) {
 	vol := healthyVolume()
 	cp := &fakeCP{renewErr: &CPError{Status: 409, Code: CPCodeStaleEpoch, Msg: "epoch 3 was moved past"}}
 	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
 	got := sup.Run(context.Background(), make(chan os.Signal))
-	if got.Exit != CodeFenced || got.ErrCode != ErrCodeLeaseLost {
-		t.Fatalf("got exit %d / %s, want %d / %s", got.Exit, got.ErrCode, CodeFenced, ErrCodeLeaseLost)
+	if got.Exit != CodeFenced || got.ErrCode != ErrCodeFencedOutOfBand {
+		t.Fatalf("got exit %d / %s, want %d / %s", got.Exit, got.ErrCode, CodeFenced, ErrCodeFencedOutOfBand)
 	}
 	if !vol.Fenced() {
 		t.Error("writes must be fenced before the process exits")
+	}
+	// Sealed FIRST, before anything else in the stop: the epoch belongs to
+	// somebody else from the instant the renew came back.
+	if order := vol.order(); len(order) == 0 || order[len(order)-3:][0] != "fence" {
+		t.Errorf("volume call order %v: the seal must come before the detach", order)
 	}
 	renews := 0
 	for _, c := range cp.order() {
@@ -572,12 +605,18 @@ func TestRestoreReadsThePreviousGenerationsPrefix(t *testing.T) {
 	}
 }
 
-func TestPriorPrefixCandidatesAreNewestFirstAndBelowTheEpoch(t *testing.T) {
+// The candidate order includes the worker's OWN epoch, newest first. A worker
+// restarted at the same epoch after a crash finds its own prefix populated and
+// must restore from it; restoring from `epoch - 1` there drops everything that
+// epoch already wrote (PLO-323 F-6c). A fresh epoch's prefix holds nothing but
+// its own fence marker, and prefixHasReplica skips it, so this ordering costs a
+// fresh mount nothing.
+func TestPriorPrefixCandidatesAreNewestFirstAtOrBelowTheEpoch(t *testing.T) {
 	root := "agents-meta/v1/"
 	got := priorPrefixCandidates([]string{
-		root + "g1/", root + "g10/", root + "g2/", root + "g11/", root + "gnope/", "elsewhere/g9/",
+		root + "g1/", root + "g10/", root + "g2/", root + "g11/", root + "g12/", root + "gnope/", "elsewhere/g9/",
 	}, root, 11)
-	want := []string{root + "g10/", root + "g2/", root + "g1/"}
+	want := []string{root + "g11/", root + "g10/", root + "g2/", root + "g1/"}
 	if len(got) != len(want) {
 		t.Fatalf("candidates = %v, want %v", got, want)
 	}
@@ -586,8 +625,17 @@ func TestPriorPrefixCandidatesAreNewestFirstAndBelowTheEpoch(t *testing.T) {
 			t.Fatalf("candidates = %v, want %v", got, want)
 		}
 	}
-	if len(priorPrefixCandidates([]string{root + "g1/"}, root, 1)) != 0 {
-		t.Error("a writer must never restore from its own or a later epoch")
+	// A LATER epoch is still never a candidate: that prefix belongs to a writer
+	// that superseded this one, and reading it would be this worker restoring
+	// from its own successor.
+	if got := priorPrefixCandidates([]string{root + "g12/"}, root, 11); len(got) != 0 {
+		t.Errorf("candidates = %v, want none: a writer must never restore from a later epoch", got)
+	}
+	// Its own epoch is a candidate, and on a fresh mount it is harmlessly
+	// empty: the caller only accepts a prefix that prefixHasReplica says holds
+	// more than a fence marker.
+	if got := priorPrefixCandidates([]string{root + "g1/"}, root, 1); len(got) != 1 {
+		t.Errorf("candidates = %v, want the writer's own epoch after a crash-restart", got)
 	}
 }
 
@@ -668,4 +716,84 @@ func indexOf(a []string, want string) int {
 		}
 	}
 	return -1
+}
+
+// The reclaim decides on two proofs and refuses on anything else. Each row here
+// is a way the 412 could be someone else's claim, or could be unprovable — and
+// every one of them must stay fenced out, because the marker is the only
+// store-side fence this design has.
+func TestTheMarkerReclaimFailsClosedOnEveryUnprovenCase(t *testing.T) {
+	spec := testSpec()
+	ours := FenceMarker{Volume: spec.StorageVolumeID, Epoch: spec.FenceEpoch, ClaimedAt: "2026-09-02T00:00:00Z"}
+
+	tests := map[string]struct {
+		fencer *fakeFencer
+		cp     *fakeCP
+	}{
+		"the marker names another volume": {
+			fencer: &fakeFencer{err: ErrFenceMarkerHeld, marker: FenceMarker{
+				Volume: "99999999-9999-9999-9999-999999999999", Epoch: spec.FenceEpoch,
+			}},
+			cp: &fakeCP{},
+		},
+		"the marker names another epoch": {
+			fencer: &fakeFencer{err: ErrFenceMarkerHeld, marker: FenceMarker{
+				Volume: spec.StorageVolumeID, Epoch: spec.FenceEpoch + 1,
+			}},
+			cp: &fakeCP{},
+		},
+		"the marker vanished between the PUT and the GET": {
+			fencer: &fakeFencer{err: ErrFenceMarkerHeld, getErr: ErrFenceMarkerMissing},
+			cp:     &fakeCP{},
+		},
+		"the control-plane says this pod does not hold the epoch": {
+			fencer: &fakeFencer{err: ErrFenceMarkerHeld, marker: ours},
+			cp: &fakeCP{renewErr: &CPError{
+				Status: 403, Code: CPCodeIdentityMismatch, Msg: "volume is not held by this pod",
+			}},
+		},
+		"the control-plane moved past this epoch": {
+			fencer: &fakeFencer{err: ErrFenceMarkerHeld, marker: ours},
+			cp:     &fakeCP{renewErr: &CPError{Status: 409, Code: CPCodeStaleEpoch, Msg: "epoch moved past"}},
+		},
+		"the control-plane cannot be reached to prove it": {
+			fencer: &fakeFencer{err: ErrFenceMarkerHeld, marker: ours},
+			cp:     &fakeCP{renewErr: context.DeadlineExceeded},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			rep := &fakeReplicator{}
+			sup := newSup(t, testSpec(), &fakeFS{vol: healthyVolume()}, tc.cp, rep, tc.fencer)
+			got := sup.Run(context.Background(), make(chan os.Signal))
+			if got.Exit != CodeFenced || got.ErrCode != ErrCodeFenceMarkerHeld {
+				t.Fatalf("exit %d/%s, want %d/%s", got.Exit, got.ErrCode, CodeFenced, ErrCodeFenceMarkerHeld)
+			}
+			if n := len(rep.order()); n != 0 {
+				t.Errorf("a worker that could not prove the claim touched the replica: %v", rep.order())
+			}
+		})
+	}
+}
+
+// The other direction: both proofs hold, so the epoch is already ours and the
+// mount proceeds. Without this a worker crash costs the Agent a full lease TTL
+// of downtime on the failure this supervisor exists to survive (PLO-323 F-6).
+func TestTheMarkerReclaimProceedsWhenBothProofsHold(t *testing.T) {
+	spec := testSpec()
+	fencer := &fakeFencer{err: ErrFenceMarkerHeld, marker: FenceMarker{
+		Volume: spec.StorageVolumeID, Epoch: spec.FenceEpoch, ClaimedAt: "2026-09-02T00:00:00Z",
+	}}
+	cp := &fakeCP{}
+	sup := newSup(t, spec, &fakeFS{vol: healthyVolume()}, cp, &fakeReplicator{}, fencer)
+	stop := make(chan os.Signal, 1)
+	stop <- syscall.SIGTERM
+	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
+		t.Fatalf("exit = %d/%s (%v), want a clean stop", got.Exit, got.ErrCode, got.Err)
+	}
+	// The proof is a renew, and it is the same route the loop uses — so a
+	// reclaim leaves no second control-plane call to review.
+	if order := cp.order(); len(order) == 0 || order[0] != "renew" {
+		t.Errorf("control-plane call order %v must open with the renew that proves the holder", order)
+	}
 }

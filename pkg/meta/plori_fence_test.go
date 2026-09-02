@@ -367,45 +367,97 @@ func TestPloriFenceWritesMakesNamespaceMutationsEROFS(t *testing.T) {
 	}
 }
 
-// TestPloriFenceWritesDoesNotStopWritesThroughAnAlreadyOpenFile is a
-// characterisation test for a gap this audit found, not a guarantee.
+// TestPloriFenceWritesStopsWritesThroughAnAlreadyOpenFile is PLO-323's "stale
+// holders fail writes loudly" on the path that actually carries an Agent's
+// bytes, and it is the assertion the acceptance audit refuted (F-2).
 //
-// plori_fence.go:39 promises that "every mutating metadata operation answers
-// EROFS". It does not: the fence reuses upstream's nine readOnly() call sites
-// (base.go:1634,1733,1822,1853,1921,2064,2324,2341,3384), and Write (base.go:2200),
-// Truncate (:2226), SetAttr (:1508) and Fallocate (:2246) are not among them.
-// Open with O_WRONLY is gated, so no NEW writable handle can be obtained — but
-// an Agent that already holds an fd across the fence trip keeps committing
-// slices to the metadata that Litestream is replicating.
+// The fence used to reuse only upstream's nine namespace call sites. Open with
+// write flags was among them, so no NEW writable handle could be obtained — but
+// Write, Truncate, SetAttr and Fallocate were not, and a handle opened before
+// the fence kept committing slices into the metadata Litestream replicates. An
+// Agent mid-`git clone` holds many such handles, and with no server-side fence
+// on the object store (no STS, no per-prefix credentials — PLO-351) the
+// writer's own cooperation is the only thing between a revoked epoch and a
+// divergent filesystem.
 //
-// This test pins today's behaviour so the gap is visible and the fix is a
-// deliberate, reviewed change rather than a silent one. When the fence is
-// extended to the data path, this test should be inverted, not deleted.
-func TestPloriFenceWritesDoesNotStopWritesThroughAnAlreadyOpenFile(t *testing.T) {
+// It is also the half of PLO-312 that was never superseded: "on revocation,
+// invalidate handles" (acceptance A4). This gate is that preservation.
+func TestPloriFenceWritesStopsWritesThroughAnAlreadyOpenFile(t *testing.T) {
 	m, inode := fencedTestMeta(t)
 	ctx := Background()
 	var attr Attr
 
-	// The handle is obtained BEFORE the fence, which is the realistic case:
-	// an Agent mid-`git clone` holds many of them.
+	// The handle is obtained BEFORE the fence, which is the realistic case.
 	if st := m.Open(ctx, inode, syscall.O_RDWR, &attr); st != 0 {
 		t.Fatalf("open before the fence: %s", st)
 	}
 
 	fenceForTest(t)
 
-	if st := m.Write(ctx, inode, 0, 0, Slice{Id: 1, Size: 4096, Len: 4096}, time.Now()); st != 0 {
-		t.Logf("Write is now fenced (%v) — the gap this test documents is closed; invert the assertions", st)
-		t.Skip("fence has been extended to the data path")
+	cases := []struct {
+		name string
+		run  func() syscall.Errno
+	}{
+		{"Write", func() syscall.Errno {
+			return m.Write(ctx, inode, 0, 0, Slice{Id: 1, Size: 4096, Len: 4096}, time.Now())
+		}},
+		{"Truncate", func() syscall.Errno { return m.Truncate(ctx, inode, 0, 8192, &attr, false) }},
+		{"SetAttr", func() syscall.Errno { return m.SetAttr(ctx, inode, SetAttrMode, 0, &Attr{Mode: 0600}) }},
+		{"Fallocate", func() syscall.Errno {
+			var flen uint64
+			return m.Fallocate(ctx, inode, 0, 0, 4096, &flen)
+		}},
 	}
-	if st := m.Truncate(ctx, inode, 0, 8192, &attr, false); st != 0 {
-		t.Errorf("Truncate = %v; expected the documented gap (unfenced)", st)
+	for _, c := range cases {
+		if st := c.run(); st != syscall.EROFS {
+			t.Errorf("%s through a handle opened before the fence = %v, want EROFS", c.name, st)
+		}
 	}
-	if st := m.SetAttr(ctx, inode, SetAttrMode, 0, &Attr{Mode: 0600}); st != 0 {
-		t.Errorf("SetAttr = %v; expected the documented gap (unfenced)", st)
+
+	// Reads through the same handle keep working: the fence revokes the right
+	// to mutate, not the right to exist.
+	if st := m.GetAttr(ctx, inode, &attr); st != 0 {
+		t.Errorf("GetAttr after the fence = %v, want success", st)
 	}
-	var flen uint64
-	if st := m.Fallocate(ctx, inode, 0, 0, 4096, &flen); st != 0 {
-		t.Errorf("Fallocate = %v; expected the documented gap (unfenced)", st)
+}
+
+// TestTheLeaseExpiryRefusesWritesWithoutAFence is PLO-323 F-5: the deadline is
+// re-checked by the write path itself rather than by a one-second ticker.
+//
+// The instant armed here is the lease EXPIRY, not `expiry − margin`. The margin
+// is the tail of the lease reserved for the flush and the durability barrier
+// (pkg/plori/mount/lease.go), and the staged writeback drains through Write
+// during it — sealing at the margin would make the bounded flush window
+// threat-model.md §7.5 mandates impossible. The margin remains the supervisor's
+// trigger to stop the mount and start that drain.
+func TestTheLeaseExpiryRefusesWritesWithoutAFence(t *testing.T) {
+	m, inode := fencedTestMeta(t)
+	ctx := Background()
+	t.Cleanup(func() { ploriWriteExpiry.Store(noWriteExpiry) })
+
+	slice := Slice{Id: 1, Size: 4096, Len: 4096}
+
+	// A lease with time left on it: writes are submitted normally.
+	PloriSetWriteExpiry(time.Now().Add(time.Hour))
+	if st := m.Write(ctx, inode, 0, 0, slice, time.Now()); st != 0 {
+		t.Fatalf("Write inside the lease = %v, want success", st)
+	}
+
+	// The same process, one instant past its expiry — the frozen-and-thawed
+	// writer of threat-model.md §7.2. Nothing called PloriFenceWrites; the
+	// deadline alone must stop it, and it must stop it on the call itself
+	// rather than whenever a timer next fires.
+	PloriSetWriteExpiry(time.Now().Add(-time.Millisecond))
+	if PloriWritesFenced() {
+		t.Fatal("this test must exercise the deadline, not the fence")
+	}
+	if st := m.Write(ctx, inode, 0, 0, slice, time.Now()); st != syscall.EROFS {
+		t.Errorf("Write past the lease expiry = %v, want EROFS", st)
+	}
+	if st := m.Truncate(ctx, inode, 0, 8192, &Attr{}, false); st != syscall.EROFS {
+		t.Errorf("Truncate past the lease expiry = %v, want EROFS", st)
+	}
+	if st := m.Mkdir(ctx, RootInode, "after-expiry", 0755, 022, 0, &inode2Discard, &Attr{}); st != syscall.EROFS {
+		t.Errorf("Mkdir past the lease expiry = %v, want EROFS", st)
 	}
 }

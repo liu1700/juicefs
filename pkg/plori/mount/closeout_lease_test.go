@@ -21,6 +21,7 @@ package mount
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -82,25 +83,74 @@ func (f *staticFS) Open(context.Context, *MountSpec) (Volume, error) {
 type sharedFencer struct {
 	mu      sync.Mutex
 	claimed map[string]int
-	prior   string
+	// bodies is what each winning claim actually PUT, so a second worker's
+	// ReadMarker sees the real marker rather than a fixture.
+	bodies map[string][]byte
+	// populated names the generation prefixes that hold an LTX history.
+	populated map[string]bool
+	prior     string
 }
 
 func newSharedFencer() *sharedFencer {
-	return &sharedFencer{claimed: map[string]int{}}
+	return &sharedFencer{claimed: map[string]int{}, bodies: map[string][]byte{}}
 }
 
-func (f *sharedFencer) Claim(_ context.Context, key string, _ []byte) error {
+func (f *sharedFencer) Claim(_ context.Context, key string, body []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claimed[key]++
 	if f.claimed[key] > 1 {
 		return ErrFenceMarkerHeld
 	}
+	f.bodies[key] = append([]byte(nil), body...)
 	return nil
 }
 
-func (f *sharedFencer) PriorMetaPrefix(context.Context, string, int64) (string, error) {
-	return f.prior, nil
+func (f *sharedFencer) ReadMarker(_ context.Context, key string) (FenceMarker, error) {
+	f.mu.Lock()
+	body, ok := f.bodies[key]
+	f.mu.Unlock()
+	if !ok {
+		return FenceMarker{}, ErrFenceMarkerMissing
+	}
+	var m FenceMarker
+	if err := json.Unmarshal(body, &m); err != nil {
+		return FenceMarker{}, err
+	}
+	return m, nil
+}
+
+// populate marks a generation prefix as holding more than its own fence
+// marker, which is what prefixHasReplica means by "populated".
+func (f *sharedFencer) populate(prefix string) {
+	f.mu.Lock()
+	if f.populated == nil {
+		f.populated = map[string]bool{}
+	}
+	f.populated[prefix] = true
+	f.mu.Unlock()
+}
+
+// PriorMetaPrefix runs the REAL candidate ordering over the prefixes this store
+// holds, so the "at or below the epoch" rule is exercised rather than stubbed
+// (PLO-323 F-6c). `prior` stays the shortcut for the tests that only care that
+// some source was chosen.
+func (f *sharedFencer) PriorMetaPrefix(_ context.Context, root string, epoch int64) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.populated) == 0 {
+		return f.prior, nil
+	}
+	prefixes := make([]string, 0, len(f.populated))
+	for p := range f.populated {
+		prefixes = append(prefixes, p)
+	}
+	for _, c := range priorPrefixCandidates(prefixes, root, epoch) {
+		if f.populated[c] {
+			return c, nil
+		}
+	}
+	return "", nil
 }
 
 // leaseAuthority models services/control-plane/internal/storagevol's lease
@@ -119,6 +169,14 @@ type leaseAuthority struct {
 	// released records every terminal reason handed back per epoch. Two
 	// workers can share one epoch (the same-epoch race), so this is a list.
 	released map[int64][]string
+	// holder is which Pod the authority handed each epoch to. The real
+	// control-plane never issues one epoch to two Pods — AcquireLease mints a
+	// new epoch for a new holder and replays only for the same one — and the
+	// renew route refuses any caller whose Pod is not the recorded holder
+	// (storagespec/issuer.go authorizeHolder). Modelling that is what makes
+	// the same-epoch reclaim decidable: without it every caller looks like the
+	// owner, and F-6's idempotent claim would wave a stranger through.
+	holder map[int64]string
 }
 
 func newLeaseAuthority(current int64, ttl time.Duration) *leaseAuthority {
@@ -128,7 +186,39 @@ func newLeaseAuthority(current int64, ttl time.Duration) *leaseAuthority {
 		ready:    map[int64]time.Time{},
 		fenced:   map[int64]time.Time{},
 		released: map[int64][]string{},
+		holder:   map[int64]string{},
 	}
+}
+
+// assign records which Pod this epoch was issued to.
+func (a *leaseAuthority) assign(epoch int64, pod string) {
+	a.mu.Lock()
+	a.holder[epoch] = pod
+	a.mu.Unlock()
+}
+
+// asHolder is one Pod's view of the authority. On the real routes the Pod's
+// identity travels in the projected ServiceAccount token, never in the request
+// body, which is why the worker's ControlPlane calls carry no holder argument —
+// so the double binds the identity the same way, by construction.
+type asHolder struct {
+	*leaseAuthority
+	pod string
+}
+
+func (h asHolder) RenewLease(_ context.Context, _ string, epoch int64) (LeaseResponse, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if epoch < h.current {
+		return LeaseResponse{}, &CPError{Status: 409, Code: CPCodeStaleEpoch, Msg: "the presented epoch was moved past"}
+	}
+	if owner, ok := h.holder[epoch]; ok && owner != h.pod {
+		return LeaseResponse{}, &CPError{
+			Status: 403, Code: CPCodeIdentityMismatch,
+			Msg: "this volume is not held by this pod",
+		}
+	}
+	return LeaseResponse{FenceEpoch: epoch, LeaseExpiresAt: time.Now().UTC().Add(h.ttl)}, nil
 }
 
 // promote is the control-plane handing the volume to a new writer.
@@ -254,7 +344,25 @@ func (r *countingReplicator) SyncAndWait(context.Context) error { r.record("sync
 func (r *countingReplicator) TxID(context.Context) (string, error) {
 	return "0000000000000011", nil
 }
-func (r *countingReplicator) Stop(context.Context) error { r.record("stop"); return nil }
+func (r *countingReplicator) Stop(context.Context) error  { r.record("stop"); return nil }
+func (r *countingReplicator) Abort(context.Context) error { r.record("abort"); return nil }
+
+func (r *countingReplicator) restoredFrom() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.prior
+}
+
+func (r *countingReplicator) has(op string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.events {
+		if e.op == op {
+			return true
+		}
+	}
+	return false
+}
 
 func (r *countingReplicator) uploadsAfter(t time.Time) int {
 	r.mu.Lock()
@@ -307,68 +415,105 @@ func specAtEpoch(epoch int64, ttl time.Duration) *MountSpec {
 
 // ------------------------------------------------------------------ tests ---
 
-// TestTwoWorkersAtTheSameEpochOnlyOneEverMounts is the same-epoch half of the
-// concurrency acceptance, and it is the half the worker itself decides: the
-// fence marker is a conditional PUT on one key, so of two workers handed the
-// same epoch exactly one claims it and the other exits 66 before it restores
-// anything. Neither the control-plane nor a timeout is involved.
-func TestTwoWorkersAtTheSameEpochOnlyOneEverMounts(t *testing.T) {
+// The same-epoch half of the concurrency acceptance, split in two because the
+// answer is not the same for the two workers that can present one epoch.
+//
+// The fence marker is a conditional PUT on one key, so of two workers handed
+// epoch N exactly one wins the PUT. What the loser does with its 412 is the
+// whole of PLO-323 F-6: before the fix it was always terminal, which made an
+// ordinary worker crash cost the Agent a full lease TTL of downtime.
+
+// TestASecondHolderAtTheSameEpochNeverMounts is the case that must stay
+// fail-closed. The control-plane never hands one epoch to two Pods, so the only
+// way a second holder presents epoch N is a replayed spec file — and that one
+// must still lose, because its writes would land in a metadata prefix and a
+// shared data prefix the real holder owns.
+func TestASecondHolderAtTheSameEpochNeverMounts(t *testing.T) {
 	auth := newLeaseAuthority(9, 2*time.Minute)
+	auth.assign(9, "pod-a")
 	fencer := newSharedFencer()
 
-	type outcome struct {
-		fatal *Fatal
-		rep   *countingReplicator
+	// The real holder mounts epoch 9 and stops cleanly. Nothing deletes a fence
+	// marker, so its claim outlives it — which is exactly what the stranger
+	// walks into.
+	specA := specAtEpoch(9, 2*time.Minute)
+	volA := &readyReportingVolume{fakeVolume: healthyVolume(), auth: auth, epoch: 9}
+	supA := newCloseoutSup(t, specA, volA, asHolder{auth, "pod-a"}, &countingReplicator{}, fencer)
+	stop := make(chan os.Signal, 1)
+	stop <- syscall.SIGTERM
+	if f := supA.Run(context.Background(), stop); f.Exit != CodeOK {
+		t.Fatalf("the holder of epoch 9 exited %d: %v", f.Exit, f.Err)
 	}
-	results := make(chan outcome, 2)
-	var wg sync.WaitGroup
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			spec := specAtEpoch(9, 2*time.Minute)
-			vol := &readyReportingVolume{fakeVolume: healthyVolume(), auth: auth, epoch: 9}
-			rep := &countingReplicator{}
-			sup := newCloseoutSup(t, spec, vol, auth, rep, fencer)
-			stop := make(chan os.Signal, 1)
-			// Both workers are asked to stop shortly after they mount, so the
-			// winner reaches a clean stop instead of running to the timeout.
-			time.AfterFunc(150*time.Millisecond, func() { stop <- syscall.SIGTERM })
-			results <- outcome{fatal: sup.Run(context.Background(), stop), rep: rep}
-		}()
-	}
-	wg.Wait()
-	close(results)
 
-	var mounted, fenced int
-	for r := range results {
-		switch r.fatal.Exit {
-		case CodeOK:
-			mounted++
-		case CodeFenced:
-			fenced++
-			if r.fatal.ErrCode != ErrCodeFenceMarkerHeld {
-				t.Errorf("loser error code = %s, want %s", r.fatal.ErrCode, ErrCodeFenceMarkerHeld)
-			}
-			// The loser must not have restored or replicated anything: the
-			// marker is claimed before the first LTX read or write.
-			if n := len(r.rep.events); n != 0 {
-				t.Errorf("the fenced-out worker touched the replica %d times, want 0: %v", n, r.rep.events)
-			}
-		default:
-			t.Errorf("unexpected exit %d: %v", r.fatal.Exit, r.fatal.Err)
-		}
+	// A different Pod arrives holding a copy of the same spec.
+	specB := specAtEpoch(9, 2*time.Minute)
+	volB := &readyReportingVolume{fakeVolume: healthyVolume(), auth: auth, epoch: 9}
+	repB := &countingReplicator{}
+	supB := newCloseoutSup(t, specB, volB, asHolder{auth, "pod-b"}, repB, fencer)
+
+	f := supB.Run(context.Background(), make(chan os.Signal))
+	if f.Exit != CodeFenced {
+		t.Fatalf("the stranger exited %d (%v), want %d", f.Exit, f.Err, CodeFenced)
 	}
-	if mounted != 1 || fenced != 1 {
-		t.Fatalf("mounted=%d fenced=%d, want exactly one of each", mounted, fenced)
+	if f.ErrCode != ErrCodeFenceMarkerHeld {
+		t.Errorf("stranger error code = %s, want %s", f.ErrCode, ErrCodeFenceMarkerHeld)
 	}
-	// Both workers share epoch 9 here, so the authority sees two releases: the
-	// loser's "fenced" and the winner's "shutdown".
-	if !auth.releasedWith(9, "fenced") {
-		t.Errorf("no worker released epoch 9 with reason \"fenced\"; saw %q", auth.reasons(9))
+	// It must not have restored or replicated anything: the marker is settled
+	// before the first LTX read or write.
+	if n := len(repB.events); n != 0 {
+		t.Errorf("the fenced-out worker touched the replica %d times, want 0: %v", n, repB.events)
 	}
-	if !auth.releasedWith(9, "shutdown") {
-		t.Errorf("the winner did not release epoch 9 cleanly; saw %q", auth.reasons(9))
+	if !auth.releasedWith(9, ReasonFencedOutOfBand) {
+		t.Errorf("the stranger released epoch 9 with %q, want %q", auth.reasons(9), ReasonFencedOutOfBand)
+	}
+}
+
+// TestTheSameHolderReclaimsItsOwnEpochAfterACrash is the case PLO-323 F-6
+// reopened the issue for, and it is the ordinary one: the worker crashes,
+// nothing releases the lease — nothing else may — the kubelet retries
+// NodePublish, and the control-plane replays the SAME epoch for the same Pod.
+// The replacement then meets its own predecessor's fence marker.
+//
+// Two things must hold. It must mount at all: before the fix the 412 was
+// terminal and the volume stayed unmountable for the rest of the lease TTL. And
+// it must restore from epoch 9's OWN prefix — the crash happened before the
+// first durable-point post, so the control-plane names no source, and the
+// listing fallback used to look strictly BELOW the epoch and hand back epoch
+// 8's replica, silently dropping everything epoch 9 had written (F-6c).
+func TestTheSameHolderReclaimsItsOwnEpochAfterACrash(t *testing.T) {
+	auth := newLeaseAuthority(9, 2*time.Minute)
+	auth.assign(9, "pod-a")
+	fencer := newSharedFencer()
+
+	spec := specAtEpoch(9, 2*time.Minute)
+	root := "agents-meta/" + spec.StorageVolumeID + "/"
+
+	// The store as the crashed generation left it: epoch 8 replicated and
+	// finished, epoch 9 claimed its marker and replicated, then the process
+	// died before it could post a durable point.
+	fencer.populate(root + "g8/")
+	fencer.populate(root + "g9/")
+	marker, err := json.Marshal(FenceMarker{Volume: spec.StorageVolumeID, Epoch: 9, ClaimedAt: "2026-09-02T00:00:00Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fencer.Claim(context.Background(), spec.FenceMarkerKey, marker); err != nil {
+		t.Fatalf("seed the predecessor's marker: %v", err)
+	}
+
+	vol := &readyReportingVolume{fakeVolume: healthyVolume(), auth: auth, epoch: 9}
+	rep := &countingReplicator{}
+	sup := newCloseoutSup(t, spec, vol, asHolder{auth, "pod-a"}, rep, fencer)
+	stop := make(chan os.Signal, 1)
+	stop <- syscall.SIGTERM
+
+	f := sup.Run(context.Background(), stop)
+	if f.Exit != CodeOK {
+		t.Fatalf("the restarted holder exited %d (%v); its own epoch must be reclaimable", f.Exit, f.Err)
+	}
+	if got := rep.restoredFrom(); got != spec.MetaPrefix {
+		t.Errorf("restored from %q, want epoch 9's own prefix %q — anything else drops epoch 9's writes",
+			got, spec.MetaPrefix)
 	}
 }
 
@@ -423,14 +568,17 @@ func TestASupersededWriterFencesItselfWithinOneRenewInterval(t *testing.T) {
 	if oldFatal.Exit != CodeFenced {
 		t.Fatalf("superseded writer exit = %d (%v), want %d", oldFatal.Exit, oldFatal.Err, CodeFenced)
 	}
-	if oldFatal.ErrCode != ErrCodeLeaseLost {
-		t.Errorf("superseded writer error code = %s, want %s", oldFatal.ErrCode, ErrCodeLeaseLost)
+	// stale_epoch is the out-of-band fence: the epoch was taken away rather
+	// than allowed to run out, so the stop skips the barrier and the final
+	// sync (PLO-323 F-1) and says so in its typed identifier.
+	if oldFatal.ErrCode != ErrCodeFencedOutOfBand {
+		t.Errorf("superseded writer error code = %s, want %s", oldFatal.ErrCode, ErrCodeFencedOutOfBand)
 	}
 	if !oldVol.Fenced() {
 		t.Error("the superseded writer exited 66 without fencing its own filesystem")
 	}
-	if !auth.releasedWith(11, "fenced") {
-		t.Errorf("superseded writer released with %q, want \"fenced\"", auth.reasons(11))
+	if !auth.releasedWith(11, ReasonFencedOutOfBand) {
+		t.Errorf("superseded writer released with %q, want %q", auth.reasons(11), ReasonFencedOutOfBand)
 	}
 
 	// The bound: the incumbent must notice within one renew interval of the
@@ -448,34 +596,23 @@ func TestASupersededWriterFencesItselfWithinOneRenewInterval(t *testing.T) {
 	}
 }
 
-// TestAFencedWriterStillUploadsOnItsWayOut is a characterisation test for the
-// question the design documents leave open, not for a confirmed defect.
+// TestAnOutOfBandFenceUploadsNothingOnItsWayOut is the F-1 ruling, asserted.
 //
-// On lease loss the supervisor runs fenceAndStop, which runs the full ordered
-// shutdown (supervisor.go:612-627 then :638-704): fence, `juicefs durability`
-// barrier — which flushes the writeback cache to the SHARED, non-epoch-
-// partitioned data prefix — then Replicator.SyncAndWait and Stop, which push
-// more LTX into the epoch's metadata prefix. All of those are uploads, and they
-// happen after the writer was told it no longer owns the volume.
+// The threat model states the drain rule entirely in terms of expiry
+// (threat-model.md §7.5) and, before this, said nothing about a writer fenced
+// OUT OF BAND — a 412 on the marker, or stale_epoch/lease_held from a renew.
+// The implementation resolved that silence in the less safe direction: it ran
+// the full ordered stop, spending whatever its LOCAL deadline still said it had
+// on a barrier that flushes the writeback cache into the SHARED data prefix,
+// and on LTX pushes into the metadata prefix its successor restores from.
 //
-// For the DEADLINE path that is exactly right: threat-model.md §7.2 rejects both
-// "fence then flush" and "flush then fence", and requires a bounded flush window
-// inside the lease with an incomplete flush reported as data loss. shutdown
-// implements that, bounded by the remaining lease (supervisor.go:639-644).
-//
-// The open question is the OUT-OF-BAND fence — a 412 on the marker, or a
-// stale_epoch/lease_held 409 from renew. The threat model states the drain rule
-// only in terms of expiry and never says whether staged bytes may still be
-// flushed when the epoch was taken away rather than run out. This test forces
-// that case by revoking the epoch while the local lease still has ~2 minutes on
-// it, and records what the implementation does with it.
-//
-// Note the setup is deliberately stronger than production can currently
-// produce: services/control-plane/internal/storagevol has no force-takeover
-// path, so a real stale_epoch only follows a genuine expiry, by which time the
-// worker's own margin guard has already fired and its shutdown budget is the
-// one-second floor. See finding F-1 in the PR body.
-func TestAFencedWriterStillUploadsOnItsWayOut(t *testing.T) {
+// The ruling (PLO-323, recorded in threat-model.md §7): an out-of-band fence
+// skips the remote barrier and the final sync. It seals, detaches without a
+// flush, closes, reports and releases. Nothing it staged reaches the store,
+// because no barrier ran to make that history's blocks durable — a successor
+// restoring it would find metadata referencing objects that were never
+// uploaded.
+func TestAnOutOfBandFenceUploadsNothingOnItsWayOut(t *testing.T) {
 	auth := newLeaseAuthority(20, 2*time.Minute)
 	spec := specAtEpoch(20, 2*time.Minute)
 	spec.LeaseRenewInterval = Duration(30 * time.Millisecond)
@@ -492,7 +629,9 @@ func TestAFencedWriterStillUploadsOnItsWayOut(t *testing.T) {
 		return ok
 	}, "writer never became ready")
 
-	// Revoke the epoch while the local lease still has ~2 minutes on it.
+	// Revoke the epoch while the local lease still has ~2 minutes on it: the
+	// worker's own deadline would happily fund a full barrier here, which is
+	// what makes this about authority rather than about time.
 	auth.promote(21)
 	revokedAt := time.Now()
 
@@ -500,28 +639,86 @@ func TestAFencedWriterStillUploadsOnItsWayOut(t *testing.T) {
 	if f.Exit != CodeFenced {
 		t.Fatalf("exit = %d (%v), want %d", f.Exit, f.Err, CodeFenced)
 	}
+	if f.ErrCode != ErrCodeFencedOutOfBand {
+		t.Errorf("error code = %s, want %s", f.ErrCode, ErrCodeFencedOutOfBand)
+	}
 
-	// The barrier is a data-plane upload and it ran after the fence.
+	// No barrier after the fence, and no upload of any kind after revocation.
 	order := vol.order()
-	fenceAt, barrierAt := -1, -1
 	for i, c := range order {
-		if c == "fence" && fenceAt < 0 {
-			fenceAt = i
+		if c == "fence" {
+			for _, later := range order[i:] {
+				if later == "barrier" {
+					t.Errorf("a durability barrier ran after the fence: %v", order)
+				}
+				if later == "unmount" {
+					t.Errorf("the mount was flushed on its way out; an out-of-band fence detaches: %v", order)
+				}
+			}
+			break
 		}
-		if c == "barrier" && fenceAt >= 0 && barrierAt < 0 {
-			barrierAt = i
+	}
+	if !contains(order, "detach") {
+		t.Errorf("volume call order %v: the mount must be detached without a flush", order)
+	}
+	if n := rep.uploadsAfter(revokedAt); n != 0 {
+		t.Errorf("%d replica upload(s) after revocation, want 0: %v", n, rep.events)
+	}
+	if !rep.has("abort") {
+		t.Errorf("replication was not aborted: %v; a graceful stop performs its own final sync", rep.events)
+	}
+	if !auth.releasedWith(20, ReasonFencedOutOfBand) {
+		t.Errorf("released with %q, want %q", auth.reasons(20), ReasonFencedOutOfBand)
+	}
+}
+
+func contains(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
 		}
 	}
-	if barrierAt < 0 {
-		t.Log("no barrier runs after the fence any more — finding F-1 is fixed; invert this test")
-		return
+	return false
+}
+
+// TestADeadlineTripKeepsItsBoundedFlush is the other side of the same ruling:
+// when the lease was not taken away but simply ran down, the ordered stop is
+// still the right answer. threat-model.md §7.5 rejects both "fence then flush"
+// and "flush then fence" and requires a bounded flush window INSIDE the lease,
+// with an incomplete flush reported as data loss. So a deadline trip must still
+// run its barrier and its final sync — bounded by what is left of the lease.
+func TestADeadlineTripKeepsItsBoundedFlush(t *testing.T) {
+	spec := testSpec()
+	// Already inside the write-stop margin when the worker starts, with the
+	// control-plane unreachable so no renewal can move the deadline.
+	spec.LeaseExpiresAt = time.Now().UTC().Add(2 * time.Second)
+	spec.WriteStopMargin = Duration(1900 * time.Millisecond)
+	spec.LeaseRenewInterval = Duration(30 * time.Millisecond)
+
+	vol := healthyVolume()
+	rep := &countingReplicator{}
+	sup := newCloseoutSup(t, spec, vol, &fakeCP{renewErr: context.DeadlineExceeded}, rep, newSharedFencer())
+
+	f := sup.Run(context.Background(), make(chan os.Signal))
+	if f.Exit != CodeFenced && f.Exit != CodeBarrierIncomplete {
+		t.Fatalf("exit = %d (%v), want 66 or 69", f.Exit, f.Err)
 	}
-	if n := rep.uploadsAfter(revokedAt); n == 0 {
-		t.Log("no replica upload after revocation any more — finding F-1 is fixed; invert this test")
-		return
+	order := vol.order()
+	if !contains(order, "barrier") {
+		t.Errorf("volume call order %v: the deadline path keeps its bounded flush", order)
 	}
-	t.Logf("documented gap F-1: after losing epoch 20 the worker still ran %v and %d replica upload(s)",
-		order[fenceAt:], rep.uploadsAfter(revokedAt))
+	if !contains(order, "unmount") {
+		t.Errorf("volume call order %v: the deadline path unmounts with a flush", order)
+	}
+	if contains(order, "detach") {
+		t.Errorf("volume call order %v: only an out-of-band fence detaches without flushing", order)
+	}
+	if !rep.has("sync") {
+		t.Errorf("the deadline path skipped its final replica sync: %v", rep.events)
+	}
+	if rep.has("abort") {
+		t.Errorf("the deadline path killed replication instead of stopping it: %v", rep.events)
+	}
 }
 
 // TestAnUnreachableControlPlaneFencesWithoutUploadingPastTheDeadline is the
@@ -633,5 +830,50 @@ func TestALateRenewResponseCannotExtendTheLeasePastItsIssue(t *testing.T) {
 	dead := NewDeadline(sentAt.UTC().Add(-time.Second), margin, sentAt)
 	if dead.WriteAllowed(sentAt) || !dead.Expired(sentAt) {
 		t.Error("an already-expired expiry was accepted as a live lease")
+	}
+}
+
+// TestTheLeaseExpiryReachesTheMetadataEngine is PLO-323 F-5 at the seam that
+// carries it. threat-model.md:812-815 requires the deadline to be re-checked
+// "immediately before every write submission, not on a timer", and lease.go
+// repeated the requirement almost word for word — while the only caller of the
+// check was a one-second ticker, which is the timer the requirement forbids.
+//
+// The fix moved the check into the metadata engine, so this asserts the one
+// thing the supervisor still owns: the engine is armed before the loop starts
+// and re-armed after every renewal, with the LEASE EXPIRY rather than the
+// write-stop margin. The margin is the tail of the lease reserved for the flush
+// and the barrier (lease.go); arming the engine with it would make the bounded
+// flush window threat-model.md §7.5 mandates impossible.
+func TestTheLeaseExpiryReachesTheMetadataEngine(t *testing.T) {
+	spec := testSpec()
+	spec.LeaseRenewInterval = Duration(20 * time.Millisecond)
+	vol := healthyVolume()
+	renewed := time.Now().UTC().Add(90 * time.Second)
+	cp := &fakeCP{expiry: func() time.Time { return renewed }}
+	sup := newCloseoutSup(t, spec, vol, cp, &countingReplicator{}, newSharedFencer())
+
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+
+	// Armed from the renewal, not from the spec the worker started with.
+	waitFor(t, 2*time.Second, func() bool {
+		vol.mu.Lock()
+		defer vol.mu.Unlock()
+		return !vol.writeExpiry.IsZero() && vol.writeExpiry.After(time.Now().Add(60*time.Second))
+	}, "the metadata engine was never armed with the renewed expiry")
+
+	vol.mu.Lock()
+	armed := vol.writeExpiry
+	vol.mu.Unlock()
+	if margin := sup.deadline.Expiry().Add(-spec.WriteStopMargin.D()); !armed.After(margin) {
+		t.Errorf("engine armed at %s, which is at or before the write-stop margin %s; "+
+			"the margin is reserved for the drain, not for sealing", armed, margin)
+	}
+
+	stop <- syscall.SIGTERM
+	if f := waitFatal(t, done, 3*time.Second, "the worker never stopped"); f.Exit != CodeOK {
+		t.Fatalf("exit = %d: %v", f.Exit, f.Err)
 	}
 }

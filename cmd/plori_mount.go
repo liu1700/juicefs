@@ -511,6 +511,17 @@ func (p *ploriVolume) ApplyGrant(ctx context.Context, bytes, inodes int64) error
 func (p *ploriVolume) FenceWrites() { meta.PloriFenceWrites() }
 func (p *ploriVolume) Fenced() bool { return meta.PloriWritesFenced() }
 
+// SetWriteExpiry arms the metadata engine's own deadline, so every gated
+// operation re-checks it immediately before it runs (PLO-323 F-5).
+func (p *ploriVolume) SetWriteExpiry(at time.Time) { meta.PloriSetWriteExpiry(at) }
+
+// Detach unmounts without flushing. Unmount is the ordered path; this is the
+// out-of-band fence's, where a flush would push staged bytes into a data prefix
+// this writer no longer owns (PLO-323 F-1).
+func (p *ploriVolume) Detach(context.Context) error {
+	return doUmount(p.paths.MountPoint, true)
+}
+
 // Unmount detaches with `umount --flush` semantics: the caller has already run
 // the barrier, and a failure here is fail-closed rather than best effort
 // (cmd/umount.go:120-125 keeps the same rule for the CLI).

@@ -313,7 +313,7 @@ func TestExitSignalsDistinguishTheTerminalConditions(t *testing.T) {
 
 	want := map[string]signal{
 		"clean stop":          {CodeOK, ""},
-		"lease loss":          {CodeFenced, ErrCodeLeaseLost},
+		"lease loss":          {CodeFenced, ErrCodeFencedOutOfBand},
 		"replication failure": {CodeBarrierIncomplete, ErrCodeBarrierIncomplete},
 		"durability timeout":  {CodeBarrierIncomplete, ErrCodeBarrierIncomplete},
 		"corruption":          {CodeRestoreFailed, ErrCodeRestoreIntegrity},
