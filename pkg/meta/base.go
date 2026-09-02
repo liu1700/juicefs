@@ -881,6 +881,25 @@ func (m *baseMeta) expireTime() int64 {
 	}
 }
 
+// writeBarrier, when non-nil, can revoke this client's write permission at
+// runtime. It is nil in every upstream build, so readOnly() below is exactly
+// `m.conf.ReadOnly` there.
+//
+// It exists so a distribution whose right to write is granted by something
+// outside the filesystem — a lease that can expire or be revoked — can make
+// every mutation fail with EROFS at once, instead of gating the handful of
+// call sites somebody remembered. The nine sites that consult readOnly() are
+// precisely the ones that already returned EROFS.
+var writeBarrier func() bool
+
+// readOnly reports whether this client may mutate the filesystem.
+func (m *baseMeta) readOnly() bool {
+	if m.conf.ReadOnly {
+		return true
+	}
+	return writeBarrier != nil && writeBarrier()
+}
+
 func (m *baseMeta) OnReload(fn func(f *Format)) {
 	m.msgCallbacks.Lock()
 	defer m.msgCallbacks.Unlock()
@@ -1612,7 +1631,7 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 	if parent == RootInode && name == TrashName {
 		return syscall.EPERM
 	}
-	if m.conf.ReadOnly {
+	if m.readOnly() {
 		return syscall.EROFS
 	}
 	if name == "." || name == ".." {
@@ -1711,7 +1730,7 @@ func (m *baseMeta) Link(ctx Context, inode, parent Ino, name string, attr *Attr)
 	if parent == RootInode && name == TrashName {
 		return syscall.EPERM
 	}
-	if m.conf.ReadOnly {
+	if m.readOnly() {
 		return syscall.EROFS
 	}
 	if errno := checkInodeName(name); errno != 0 {
@@ -1800,7 +1819,7 @@ func (m *baseMeta) Unlink(ctx Context, parent Ino, name string, skipCheckTrash .
 	if parent == RootInode && name == TrashName || parent.IsTrash() && ctx.Uid() != 0 {
 		return syscall.EPERM
 	}
-	if m.conf.ReadOnly {
+	if m.readOnly() {
 		return syscall.EROFS
 	}
 
@@ -1831,7 +1850,7 @@ func (m *baseMeta) Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ..
 	if parent == RootInode && name == TrashName || parent == TrashInode || parent.IsTrash() && ctx.Uid() != 0 {
 		return syscall.EPERM
 	}
-	if m.conf.ReadOnly {
+	if m.readOnly() {
 		return syscall.EROFS
 	}
 
@@ -1899,7 +1918,7 @@ func (m *baseMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 	if parentDst.IsTrash() || parentSrc.IsTrash() && ctx.Uid() != 0 {
 		return syscall.EPERM
 	}
-	if m.conf.ReadOnly {
+	if m.readOnly() {
 		return syscall.EROFS
 	}
 	if errno := checkInodeName(nameDst); errno != 0 {
@@ -2042,7 +2061,7 @@ func (m *baseMeta) touchAtime(ctx Context, inode Ino, attr *Attr) {
 }
 
 func (m *baseMeta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) (st syscall.Errno) {
-	if m.conf.ReadOnly && flags&(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_TRUNC|syscall.O_APPEND) != 0 {
+	if m.readOnly() && flags&(syscall.O_WRONLY|syscall.O_RDWR|syscall.O_TRUNC|syscall.O_APPEND) != 0 {
 		return syscall.EROFS
 	}
 	defer func() {
@@ -2302,7 +2321,7 @@ func (m *baseMeta) Readdir(ctx Context, inode Ino, plus uint8, entries *[]*Entry
 }
 
 func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, flags uint32) syscall.Errno {
-	if m.conf.ReadOnly {
+	if m.readOnly() {
 		return syscall.EROFS
 	}
 	if name == "" {
@@ -2319,7 +2338,7 @@ func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, f
 }
 
 func (m *baseMeta) RemoveXattr(ctx Context, inode Ino, name string) syscall.Errno {
-	if m.conf.ReadOnly {
+	if m.readOnly() {
 		return syscall.EROFS
 	}
 	if name == "" {
@@ -3362,7 +3381,7 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 		return syscall.EPERM
 	}
 
-	if m.conf.ReadOnly {
+	if m.readOnly() {
 		return syscall.EROFS
 	}
 	if name == "" {

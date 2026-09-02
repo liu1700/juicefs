@@ -208,6 +208,37 @@ jobs:
             sudo ./juicefs.plori umount /mnt/plori-sqlite || sudo fusermount3 -u /mnt/plori-sqlite
           fi
 
+      - name: Exercise the plori-mount lifecycle supervisor
+        env:
+          AWS_ACCESS_KEY_ID: plori-ci
+          AWS_SECRET_ACCESS_KEY: plori-ci-secret
+          AWS_REGION: us-east-1
+          LITESTREAM_VERSION: 0.5.17
+          LITESTREAM_SHA256: cfb371176d164437ae869f8351cfde49bd1804ae71c61923f75c9cba9c9c006d
+          S3_ENDPOINT: http://127.0.0.1:9000
+          S3_BUCKET: plori-ci-mount
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-${LITESTREAM_VERSION}-linux-x86_64.tar.gz" \
+            -o "$RUNNER_TEMP/litestream.tar.gz"
+          echo "${LITESTREAM_SHA256}  $RUNNER_TEMP/litestream.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/litestream.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/litestream" version | grep -q "${LITESTREAM_VERSION}"
+          # The supervisor formats the volume itself, but the bucket has to
+          # exist; MinIO creates one on a bare PUT of the bucket path.
+          curl --fail --silent --show-error --request PUT \
+            --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" --aws-sigv4 "aws:amz:${AWS_REGION}:s3" \
+            "$S3_ENDPOINT/$S3_BUCKET" || true
+          PLORI_BIN=./juicefs.plori LITESTREAM_BIN="$RUNNER_TEMP/litestream" \
+            hack/plori-mount-e2e/run.sh
+
+      - name: Clean up the plori-mount lifecycle test
+        if: always()
+        run: |
+          pkill -f 'plori-mount' || true
+          pkill -f fake_control_plane.py || true
+
       - name: Regression - metadata backup under the plori profile
         env:
           PLORI_TEST_META_URL: redis://127.0.0.1:6379/2

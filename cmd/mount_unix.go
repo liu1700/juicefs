@@ -1121,6 +1121,14 @@ func parseUIDGID(input string, defaultUid uint32, defaultGid uint32) (uint32, ui
 }
 
 func mountMain(v *vfs.VFS, c *cli.Context) {
+	if err := serveMount(v, c); err != nil {
+		logger.Fatalf("fuse: %s", err)
+	}
+}
+
+// serveMount is mountMain without the fatal exit, so a caller that owns its
+// own exit codes can report why the FUSE session ended instead of dying as 1.
+func serveMount(v *vfs.VFS, c *cli.Context) error {
 	if os.Getuid() == 0 {
 		disableUpdatedb()
 	}
@@ -1163,8 +1171,5 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		}
 	}
 	logger.Infof("Mounting volume %s at %q ...", conf.Format.Name, conf.Meta.MountPoint)
-	err := fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))
-	if err != nil {
-		logger.Fatalf("fuse: %s", err)
-	}
+	return fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))
 }
