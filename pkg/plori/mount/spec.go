@@ -137,46 +137,11 @@ type MountSpec struct {
 
 	IssuedAt time.Time `json:"issued_at"`
 
-	// Format is the first-boot format contract (PLO-330). Optional.
+	// Format is the first-boot format contract (PLO-330). Optional; every
+	// other tuning knob arrives through MountOptions, whose vocabulary is in
+	// options.go.
 	Format *FormatSpec `json:"format_spec,omitempty"`
-	// BarrierInterval is how often the periodic durability barrier runs. Spec
-	// driven so PLO-316's measurement can change it without a worker rollout;
-	// zero means DefaultBarrierInterval.
-	BarrierInterval Duration `json:"barrier_interval,omitempty"`
-	// ReplicaSyncInterval is Litestream's sync interval. Zero means
-	// DefaultReplicaSyncInterval.
-	ReplicaSyncInterval Duration `json:"replica_sync_interval,omitempty"`
-	// UsageReportEvery is how many renew ticks pass between /usage reports.
-	// Zero means DefaultUsageReportEvery.
-	UsageReportEvery int `json:"usage_report_every,omitempty"`
-	// MemoryLimitMiB caps the worker's Go heap. Zero means
-	// DefaultMemoryLimitMiB.
-	MemoryLimitMiB int `json:"memory_limit_mib,omitempty"`
 }
-
-// Defaults for the spec-driven knobs the control-plane does not issue yet.
-const (
-	// DefaultBarrierInterval is the periodic `juicefs durability` cadence.
-	// PLO-316 wave 2 measured 15/60/300 s and found zero write stall and zero
-	// extra PUTs at all three, so the period is chosen for how much work an
-	// unclean death can lose, not for what it costs: 60 s.
-	DefaultBarrierInterval = 60 * time.Second
-	// DefaultReplicaSyncInterval matches the M0 harness (one LTX object per
-	// second, wave-2 brief blocker 2).
-	DefaultReplicaSyncInterval = time.Second
-	// DefaultUsageReportEvery reports usage every 15th renew: at a 20 s renew
-	// interval that is one /usage call per five minutes per mount.
-	DefaultUsageReportEvery = 15
-	// DefaultMemoryLimitMiB is the GOMEMLIMIT the worker sets when neither the
-	// spec nor the environment names one. PLO-316 wave 2 measured 32.6 MiB
-	// idle and 141 MiB at a git-clone peak at this limit, against 250 MiB
-	// unlimited, with no throughput cost.
-	DefaultMemoryLimitMiB = 128
-	// DefaultTrashDays is the crash-consistency D1 floor. A volume formatted
-	// with trash-days 0 cannot satisfy crash-consistency.md §7 Rank 1, so the
-	// worker never formats one and refuses to mount one (exit 70).
-	DefaultTrashDays = 1
-)
 
 // ErrSpec marks every refusal that must exit with CodeSpecInvalid.
 var ErrSpec = errors.New("mount spec")
@@ -268,12 +233,6 @@ func (s *MountSpec) Validate() error {
 			return fmt.Errorf("%w: mount_options entry contains a control character", ErrSpec)
 		}
 	}
-	if s.UsageReportEvery < 0 {
-		return fmt.Errorf("%w: usage_report_every must not be negative", ErrSpec)
-	}
-	if s.MemoryLimitMiB < 0 {
-		return fmt.Errorf("%w: memory_limit_mib must not be negative", ErrSpec)
-	}
 	if f := s.Format; f != nil {
 		if f.TrashDays < DefaultTrashDays {
 			return fmt.Errorf("%w: format_spec.trash_days %d is below the crash-consistency floor of %d",
@@ -334,50 +293,4 @@ func (s *MountSpec) EffectiveFormat() FormatSpec {
 		}
 	}
 	return f
-}
-
-func (s *MountSpec) barrierInterval() time.Duration {
-	if s.BarrierInterval > 0 {
-		return s.BarrierInterval.D()
-	}
-	return DefaultBarrierInterval
-}
-
-func (s *MountSpec) replicaSyncInterval() time.Duration {
-	if s.ReplicaSyncInterval > 0 {
-		return s.ReplicaSyncInterval.D()
-	}
-	return DefaultReplicaSyncInterval
-}
-
-// MemoryLimitMB is the Go heap cap in MiB.
-func (s *MountSpec) MemoryLimitMB() int {
-	if s.MemoryLimitMiB > 0 {
-		return s.MemoryLimitMiB
-	}
-	return DefaultMemoryLimitMiB
-}
-
-func (s *MountSpec) usageReportEvery() int {
-	if s.UsageReportEvery > 0 {
-		return s.UsageReportEvery
-	}
-	return DefaultUsageReportEvery
-}
-
-// EffectiveMountOptions applies the PLORI_MOUNT_OPTIONS operator escape hatch.
-// The override replaces the server's list wholesale rather than merging: a
-// merge would make the resulting kernel mount string a function of two
-// authorities and neither would be auditable.
-func (s *MountSpec) EffectiveMountOptions(env func(string) string) []string {
-	if raw := env("PLORI_MOUNT_OPTIONS"); raw != "" {
-		var out []string
-		for _, part := range strings.Split(raw, ",") {
-			if part = strings.TrimSpace(part); part != "" {
-				out = append(out, part)
-			}
-		}
-		return out
-	}
-	return append([]string(nil), s.MountOptions...)
 }

@@ -84,10 +84,8 @@ spec = {
     "region": "${AWS_REGION:-us-east-1}",
     "credential_source": "node_secret",
   },
-  "mount_options": ["--cache-size=1024"],
+  "mount_options": ["writeback", "heartbeat=30", "barrier_interval=5"],
   "issued_at": expires.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-  "barrier_interval": "5s",
-  "usage_report_every": 2,
 }
 open(out, "w").write(json.dumps(spec))
 PY

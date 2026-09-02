@@ -45,7 +45,7 @@ func TestLitestreamConfigRendersTheWave2Defaults(t *testing.T) {
 			Region:   "lax1",
 		},
 	}
-	if err := ls.WriteConfig(spec); err != nil {
+	if err := ls.WriteConfig(spec, ParseMountOptions(nil)); err != nil {
 		t.Fatalf("WriteConfig: %v", err)
 	}
 	data, err := os.ReadFile(ls.ConfigPath)

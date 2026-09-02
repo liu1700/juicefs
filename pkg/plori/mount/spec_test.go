@@ -166,27 +166,55 @@ func TestEffectiveFormatRaisesTrashDaysToTheFloor(t *testing.T) {
 }
 
 // The operator escape hatch replaces the server's list rather than merging
-// into it: a merged list would make the kernel mount string a function of two
+// into it: a merged list would make the resulting mount a function of two
 // authorities and neither would be auditable.
 func TestMountOptionsOverrideReplacesRatherThanMerges(t *testing.T) {
-	spec := &MountSpec{MountOptions: []string{"--writeback", "--cache-size=10240"}}
+	spec := &MountSpec{MountOptions: []string{"writeback", "buffer_size=256"}}
 	env := func(k string) string {
 		if k == "PLORI_MOUNT_OPTIONS" {
-			return "--cache-size=512, --heartbeat=60s"
+			return "buffer_size=64, heartbeat=120"
 		}
 		return ""
 	}
-	got := spec.EffectiveMountOptions(env)
-	want := []string{"--cache-size=512", "--heartbeat=60s"}
-	if len(got) != len(want) {
-		t.Fatalf("options = %v, want %v", got, want)
+	got := spec.Options(env)
+	if got.BufferSizeMB != 64 {
+		t.Errorf("buffer size = %d, want 64", got.BufferSizeMB)
 	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("options = %v, want %v", got, want)
-		}
+	if got.Heartbeat != 120*time.Second {
+		t.Errorf("heartbeat = %s, want 2m0s", got.Heartbeat)
 	}
-	if plain := spec.EffectiveMountOptions(func(string) string { return "" }); len(plain) != 2 {
-		t.Fatalf("without the override the server list must stand, got %v", plain)
+	if plain := spec.Options(func(string) string { return "" }); plain.BufferSizeMB != 256 {
+		t.Errorf("without the override the server list must stand, got buffer size %d", plain.BufferSizeMB)
+	}
+}
+
+// An unknown OPTION is tuning this worker does not have, so it is reported and
+// ignored. An unknown top-level FIELD is authority it cannot honour, so it is
+// refused (TestUnknownSpecFieldIsRefused). The two must not converge.
+func TestUnknownMountOptionIsIgnoredNotRefused(t *testing.T) {
+	got := ParseMountOptions([]string{"writeback", "future_knob=7", "allow_other", "gomemlimit=128"})
+	if !got.Writeback || !got.AllowOther {
+		t.Errorf("known options were dropped: %+v", got)
+	}
+	if len(got.Ignored) != 1 || got.Ignored[0] != "future_knob" {
+		t.Errorf("ignored = %v, want [future_knob]; gomemlimit belongs to the plugin and must not be warned about", got.Ignored)
+	}
+	if got.BufferSizeMB != DefaultBufferSizeMB || got.Heartbeat != DefaultHeartbeat {
+		t.Errorf("defaults were disturbed: %+v", got)
+	}
+}
+
+func TestMountOptionDurationsAcceptBothSpellings(t *testing.T) {
+	got := ParseMountOptions([]string{"heartbeat=300", "barrier_interval=90s", "litestream_sync=bogus"})
+	if got.Heartbeat != 300*time.Second {
+		t.Errorf("heartbeat = %s, want 5m0s", got.Heartbeat)
+	}
+	if got.BarrierInterval != 90*time.Second {
+		t.Errorf("barrier interval = %s, want 1m30s", got.BarrierInterval)
+	}
+	// An unparseable value falls back to the default rather than to zero,
+	// which would busy-loop the replicator.
+	if got.LitestreamSync != DefaultLitestreamSync {
+		t.Errorf("litestream sync = %s, want the default %s", got.LitestreamSync, DefaultLitestreamSync)
 	}
 }

@@ -205,8 +205,6 @@ func testSpec() *MountSpec {
 	spec.LeaseExpiresAt = time.Now().UTC().Add(2 * time.Minute)
 	spec.LeaseRenewInterval = Duration(50 * time.Millisecond)
 	spec.WriteStopMargin = Duration(300 * time.Millisecond)
-	spec.BarrierInterval = Duration(30 * time.Millisecond)
-	spec.UsageReportEvery = 2
 	return spec
 }
 
@@ -214,8 +212,9 @@ func newSup(t *testing.T, spec *MountSpec, fs *fakeFS, cp *fakeCP, rep *fakeRepl
 	t.Helper()
 	dir := t.TempDir()
 	return &Supervisor{
-		Spec:  spec,
-		Paths: Paths{StateDir: filepath.Join(dir, "state"), CacheDir: filepath.Join(dir, "cache"), MountPoint: filepath.Join(dir, "mnt")},
+		Spec:    spec,
+		Paths:   Paths{StateDir: filepath.Join(dir, "state"), CacheDir: filepath.Join(dir, "cache"), MountPoint: filepath.Join(dir, "mnt")},
+		Options: MountOptions{BarrierInterval: 30 * time.Millisecond},
 		Deps: Deps{
 			FS: fs, CP: cp, Replicator: rep, Fencer: fencer,
 			ControlGateInstalled: func() bool { return true },

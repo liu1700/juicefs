@@ -32,10 +32,35 @@ in the worker's own environment. The MountSpec carries none, and a spec whose
 `credential_source` is anything other than `node_secret` is refused rather than
 served from some other source.
 
-`PLORI_MOUNT_OPTIONS` replaces the spec's `mount_options` wholesale. It is an
-operator escape hatch; it does not merge with the server's list, because a
-merged list would make the resulting mount a function of two authorities and
-neither would be auditable.
+The plugin passes exactly `PATH`, `GOMEMLIMIT`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` and optionally `PLORI_MOUNT_OPTIONS`. Missing object
+credentials are exit 68.
+
+## Mount options
+
+`mount_options` is a closed vocabulary, not a list of `juicefs` flags. The two
+sides version independently, so the worker understands a vocabulary rather than
+a command line.
+
+| key | default | effect |
+|---|---|---|
+| `writeback` | on | the crash-consistency protocol is writeback plus barrier |
+| `allow_other` | off | passed through the `-o` string, which sets it at any uid; the upstream default only sets it for uid 0 |
+| `buffer_size=` | `32` | MiB; the chunk store raises anything smaller anyway |
+| `heartbeat=` | `300` | seconds or a Go duration |
+| `barrier_interval=` | `60` | seconds or a Go duration |
+| `litestream_sync=` | `1s` | replica sync interval |
+| `gomemlimit=` | — | consumed by the plugin, which exports `GOMEMLIMIT`; the Go runtime reads it directly |
+
+An unrecognised key is logged and ignored. That is the opposite of the rule for
+an unknown top-level spec field, and the difference is which side owns the
+meaning: an unknown field means the control-plane is describing authority this
+worker cannot honour, while an unknown option means it is tuning something this
+worker does not have.
+
+`PLORI_MOUNT_OPTIONS` replaces the whole list rather than merging with it,
+because a merged list would make the resulting mount a function of two
+authorities and neither would be auditable.
 
 ## Exit codes
 
@@ -137,7 +162,7 @@ generation died mid-flight.
 | `litestream.yml` | startup, 0600 | replication config; never contains a credential |
 | `litestream.sock` | replication start | Litestream's control socket |
 | `ready` | after the mount serves | `{"epoch", "mounted_at", "volume"}` |
-| `health.json` | every renew tick | `{"epoch", "lease_expires_at", "last_renew_ok", "replica_lag_ms", "pending_blocks", "last_barrier_at", "used_bytes", "used_inodes", "grant_epoch_applied", "fenced"}` |
+| `health.json` | every 10 s and on every renew | `{"epoch", "lease_expires_at", "last_renew_ok", "replica_lag_ms", "pending_blocks", "last_barrier_at", "used_bytes", "used_inodes", "grant_epoch_applied", "fenced"}` |
 | `durable-point.json` | after every barrier | the `T_before` anchor plus the replica TXID |
 | `clean` | after a clean stop | the timestamp of the stop |
 
@@ -147,17 +172,14 @@ The directory is 0700 and lives outside the Agent's bind mount.
 
 | knob | default | why |
 |---|---|---|
-| `--heartbeat` | `300s` | the 12 s heartbeat was one of the two idle object writers |
-| `--backup-meta` | `0` | Litestream is the metadata backup; the hourly dump was the other idle writer |
-| `--buffer-size` | `32` | the floor the chunk store enforces anyway |
-| `--writeback` | on | the crash-consistency protocol is writeback plus barrier; write-through was rejected |
-| `GOMEMLIMIT` | 128 MiB | JuiceFS page buffers are Go heap allocations and nothing else tunes the GC; an operator-set `GOMEMLIMIT` wins |
-| barrier interval | `60s` | measured as free at 15, 60 and 300 s, so the period is chosen for how much an unclean death loses |
-| Litestream sync interval | `1s` | raising it does not reduce PUTs and multiplies replica lag |
+| `--backup-meta` | `0` | Litestream is the metadata backup, and the hourly dump was one of the two idle object writers |
+| `--no-usage-report` | on | the mount is not a telemetry client |
+| `--metrics` | empty | one Prometheus listener per mount does not fit a node running many; `health.json` is the surface |
 | Litestream compaction | L1 10 m, L2 1 h, L3 6 h | with snapshot 24 h and L0 retention 30 m, an idle mount costs 0.018 object ops/s |
 
-Everything above is overridable through the MountSpec, so a measurement can
-change a value without a worker rollout.
+These four are not configurable, and should not be. Everything that is tunable
+is in the mount-options vocabulary above, so a measurement can change a value
+without a worker rollout.
 
 ## Why Litestream runs as a child process
 

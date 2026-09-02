@@ -28,7 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	rtdebug "runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -113,19 +113,26 @@ func ploriMount(c *cli.Context) error {
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
 	}
-	if err := ls.WriteConfig(spec); err != nil {
+	opts := spec.Options(os.Getenv)
+	if len(opts.Ignored) > 0 {
+		// An option this worker does not know is the control-plane tuning
+		// something it does not have, not authority it cannot honour, so it
+		// is reported and ignored rather than refused.
+		ploriLog("mount_options_ignored", "keys", strings.Join(opts.Ignored, ","))
+	}
+	if err := ls.WriteConfig(spec, opts); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
 	}
-	applyMemoryLimit(spec)
 
 	stop := make(chan os.Signal, 2)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 
 	sup := &pmount.Supervisor{
-		Spec:  spec,
-		Paths: paths,
+		Spec:    spec,
+		Paths:   paths,
+		Options: opts,
 		Deps: pmount.Deps{
-			FS:                   &ploriFS{paths: paths, accessKey: accessKey, secretKey: secretKey},
+			FS:                   &ploriFS{paths: paths, accessKey: accessKey, secretKey: secretKey, opts: opts},
 			CP:                   pmount.NewClient(c.String("control-plane-url"), paths.TokenFile, 10*time.Second),
 			Replicator:           ls,
 			Fencer:               fencer,
@@ -169,6 +176,7 @@ func ploriLog(event string, kv ...any) {
 type ploriFS struct {
 	paths                pmount.Paths
 	accessKey, secretKey string
+	opts                 pmount.MountOptions
 }
 
 // metaURI is the local SQLite metadata engine. It is deliberately a plain
@@ -260,7 +268,7 @@ func max64(a, b int64) int64 {
 // which is where the second juicefs process in the M0 RSS measurement comes
 // from. One volume per process means one process.
 func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volume, error) {
-	c, err := ploriMountContext(spec, f.paths)
+	c, err := ploriMountContext(f.opts, f.paths)
 	if err != nil {
 		return nil, err
 	}
@@ -496,48 +504,16 @@ func (p *ploriVolume) Close() error {
 // Turning the MountSpec into the mount command's flags.
 // ---------------------------------------------------------------------------
 
-// ploriDefaults are the client settings applied when the spec's mount_options
-// do not name them. They come from PLO-316 wave 2
-// (docs/design/per-agent-juicefs/benchmark-wave2-object-ops.md): heartbeat 300
-// and backup-meta 0 are what take an idle mount down to 0.018 object ops/s,
-// because the 12-second heartbeat and the hourly metadata dump were the only
-// JuiceFS-side idle object writers. Litestream is the metadata backup now, so
-// the dump is redundant as well as expensive.
-var ploriDefaults = map[string]string{
-	"writeback":       "true",
-	"heartbeat":       "300s",
-	"backup-meta":     "0",
-	"buffer-size":     "32",
-	"no-usage-report": "true",
-	"metrics":         "",
-	"consul":          "",
-}
-
-// applyMemoryLimit caps the Go heap.
+// ploriMountContext turns the resolved option vocabulary into the cli.Context
+// the generic mount helpers read.
 //
-// JuiceFS page buffers are Go heap allocations (pkg/utils/alloc.go:30-31) and
-// nothing in cmd or pkg tunes the GC, so an unconstrained mount peaks far
-// above its steady state under a write burst. PLO-316 wave 2 measured 32.6 MiB
-// idle and 141 MiB at a git-clone peak with a 128 MiB limit and a 32 MiB
-// buffer, against 250 MiB unlimited, at no throughput cost.
-//
-// An operator-set GOMEMLIMIT wins: the Go runtime already honours the
-// environment variable, so this only supplies the default.
-func applyMemoryLimit(spec *pmount.MountSpec) {
-	if os.Getenv("GOMEMLIMIT") != "" {
-		return
-	}
-	rtdebug.SetMemoryLimit(int64(spec.MemoryLimitMB()) << 20)
-}
-
-// ploriMountContext builds the cli.Context the generic mount helpers read.
-//
-// Each mount_options entry is one flag of the `juicefs mount` command in
-// `--name=value` or `--name` form. An unrecognised entry is refused rather
-// than ignored: the list is server-built (threat-model R14), so an entry this
-// worker does not understand means the two sides disagree about what the mount
-// is, which exit code 64 exists for.
-func ploriMountContext(spec *pmount.MountSpec, paths pmount.Paths) (*cli.Context, error) {
+// The fixed half is not configurable and should not be: --backup-meta 0
+// because Litestream is the metadata backup and the hourly dump was one of the
+// two idle object writers, --no-usage-report because the mount is not a
+// telemetry client, and an empty --metrics because one Prometheus listener per
+// mount does not fit a node running many (health.json is the surface, and
+// PLO-325 owns the rest).
+func ploriMountContext(opts pmount.MountOptions, paths pmount.Paths) (*cli.Context, error) {
 	set := flag.NewFlagSet("plori-mount", flag.ContinueOnError)
 	set.SetOutput(devNull{})
 	for _, f := range append(cmdMount().Flags, globalFlags()...) {
@@ -545,30 +521,28 @@ func ploriMountContext(spec *pmount.MountSpec, paths pmount.Paths) (*cli.Context
 			return nil, err
 		}
 	}
-	apply := func(name, value string) error {
+	values := map[string]string{
+		"backup-meta":     "0",
+		"no-usage-report": "true",
+		"cache-dir":       paths.CacheDir,
+		"buffer-size":     strconv.Itoa(opts.BufferSizeMB),
+		"heartbeat":       opts.Heartbeat.String(),
+	}
+	if opts.Writeback {
+		values["writeback"] = "true"
+	}
+	if opts.AllowOther {
+		// Through the -o string, not the AllowOther default: upstream ties
+		// that default to uid 0 (pkg/fuse/fuse.go:485) while the explicit
+		// option sets it at any uid (:500-501).
+		values["o"] = "allow_other"
+	}
+	for name, value := range values {
 		if set.Lookup(name) == nil {
-			return fmt.Errorf("%w: mount option %q is not a flag of this client", pmount.ErrSpec, name)
+			return nil, fmt.Errorf("%w: %q is not a flag of this client", pmount.ErrSpec, name)
 		}
-		return set.Set(name, value)
-	}
-	for name, value := range ploriDefaults {
-		if value == "" {
-			continue
-		}
-		if err := apply(name, value); err != nil {
-			return nil, err
-		}
-	}
-	if err := apply("cache-dir", paths.CacheDir); err != nil {
-		return nil, err
-	}
-	for _, opt := range spec.EffectiveMountOptions(os.Getenv) {
-		name, value, hasValue := strings.Cut(strings.TrimLeft(opt, "-"), "=")
-		if !hasValue {
-			value = "true"
-		}
-		if err := apply(name, value); err != nil {
-			return nil, err
+		if err := set.Set(name, value); err != nil {
+			return nil, fmt.Errorf("%w: %s=%s: %s", pmount.ErrSpec, name, value, err)
 		}
 	}
 	if err := set.Parse(nil); err != nil {

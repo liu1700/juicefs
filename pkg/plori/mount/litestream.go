@@ -134,11 +134,10 @@ type litestreamReplicaC struct {
 	SyncInterval   string `yaml:"sync-interval"`
 }
 
-// Replication cadence. These are the PLO-316 wave-2 measured defaults
-// (docs/design/per-agent-juicefs/benchmark-wave2-object-ops.md): they produce
-// 0.018 object ops/s per idle mount. sync-interval stays at 1 s deliberately —
-// raising it does not reduce PUTs (batching is monitor-interval's job) and
-// 10 s multiplies replica lag 7.7x.
+// Compaction and retention cadence, from the PLO-316 wave-2 measurement
+// (docs/design/per-agent-juicefs/benchmark-wave2-object-ops.md). Together with
+// the 1 s sync interval in options.go these produce 0.018 object ops/s per
+// idle mount.
 const (
 	DefaultCompactionL1  = 10 * time.Minute
 	DefaultCompactionL2  = time.Hour
@@ -151,7 +150,7 @@ const (
 // child inherits AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from this process's
 // environment, which keeps the one bucket-wide key off disk (threat-model
 // F-11: a config file is one more place a debug dump can read it from).
-func (l *Litestream) WriteConfig(spec *MountSpec) error {
+func (l *Litestream) WriteConfig(spec *MountSpec, opts MountOptions) error {
 	var cfg litestreamConfig
 	cfg.Socket.Enabled = true
 	cfg.Socket.Path = l.SocketPath
@@ -175,7 +174,7 @@ func (l *Litestream) WriteConfig(spec *MountSpec) error {
 			Endpoint:       spec.ObjectStore.Endpoint,
 			Region:         spec.ObjectStore.Region,
 			ForcePathStyle: true,
-			SyncInterval:   spec.replicaSyncInterval().String(),
+			SyncInterval:   opts.LitestreamSync.String(),
 		},
 	}}
 	data, err := marshalLitestreamYAML(&cfg)

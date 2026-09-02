@@ -53,6 +53,10 @@ type Supervisor struct {
 	Paths Paths
 	Deps  Deps
 
+	// Options is the resolved mount_options vocabulary. cmd fills it so the
+	// operator override is applied exactly once, at startup.
+	Options MountOptions
+
 	deadline *Deadline
 	vol      Volume
 
@@ -371,7 +375,7 @@ func dirIsEmpty(dir string) (bool, error) {
 func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <-chan error) *Fatal {
 	renew := time.NewTicker(s.Spec.LeaseRenewInterval.D())
 	defer renew.Stop()
-	barrier := time.NewTicker(s.Spec.barrierInterval())
+	barrier := time.NewTicker(s.barrierInterval())
 	defer barrier.Stop()
 	// The deadline guard runs far more often than the renew interval: it is
 	// the backstop for the case where renewals stop happening at all (the
@@ -379,6 +383,11 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 	// the deadline forward.
 	guard := time.NewTicker(time.Second)
 	defer guard.Stop()
+	// health.json is rewritten on its own cadence rather than only on a renew
+	// tick: the plugin reads a file older than 60 s as degraded, and a long
+	// renew interval must not make a healthy mount look stale.
+	health := time.NewTicker(HealthWriteInterval)
+	defer health.Stop()
 
 	ticks := 0
 	renewedAt := s.now()
@@ -440,15 +449,25 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 			if resp.Grant.Epoch > s.appliedGrant() {
 				s.applyGrant(ctx, resp.Grant)
 			}
-			if ticks%s.Spec.usageReportEvery() == 0 {
+			if ticks%DefaultUsageReportEvery == 0 {
 				s.reportUsage(ctx)
 			}
+			s.writeHealth()
+
+		case <-health.C:
 			s.writeHealth()
 
 		case <-barrier.C:
 			s.runBarrier(ctx)
 		}
 	}
+}
+
+func (s *Supervisor) barrierInterval() time.Duration {
+	if s.Options.BarrierInterval > 0 {
+		return s.Options.BarrierInterval
+	}
+	return DefaultBarrierInterval
 }
 
 func (s *Supervisor) runBarrier(ctx context.Context) {
