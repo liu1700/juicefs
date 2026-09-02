@@ -98,4 +98,9 @@ const (
 	DefaultBarrierInterval = mountspec.DefaultBarrierInterval
 	DefaultLitestreamSync  = mountspec.DefaultLitestreamSync
 	DefaultTrashDays       = mountspec.DefaultTrashDays
+
+	// The writeback backlog bounds (PLO-383).
+	DefaultMaxStagingBacklog = mountspec.DefaultMaxStagingBacklog
+	DefaultDrainPerBlock     = mountspec.DefaultDrainPerBlock
+	MaxProjectedDrain        = mountspec.MaxProjectedDrain
 )

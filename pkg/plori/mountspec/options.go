@@ -74,6 +74,43 @@ const (
 	DefaultTrashDays = 1
 )
 
+// Writeback backlog bounds (PLO-383). The writeback backlog -- blocks staged on
+// local disk and not yet uploaded -- is both the loss window if the node dies
+// and the work the ordered stop's barrier has to finish inside the writer's
+// remaining lease. Neither is bounded unless the backlog is.
+const (
+	// DefaultMaxStagingBacklog is the ceiling, in blocks. Above it a write is
+	// uploaded through rather than staged: the writer waits for the object
+	// store and the backlog stops growing. Nothing is dropped.
+	//
+	// Sizing, from the only measurement on the production node shape
+	// (`vhf-1c-2gb`, PLO-346, docs/design/per-agent-juicefs/benchmark-real-node.md
+	// §5): the shutdown barrier drained ~345 staged blocks in 10,724 ms with
+	// `--max-uploads 1` -- 31 ms per block, serialised, on a core that was also
+	// serving FUSE. The 45 s write-stop margin therefore covers ~1,447 blocks
+	// in that worst case, and 1,024 leaves a 1.4x margin on it. Production runs
+	// `--max-uploads 20`, so the real headroom is larger again.
+	//
+	// It is NOT sized from that run's headline 595 s / 1,008-block figure. That
+	// was the PASSIVE drain, quantised by a once-a-minute re-queue sweep
+	// (pkg/chunk/cached_store.go stagingSweepInterval, a flat minute before
+	// PLO-383), not by per-block cost; the ordered stop does not use that path,
+	// it force-queues through the barrier.
+	DefaultMaxStagingBacklog = 1024
+
+	// DefaultDrainPerBlock seeds the supervisor's measured drain model before
+	// its first barrier with a non-empty queue. Same measurement as above,
+	// rounded up: 10,724 ms / 345 blocks = 31.1 ms.
+	DefaultDrainPerBlock = 32 * time.Millisecond
+
+	// MaxProjectedDrain caps the projected drain the worker publishes and the
+	// plugin waits for. The plugin gives a stopping worker
+	// `write_stop_margin + projected_drain + 10 s` before SIGKILL, and the
+	// kubelet's own per-volume CSI operation timeout is 2 minutes, so the whole
+	// sum has to fit inside that: 45 + 60 + 10 = 115 s.
+	MaxProjectedDrain = 60 * time.Second
+)
+
 // ParseMountOptions resolves the vocabulary over the defaults.
 func ParseMountOptions(entries []string) MountOptions {
 	opts := MountOptions{

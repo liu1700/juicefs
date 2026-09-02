@@ -41,6 +41,13 @@ const chunkSize = 1 << 26 // 64M
 const pageSize = 1 << 16  // 64K
 const SlowRequest = time.Second * time.Duration(10)
 
+// stagingSweepInterval is how often a writeback store re-queues staged blocks
+// that missed pendingCh, when no upload delay is configured. It is the drain's
+// quantum: a backlog deeper than the channel (100*MaxUpload) can only leave at
+// one channel-full per sweep, so this period, not the store's throughput, is
+// what sets the floor on how long a deep backlog takes to become durable.
+const stagingSweepInterval = time.Second
+
 var (
 	logger = utils.GetLogger("juicefs")
 )
@@ -414,7 +421,7 @@ func (s *wSlice) upload(indx int) {
 			panic(fmt.Sprintf("block length does not match: %v != %v", off, blen))
 		}
 		ctx := context.WithValue(context.Background(), object.TierKey{}, s.tierID)
-		if s.writeback && blen < s.store.conf.WritebackThresholdSize {
+		if s.writeback && blen < s.store.conf.WritebackThresholdSize && !s.store.stagingBacklogFull() {
 			stagingPath := "unknown"
 			stageFailed := false
 			block.Acquire()
@@ -525,21 +532,30 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir               string
-	CacheMode              os.FileMode
-	CacheSize              uint64
-	CacheItems             int64
-	CacheChecksum          string
-	CacheEviction          string
-	CacheScanInterval      time.Duration
-	CacheExpire            time.Duration
-	OSCache                bool
-	FreeSpace              float32
-	AutoCreate             bool
-	Compress               string
-	MaxUpload              int
-	MaxDownload            int
-	MaxStageWrite          int
+	CacheDir          string
+	CacheMode         os.FileMode
+	CacheSize         uint64
+	CacheItems        int64
+	CacheChecksum     string
+	CacheEviction     string
+	CacheScanInterval time.Duration
+	CacheExpire       time.Duration
+	OSCache           bool
+	FreeSpace         float32
+	AutoCreate        bool
+	Compress          string
+	MaxUpload         int
+	MaxDownload       int
+	MaxStageWrite     int
+	// MaxStagingBacklog caps the number of blocks staged on local disk and not
+	// yet uploaded. Zero (the default, and upstream's only behaviour) means
+	// unlimited. Above the cap a write is uploaded through instead of staged:
+	// the writer waits for the object store, and the backlog stops growing.
+	//
+	// The backlog is the writeback loss window -- everything in it dies with
+	// the node -- and it is what a shutdown barrier has to drain inside
+	// whatever time the writer has left. Neither is bounded unless this is.
+	MaxStagingBacklog      int
 	MaxRetries             int
 	UploadLimit            int64 // bytes per second
 	DownloadLimit          int64 // bytes per second
@@ -681,10 +697,14 @@ type cachedStore struct {
 	lastSuccessAt   time.Time
 	startHour       int
 	endHour         int
-	compressor      compress.Compressor
-	seekable        bool
-	upLimit         *ratelimit.Bucket
-	downLimit       *ratelimit.Bucket
+	// maxStagingBacklog is Config.MaxStagingBacklog, live: a supervisor that
+	// measures the real drain rate can tighten it without a remount.
+	maxStagingBacklog   atomic.Int64
+	stagingBacklogTrips atomic.Uint64
+	compressor          compress.Compressor
+	seekable            bool
+	upLimit             *ratelimit.Bucket
+	downLimit           *ratelimit.Bucket
 
 	cacheHits           prometheus.Counter
 	cacheMiss           prometheus.Counter
@@ -854,6 +874,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		pendingChanged:  make(chan struct{}),
 		group:           NewController(),
 	}
+	store.maxStagingBacklog.Store(int64(config.MaxStagingBacklog))
 	if config.UploadLimit > 0 {
 		// there are overheads coming from HTTP/TCP/IP
 		store.upLimit = ratelimit.NewBucketWithRate(float64(config.UploadLimit)*0.85, config.UploadLimit/10)
@@ -914,8 +935,17 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		for i := 0; i < store.conf.MaxUpload; i++ {
 			go store.uploader()
 		}
-		interval := time.Minute
+		// The sweep is the ONLY thing that ever re-queues a staged block that
+		// missed pendingCh (capacity 100*MaxUpload), so its period quantises
+		// the drain of any backlog deeper than that channel. At the old flat
+		// minute, 1,008 staged blocks took 595 s to reach the store on a
+		// 1-vCPU node -- ~10 sweeps of ~100 blocks -- which was read as 590 ms
+		// of per-block work and is nothing of the sort (PLO-346 / PLO-383).
+		// With no configured delay there is nothing to wait for, so sweep at
+		// the rate the uploaders can actually absorb.
+		interval := stagingSweepInterval
 		if d := store.conf.UploadDelay; d > 0 {
+			interval = time.Minute
 			if d < time.Minute {
 				interval = d
 				logger.Warnf("delay uploading by %s (this value is too small, and is not recommended)", d)
@@ -1022,6 +1052,12 @@ func (store *cachedStore) regMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{Name: "writeback_pending_blocks", Help: "number of staged blocks not yet durable in object storage"},
 		func() float64 { return float64(store.RemoteDurabilityStatus().PendingBlocks) }))
+	reg.MustRegister(prometheus.NewGaugeFunc(
+		prometheus.GaugeOpts{Name: "writeback_staging_backlog_cap", Help: "cap on staged blocks not yet durable; 0 means unlimited"},
+		func() float64 { return float64(store.StagingBacklogCap()) }))
+	reg.MustRegister(prometheus.NewCounterFunc(
+		prometheus.CounterOpts{Name: "writeback_staging_backlog_full", Help: "blocks uploaded through instead of staged because the backlog was at its cap"},
+		func() float64 { return float64(store.StagingBacklogTrips()) }))
 	reg.MustRegister(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{Name: "writeback_pending_bytes", Help: "bytes staged but not yet durable in object storage"},
 		func() float64 { return float64(store.RemoteDurabilityStatus().PendingBytes) }))
@@ -1266,6 +1302,40 @@ func (store *cachedStore) RemoteDurabilityStatus() DurabilityStatus {
 	store.pendingMutex.Lock()
 	defer store.pendingMutex.Unlock()
 	return store.durabilityStatusLocked(store.nextPendingSeq)
+}
+
+// SetStagingBacklogCap replaces the live cap. Zero or negative is unlimited.
+func (store *cachedStore) SetStagingBacklogCap(blocks int64) {
+	if blocks < 0 {
+		blocks = 0
+	}
+	store.maxStagingBacklog.Store(blocks)
+}
+
+// StagingBacklogCap is the cap in force.
+func (store *cachedStore) StagingBacklogCap() int64 { return store.maxStagingBacklog.Load() }
+
+// StagingBacklogTrips counts blocks that were uploaded through because the
+// backlog was at its cap. It is the throughput cost of the cap, in one number.
+func (store *cachedStore) StagingBacklogTrips() uint64 { return store.stagingBacklogTrips.Load() }
+
+// stagingBacklogFull reports whether the backlog has reached its cap, and
+// counts the trip. It is asked once per block, immediately before staging it.
+//
+// The counter increments here rather than at the fallback so that "how often
+// did the cap send a write through the store" is one number with one writer.
+func (store *cachedStore) stagingBacklogFull() bool {
+	limit := store.maxStagingBacklog.Load()
+	if limit <= 0 {
+		return false
+	}
+	store.pendingMutex.Lock()
+	full := int64(len(store.pendingKeys)) >= limit
+	store.pendingMutex.Unlock()
+	if full {
+		store.stagingBacklogTrips.Add(1)
+	}
+	return full
 }
 
 func (store *cachedStore) RemoteDurability(ctx context.Context) (DurabilityStatus, error) {

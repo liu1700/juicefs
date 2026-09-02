@@ -54,6 +54,12 @@ type fakeVolume struct {
 	grants      [][2]int64
 	grantErr    error
 	quotaTrips  atomic.Uint64
+	// pending is the writeback backlog the fake reports. A settable number
+	// rather than a constant zero because the whole of PLO-383 is what the
+	// supervisor does when it is NOT zero.
+	pending atomic.Uint64
+	// backlogCaps is every cap the supervisor pushed down, in order.
+	backlogCaps []int64
 }
 
 func (f *fakeVolume) record(name string) {
@@ -97,7 +103,28 @@ func (f *fakeVolume) Barrier(ctx context.Context) (BarrierResult, error) {
 	}
 	return BarrierResult{BarrierAt: time.Now().UTC()}, nil
 }
-func (f *fakeVolume) PendingBlocks() uint64                { return 0 }
+func (f *fakeVolume) PendingBlocks() uint64 { return f.pending.Load() }
+func (f *fakeVolume) SetStagingBacklogCap(blocks int64) {
+	f.mu.Lock()
+	f.backlogCaps = append(f.backlogCaps, blocks)
+	f.mu.Unlock()
+}
+
+// caps is every staging-backlog cap the supervisor pushed down, in order.
+func (f *fakeVolume) caps() []int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int64(nil), f.backlogCaps...)
+}
+
+// lastCap is the cap in force, or -1 if none was ever pushed.
+func (f *fakeVolume) lastCap() int64 {
+	c := f.caps()
+	if len(c) == 0 {
+		return -1
+	}
+	return c[len(c)-1]
+}
 func (f *fakeVolume) Usage(context.Context) (Usage, error) { return f.usage, nil }
 func (f *fakeVolume) ApplyGrant(_ context.Context, bytes, inodes int64) error {
 	f.record("apply_grant")

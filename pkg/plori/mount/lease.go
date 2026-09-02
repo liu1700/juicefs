@@ -96,6 +96,31 @@ func (d *Deadline) WriteAllowed(now time.Time) bool {
 	return now.Before(d.margin)
 }
 
+// StopBy is the instant the ordered stop must begin so that a drain of
+// `projected` still finishes inside the lease: expiry - margin - projected.
+//
+// It is threat-model.md §7.5's third instant, and until PLO-383 it did not
+// exist in code -- the stop began AT the margin, which reserves a fixed tail
+// for a flush whose length is not fixed (PLO-346: 13.2x the margin). The
+// margin is still the floor: the returned instant is never later than
+// expiry - margin, so nothing this adds can make a stop start later than it
+// used to.
+func (d *Deadline) StopBy(projected time.Duration) time.Time {
+	if projected < 0 {
+		projected = 0
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.margin.Add(-projected)
+}
+
+// StopDue reports whether the ordered stop must begin now, given how long the
+// backlog in front of it is projected to take. With projected == 0 it is
+// exactly !WriteAllowed.
+func (d *Deadline) StopDue(now time.Time, projected time.Duration) bool {
+	return !now.Before(d.StopBy(projected))
+}
+
 // Expiry is the monotonic instant at which the lease itself dies. It is what
 // the metadata engine's write gate is armed with: after it, another writer may
 // exist, so nothing may be committed — not even the drain.

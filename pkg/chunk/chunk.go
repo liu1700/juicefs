@@ -72,3 +72,20 @@ type RemoteDurabilityStore interface {
 	RemoteDurability(context.Context) (DurabilityStatus, error)
 	RemoteDurabilityStatus() DurabilityStatus
 }
+
+// StagingBacklogLimiter caps how many blocks may sit staged on local disk
+// waiting to be uploaded. Above the cap the writer stops staging and uploads
+// through instead, so the writer pays the store round trip and the backlog
+// stops growing. Nothing is ever dropped.
+//
+// It exists because a writeback backlog is a bounded loss window only if the
+// backlog itself is bounded: everything staged and not yet uploaded is lost if
+// the node dies, and it is what the shutdown barrier has to drain inside the
+// writer's remaining authority. See Config.MaxStagingBacklog.
+type StagingBacklogLimiter interface {
+	// SetStagingBacklogCap replaces the cap. Zero or negative means unlimited,
+	// which is the upstream behaviour and the default.
+	SetStagingBacklogCap(blocks int64)
+	// StagingBacklogCap is the cap in force.
+	StagingBacklogCap() int64
+}
