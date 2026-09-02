@@ -131,6 +131,7 @@ func ploriMount(c *cli.Context) error {
 		// environment, rebuilt every time it starts. This process's own
 		// environment holds no credential on the file path.
 		Env: func() []string { return source.Env(os.Environ()) },
+		Log: ploriLog,
 	}
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))

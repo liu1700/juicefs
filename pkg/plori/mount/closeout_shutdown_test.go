@@ -239,12 +239,12 @@ type slowReplicator struct {
 	did   bool
 }
 
-func (r *slowReplicator) Restore(ctx context.Context, src string, ts time.Time) error {
+func (r *slowReplicator) Restore(ctx context.Context, src string, opt RestoreOptions) error {
 	time.Sleep(r.delay)
 	r.mu.Lock()
 	r.did = true
 	r.mu.Unlock()
-	return r.fakeReplicator.Restore(ctx, src, ts)
+	return r.fakeReplicator.Restore(ctx, src, opt)
 }
 
 func (r *slowReplicator) restored() bool {

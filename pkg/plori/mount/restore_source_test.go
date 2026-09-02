@@ -36,12 +36,13 @@ type restoreRecorder struct {
 	mu     sync.Mutex
 	prefix string
 	anchor time.Time
+	txid   string
 }
 
-func (r *restoreRecorder) Restore(_ context.Context, sourcePrefix string, ts time.Time) error {
+func (r *restoreRecorder) Restore(_ context.Context, sourcePrefix string, opt RestoreOptions) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.prefix, r.anchor = sourcePrefix, ts
+	r.prefix, r.anchor, r.txid = sourcePrefix, opt.Timestamp, opt.TXID
 	return nil
 }
 func (r *restoreRecorder) Start(context.Context) error       { return nil }
@@ -56,6 +57,14 @@ func (r *restoreRecorder) result() (string, time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.prefix, r.anchor
+}
+
+// restoredTxID is the third field of the anchor: the transaction the restore
+// actually asked for (PLO-396).
+func (r *restoreRecorder) restoredTxID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.txid
 }
 
 // countingFencer records whether the LIST fallback was reached at all. "The
@@ -366,4 +375,73 @@ func TestSpecDurablePointSurvivesTheWire(t *testing.T) {
 	if want := time.Date(2026, 9, 2, 11, 0, 0, 0, time.UTC); !spec.DurablePoint.DurableAt.Equal(want) {
 		t.Errorf("durable_point.durable_at = %s, want %s", spec.DurablePoint.DurableAt, want)
 	}
+}
+
+// TestTheRestoreAnchorCarriesTheDurablePointsTransaction is PLO-396's half of
+// the anchor. A durable point names a transaction as well as an instant, and
+// the transaction is the exact one: `-timestamp` selects whole LTX FILES by
+// their encode moment, so it silently drops the last transactions before
+// `T_before` — the ones whose file was encoded just after it. Both sources of
+// a durable point must hand their txid to the restore, or the field is decoded
+// and dropped, which is what this issue was filed about.
+func TestTheRestoreAnchorCarriesTheDurablePointsTransaction(t *testing.T) {
+	t.Run("from the mount spec", func(t *testing.T) {
+		spec := testSpec()
+		spec.FenceEpoch = 7
+		spec.MetaPrefix = testVolumeRoot + "g7/"
+		spec.FenceMarkerKey = spec.MetaPrefix + "fence"
+		spec.RestoreFromPrefix = testVolumeRoot + "g4/"
+		spec.DurablePoint = &DurablePointSpec{
+			DurableAt:   time.Date(2026, 9, 2, 11, 30, 0, 0, time.UTC),
+			ReplicaTxID: "0000000000000042",
+			FenceEpoch:  4,
+		}
+		if err := spec.Validate(); err != nil {
+			t.Fatalf("spec: %v", err)
+		}
+		rep := &restoreRecorder{}
+		runToCleanStop(t, spec, rep, &countingFencer{})
+		if got := rep.restoredTxID(); got != "0000000000000042" {
+			t.Errorf("restore asked for txid %q, want the spec's durable point %q", got, "0000000000000042")
+		}
+	})
+
+	t.Run("from the state dir", func(t *testing.T) {
+		spec := testSpec()
+		spec.FenceEpoch = 7
+		spec.MetaPrefix = testVolumeRoot + "g7/"
+		spec.FenceMarkerKey = spec.MetaPrefix + "fence"
+		spec.RestoreFromPrefix = testVolumeRoot + "g4/"
+		spec.DurablePoint = &DurablePointSpec{
+			DurableAt:   time.Date(2026, 9, 2, 11, 0, 0, 0, time.UTC),
+			ReplicaTxID: "0000000000000042",
+			FenceEpoch:  4,
+		}
+		if err := spec.Validate(); err != nil {
+			t.Fatalf("spec: %v", err)
+		}
+		rep := &restoreRecorder{}
+		sup := newSup(t, spec, &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &countingFencer{})
+		sup.Deps.Replicator = rep
+		local := time.Date(2026, 9, 2, 11, 45, 0, 0, time.UTC)
+		if err := os.MkdirAll(sup.Paths.StateDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSONAtomic(sup.Paths.DurablePointPath(), DurablePoint{
+			Volume: spec.StorageVolumeID, FenceEpoch: 6, DurableAt: local,
+			BarrierAt: local.Add(time.Second), ReplicaTxID: "0000000000000077",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		stop := make(chan os.Signal, 1)
+		stop <- syscall.SIGTERM
+		if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
+			t.Fatalf("exit = %d: %v", got.Exit, got.Err)
+		}
+		// The whole point wins, transaction included: the newer local point's
+		// txid, never the server's paired with the local prefix.
+		if got := rep.restoredTxID(); got != "0000000000000077" {
+			t.Errorf("restore asked for txid %q, want the local point's %q", got, "0000000000000077")
+		}
+	})
 }

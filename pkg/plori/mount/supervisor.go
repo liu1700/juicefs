@@ -287,8 +287,9 @@ func (s *Supervisor) reclaimOwnMarker(ctx context.Context) *Fatal {
 
 func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// There are up to two known durable points, and the newer one wins WHOLE:
-	// both the prefix to restore from and the instant to stop at come from the
-	// same point, never one from each.
+	// the prefix to restore from, the replica transaction to stop at and the
+	// instant that transaction was durable at all come from the same point,
+	// never one from each.
 	//
 	//   * the control-plane's, in the MountSpec. Authoritative, and the only
 	//     one a Pod rescheduled onto a different node can see.
@@ -307,12 +308,13 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// is what every mount did before the server carried a point (PLO-391).
 	var (
 		anchor time.Time
+		txid   string
 		source string
 		from   int64
 	)
 	if dp := s.Spec.DurablePoint; dp != nil {
-		anchor, from, source = dp.DurableAt, dp.FenceEpoch, s.Spec.RestoreFromPrefix
-		s.log("restore_anchor", "durable_at", anchor, "from_epoch", from, "known_by", "mount_spec")
+		anchor, txid, from, source = dp.DurableAt, dp.ReplicaTxID, dp.FenceEpoch, s.Spec.RestoreFromPrefix
+		s.log("restore_anchor", "durable_at", anchor, "replica_txid", txid, "from_epoch", from, "known_by", "mount_spec")
 	}
 	// `<=`, not `<`: a worker restarted at the SAME epoch — the crash-restart
 	// the kubelet produces, where the issuer replays the epoch for the same Pod
@@ -324,8 +326,8 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 			// Its prefix is populated by construction: the file is written
 			// only after a barrier, and a barrier only happens once
 			// replication is running under that epoch's prefix.
-			anchor, from, source = dp.DurableAt, dp.FenceEpoch, s.Spec.MetaPrefixForEpoch(dp.FenceEpoch)
-			s.log("restore_anchor", "durable_at", anchor, "from_epoch", from, "known_by", "state_dir")
+			anchor, txid, from, source = dp.DurableAt, dp.ReplicaTxID, dp.FenceEpoch, s.Spec.MetaPrefixForEpoch(dp.FenceEpoch)
+			s.log("restore_anchor", "durable_at", anchor, "replica_txid", txid, "from_epoch", from, "known_by", "state_dir")
 		}
 	}
 	// A previous generation that did not write the clean marker died without
@@ -365,7 +367,11 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 		}
 	}
 
-	err := s.Deps.Replicator.Restore(ctx, source, anchor)
+	// The transaction id wins over the wall clock when the point carries one:
+	// it names a transaction, where a timestamp names a FILE whose stamp is
+	// the moment it was encoded, strictly after the last commit inside it
+	// (PLO-396, RestoreOptions).
+	err := s.Deps.Replicator.Restore(ctx, source, RestoreOptions{TXID: txid, Timestamp: anchor})
 	switch {
 	case err == nil:
 		if s.restoredUnclean {
