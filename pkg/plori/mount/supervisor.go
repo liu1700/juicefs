@@ -795,9 +795,10 @@ func (s *Supervisor) renewRequest() RenewRequest {
 // asked again would stay stuck after the user paid to unstick it.
 func (s *Supervisor) growRefused() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.growAsked = false
-	s.log("grant_over_budget", "epoch", s.grantApplied)
+	epoch := s.grantApplied
+	s.mu.Unlock()
+	s.log("grant_over_budget", "epoch", epoch)
 }
 
 func (s *Supervisor) reportUsage(ctx context.Context) {
