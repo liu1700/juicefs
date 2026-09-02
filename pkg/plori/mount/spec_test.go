@@ -30,6 +30,12 @@ import (
 // validSpecJSON is the shape services/control-plane/internal/storagespec
 // actually emits (docs/design/per-agent-juicefs/mountspec.md §3), so a change
 // on either side that breaks the wire shows up here.
+//
+// It is a hand-kept copy of that wire and therefore only half a guard: this
+// package cannot see the control-plane's source. The other half lives in
+// plori-runtime, where services/storage-worker decodes the control-plane's own
+// generated golden with LoadSpec (PLO-395) — which is the check that would have
+// caught `format` against `format_spec` on the day it was written.
 const validSpecJSON = `{
   "storage_volume_id": "550e8400-e29b-41d4-a716-446655440000",
   "format_uuid": "6c1e5f2c-0f0a-4a1c-9f2d-2b4e6a8c0d1e",
@@ -49,6 +55,18 @@ const validSpecJSON = `{
     "region": "lax1",
     "credential_source": "node_secret"
   },
+  "format": {
+    "volume_id": "550e8400-e29b-41d4-a716-446655440000",
+    "bucket": "https://plorifs.lax1.vultrobjects.com/plorifs",
+    "data_prefix": "agents/550e8400-e29b-41d4-a716-446655440000/",
+    "meta_prefix": "agents-meta/550e8400-e29b-41d4-a716-446655440000/",
+    "trash_days": 1,
+    "capacity_bytes": 10737418240,
+    "inodes": 1000000,
+    "grant_epoch": 2,
+    "expected_uuid": "6c1e5f2c-0f0a-4a1c-9f2d-2b4e6a8c0d1e"
+  },
+  "may_format": false,
   "mount_options": ["--writeback", "--cache-size=10240"],
   "issued_at": "2026-09-02T11:58:00Z"
 }`
@@ -81,6 +99,44 @@ func TestLoadSpecAcceptsTheControlPlaneWireShape(t *testing.T) {
 	// prefix of its own, so the data root has to live in the name.
 	if got, want := spec.VolumeName(), "agents/550e8400-e29b-41d4-a716-446655440000"; got != want {
 		t.Errorf("VolumeName() = %q, want %q", got, want)
+	}
+	// The format block is what PLO-395 was about: the control-plane sends
+	// `format` with nine fields and `may_format`, and this worker decoded
+	// `format_spec` with four, so every real spec was refused with exit 64
+	// before it reached any of the above.
+	if got, want := spec.Format.TrashDays, 1; got != want {
+		t.Errorf("format.trash_days = %d, want %d", got, want)
+	}
+	if got, want := spec.Format.Bucket, "https://plorifs.lax1.vultrobjects.com/plorifs"; got != want {
+		t.Errorf("format.bucket = %q, want %q", got, want)
+	}
+	if got, want := spec.Format.CapacityBytes, int64(10737418240); got != want {
+		t.Errorf("format.capacity_bytes = %d, want %d", got, want)
+	}
+	if spec.MayFormat {
+		t.Error("may_format is true for a volume that already carries a Format.UUID")
+	}
+}
+
+// The bootstrap spec — an `allocating` volume whose lease IS the formatting
+// lease (PLO-373). It is the only shape that authorises a format, and the shape
+// no round trip covered until PLO-395.
+func TestLoadSpecAcceptsTheBootstrapWireShape(t *testing.T) {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(validSpecJSON), &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["volume_state"] = "allocating"
+	raw["format_uuid"] = ""
+	raw["may_format"] = true
+	delete(raw["format"].(map[string]any), "expected_uuid")
+	body, _ := json.Marshal(raw)
+	spec, err := LoadSpec(writeSpec(t, string(body)))
+	if err != nil {
+		t.Fatalf("LoadSpec: %v", err)
+	}
+	if !spec.MayFormat {
+		t.Error("may_format did not survive the round trip")
 	}
 }
 
@@ -129,11 +185,35 @@ func TestSpecRefusals(t *testing.T) {
 			m["fence_marker_key"] = "agents-meta/other/fence"
 		}, CodeSpecInvalid},
 		{"unwritable volume state", func(m map[string]any) { m["volume_state"] = "retiring" }, CodeSpecInvalid},
+		{"missing format block", func(m map[string]any) { delete(m, "format") }, CodeSpecInvalid},
 		{"trash days below the floor", func(m map[string]any) {
-			m["format_spec"] = map[string]any{"trash_days": 0}
+			m["format"].(map[string]any)["trash_days"] = 0
 		}, CodeSpecInvalid},
-		{"storage outside the profile", func(m map[string]any) {
-			m["format_spec"] = map[string]any{"trash_days": 1, "storage": "gs"}
+		{"format names another volume", func(m map[string]any) {
+			m["format"].(map[string]any)["volume_id"] = "00000000-0000-0000-0000-000000000000"
+		}, CodeSpecInvalid},
+		{"format names another data prefix", func(m map[string]any) {
+			m["format"].(map[string]any)["data_prefix"] = "agents/other/"
+		}, CodeSpecInvalid},
+		// The format block carries the metadata ROOT; a spec that put this
+		// writer's epoch prefix there would restore and replicate one segment
+		// deeper than every other generation.
+		{"format meta prefix is the epoch prefix", func(m map[string]any) {
+			m["format"].(map[string]any)["meta_prefix"] = m["meta_prefix"]
+		}, CodeSpecInvalid},
+		{"format bucket is not the spec's object store", func(m map[string]any) {
+			m["format"].(map[string]any)["bucket"] = "https://elsewhere.example.com/other"
+		}, CodeSpecInvalid},
+		{"expected uuid contradicts format_uuid", func(m map[string]any) {
+			m["format"].(map[string]any)["expected_uuid"] = "0d0d0d0d-0000-0000-0000-000000000000"
+		}, CodeSpecInvalid},
+		// The one that would licence formatting over a live filesystem.
+		{"may_format granted on a formatted volume", func(m map[string]any) {
+			m["may_format"] = true
+		}, CodeSpecInvalid},
+		{"may_format withheld on an unformatted volume", func(m map[string]any) {
+			m["format_uuid"] = ""
+			delete(m["format"].(map[string]any), "expected_uuid")
 		}, CodeSpecInvalid},
 	}
 	for _, tc := range tests {
@@ -152,16 +232,6 @@ func TestSpecRefusals(t *testing.T) {
 				t.Errorf("exit = %d, want %d (%v)", got, tc.want, err)
 			}
 		})
-	}
-}
-
-func TestEffectiveFormatRaisesTrashDaysToTheFloor(t *testing.T) {
-	spec := &MountSpec{}
-	if got := spec.EffectiveFormat().TrashDays; got != DefaultTrashDays {
-		t.Errorf("derived trash days = %d, want %d", got, DefaultTrashDays)
-	}
-	if got := spec.EffectiveFormat().Storage; got != "s3" {
-		t.Errorf("derived storage = %q, want s3", got)
 	}
 }
 

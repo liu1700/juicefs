@@ -307,15 +307,20 @@ func (s *Supervisor) formatFirstBoot(ctx context.Context) error {
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false,
 			"metadata replica is empty but volume state is %q; refusing to format", s.Spec.VolumeState)
 	}
-	if s.Spec.FormatUUID != "" {
+	// may_format is the control-plane's authorisation, and it is the only thing
+	// consulted here: the server sets it exactly when the volume has never been
+	// formatted, and Validate has already refused a spec where it disagrees with
+	// the recorded Format.UUID.
+	if !s.Spec.MayFormat {
 		return fatalf(CodeIdentityMismatch, ErrCodeIdentityMismatch, false,
-			"metadata replica is empty but the control-plane recorded format UUID %s", s.Spec.FormatUUID)
+			"metadata replica is empty but the control-plane did not authorise a format (format UUID %q)",
+			s.Spec.FormatUUID)
 	}
 	if err := s.Deps.FS.Format(ctx, s.Spec); err != nil {
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "format volume: %s", err)
 	}
 	s.formattedHere = true
-	s.log("formatted", "volume", s.Spec.StorageVolumeID, "trash_days", s.Spec.EffectiveFormat().TrashDays)
+	s.log("formatted", "volume", s.Spec.StorageVolumeID, "trash_days", s.Spec.Format.TrashDays)
 	return nil
 }
 

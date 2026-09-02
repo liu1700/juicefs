@@ -206,21 +206,21 @@ func (f *ploriFS) credentialPatch() func(*meta.Format) {
 // object.CreateStorage is handed empty keys and the AWS SDK resolves them from
 // this process's environment for the duration of the format only.
 func (f *ploriFS) Format(ctx context.Context, spec *pmount.MountSpec) error {
-	fs := spec.EffectiveFormat()
-	blockSize := fs.BlockSizeKB
-	if blockSize == 0 {
-		blockSize = 4096
-	}
+	// Everything `juicefs format` needs comes out of the spec's format block,
+	// which the control-plane composed for this volume; Compression is left at
+	// JuiceFS's default (none), which is the Plori profile. Validate has already
+	// checked the block against the rest of the spec, so nothing here re-derives
+	// a value the server sent.
+	fs := spec.Format
 	format := &meta.Format{
 		Name:             spec.VolumeName(),
 		UUID:             uuid.New().String(),
-		Storage:          fs.Storage,
-		Bucket:           spec.ObjectStore.Endpoint + "/" + spec.ObjectStore.Bucket,
+		Storage:          pmount.FormatStorage,
+		Bucket:           fs.Bucket,
 		Tiers:            object.NewTiers(""),
-		BlockSize:        blockSize,
-		Compression:      fs.Compression,
-		Capacity:         uint64(max64(spec.Grant.Bytes, 0)),
-		Inodes:           uint64(max64(spec.Grant.Inodes, 0)),
+		BlockSize:        pmount.FormatBlockSizeKB,
+		Capacity:         uint64(max64(fs.CapacityBytes, 0)),
+		Inodes:           uint64(max64(fs.Inodes, 0)),
 		TrashDays:        fs.TrashDays,
 		DirStats:         true,
 		MetaVersion:      meta.MaxVersion,

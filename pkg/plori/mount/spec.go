@@ -98,18 +98,63 @@ type ObjectStore struct {
 	CredentialSource string `json:"credential_source"`
 }
 
-// FormatSpec is the first-boot format contract. PLO-330 owns the server-side
-// half; until it lands the control-plane omits the object entirely and the
-// worker derives everything below from the rest of the spec (see
-// (*MountSpec).EffectiveFormat).
+// Format constants of the Plori profile. `juicefs format` takes three more
+// knobs than the control-plane issues, and they are constants here rather than
+// wire fields on purpose: a field the server never sends is a field the two
+// sides can disagree about for free, which is the class of bug PLO-395 was.
+const (
+	// FormatStorage is the object-storage driver every per-Agent volume is
+	// formatted with. The Plori release profile registers no other remote
+	// backend, so this is a constant rather than a choice.
+	FormatStorage = "s3"
+	// FormatBlockSizeKB is `--block-size`, in KiB, at JuiceFS's own default
+	// (cmd/format.go:154). Changing it after the fact is impossible, so it is
+	// pinned here where a change is a code review rather than a config edit.
+	FormatBlockSizeKB = 4096
+)
+
+// FormatSpec is `juicefs format`'s whole input for one per-Agent volume,
+// mirrored field-for-field from the control-plane's
+// storagelifecycle.FormatSpec. The control-plane is the AUTHORITY on this
+// wire and this struct is a copy of it; plori-runtime's
+// services/storage-worker decodes the control-plane's own golden spec with
+// this type so the copy cannot drift again (PLO-395).
+//
+// It carries NO credential. The worker already holds the bucket key from its
+// node Secret (ADR §5 C1); a key here would be one in a struct that crosses a
+// process boundary, gets logged, and lands in the replicated SQLite.
 type FormatSpec struct {
-	TrashDays   int    `json:"trash_days"`
-	BlockSizeKB int    `json:"block_size_kb,omitempty"`
-	Compression string `json:"compression,omitempty"`
-	// Storage is the JuiceFS object-storage driver name. The Plori profile
-	// registers exactly two ("s3" for remote, "file" for the metadata-backup
-	// staging path), so anything else is refused.
-	Storage string `json:"storage,omitempty"`
+	// VolumeID is the volume row's id. It is NOT `juicefs format`'s NAME
+	// argument on its own — see (*MountSpec).VolumeName for why the name has to
+	// carry the data root too.
+	VolumeID string `json:"volume_id"`
+	// Bucket is `--bucket`: `<endpoint>/<bucket>` and nothing deeper, because
+	// JuiceFS's S3 backend reads at most `[ENDPOINT]/[BUCKET]` and discards the
+	// rest (pkg/object/s3.go). It is the same string this spec's object_store
+	// composes, and validateFormat refuses a spec where the two disagree.
+	Bucket string `json:"bucket"`
+	// DataPrefix and MetaPrefix are the volume's two disjoint object roots, as
+	// the control-plane derived them. MetaPrefix here is the metadata ROOT
+	// (`agents-meta/<vid>/`), not this writer's epoch inside it — that is
+	// MountSpec.MetaPrefix.
+	DataPrefix string `json:"data_prefix"`
+	MetaPrefix string `json:"meta_prefix"`
+	// TrashDays is `--trash-days`, always >= 1: the Rank 1 crash-consistency
+	// protocol restores through the trash, so 0 is not a tunable value here.
+	TrashDays int `json:"trash_days"`
+	// CapacityBytes and Inodes are the account allocator's hard ceiling for
+	// this volume. Zero means unlimited, which only an ungranted volume has —
+	// and such a volume is not mountable.
+	CapacityBytes int64 `json:"capacity_bytes"`
+	Inodes        int64 `json:"inodes"`
+	// GrantEpoch is the grant those numbers came from, echoed back on
+	// /grant-ack so the allocator can tell an issued ceiling from an enforced
+	// one.
+	GrantEpoch int64 `json:"grant_epoch"`
+	// ExpectedUUID is the Format.UUID this volume already has, and its
+	// emptiness is what MayFormat reports. The worker compares it against the
+	// Format it restores and refuses on a mismatch; it never formats over it.
+	ExpectedUUID string `json:"expected_uuid,omitempty"`
 }
 
 // DurablePointSpec is the control-plane's copy of the recovery anchor: the
@@ -170,14 +215,21 @@ type MountSpec struct {
 	Grant       GrantSpec   `json:"grant"`
 	ObjectStore ObjectStore `json:"object_store"`
 
+	// Format is everything `juicefs format` needs, always sent. It is embedded
+	// rather than re-derived from the rest of the spec so that ONE side decides
+	// what a per-Agent volume's Format looks like; every other tuning knob
+	// arrives through MountOptions, whose vocabulary is in options.go.
+	Format FormatSpec `json:"format"`
+	// MayFormat is the control-plane's AUTHORISATION to run `juicefs format`,
+	// true exactly when the volume has never been formatted. It is a field
+	// rather than an inference from an empty Format.ExpectedUUID because an
+	// authorisation both sides infer from the absence of a value is one a
+	// future rename silently grants.
+	MayFormat bool `json:"may_format"`
+
 	MountOptions []string `json:"mount_options"`
 
 	IssuedAt time.Time `json:"issued_at"`
-
-	// Format is the first-boot format contract (PLO-330). Optional; every
-	// other tuning knob arrives through MountOptions, whose vocabulary is in
-	// options.go.
-	Format *FormatSpec `json:"format_spec,omitempty"`
 }
 
 // ErrSpec marks every refusal that must exit with CodeSpecInvalid.
@@ -282,16 +334,72 @@ func (s *MountSpec) Validate() error {
 			return fmt.Errorf("%w: mount_options entry contains a control character", ErrSpec)
 		}
 	}
-	if f := s.Format; f != nil {
-		if f.TrashDays < DefaultTrashDays {
-			return fmt.Errorf("%w: format_spec.trash_days %d is below the crash-consistency floor of %d",
-				ErrSpec, f.TrashDays, DefaultTrashDays)
-		}
-		if f.Storage != "" && f.Storage != "s3" {
-			return fmt.Errorf("%w: format_spec.storage %q is outside the Plori profile", ErrSpec, f.Storage)
-		}
+	return s.validateFormat()
+}
+
+// validateFormat checks the embedded format block against the rest of the spec.
+//
+// Every field in it is also spelled somewhere else on this wire — the volume id,
+// the two prefixes, the bucket, the recorded Format.UUID — so the only way the
+// two spellings can disagree is a control-plane that contradicted itself. Acting
+// on half of a contradiction is how a mount formats against one bucket and
+// replicates to another, so a disagreement is exit 64 rather than a preference.
+func (s *MountSpec) validateFormat() error {
+	f := s.Format
+	if f.TrashDays < DefaultTrashDays {
+		return fmt.Errorf("%w: format.trash_days %d is below the crash-consistency floor of %d",
+			ErrSpec, f.TrashDays, DefaultTrashDays)
+	}
+	if f.VolumeID != s.StorageVolumeID {
+		return fmt.Errorf("%w: format.volume_id %q is not this spec's volume %q",
+			ErrSpec, f.VolumeID, s.StorageVolumeID)
+	}
+	if f.DataPrefix != s.DataPrefix {
+		return fmt.Errorf("%w: format.data_prefix %q does not match the spec's data_prefix %q",
+			ErrSpec, f.DataPrefix, s.DataPrefix)
+	}
+	// The control-plane's format block carries the metadata ROOT; the spec's
+	// own meta_prefix is this writer's epoch inside it (storagevol.MetaRootPrefix
+	// against storagevol.MetaPrefix). Comparing them the wrong way round would
+	// pass on every volume and mean nothing.
+	if f.MetaPrefix != s.MetaRoot() {
+		return fmt.Errorf("%w: format.meta_prefix %q is not this volume's metadata root %q",
+			ErrSpec, f.MetaPrefix, s.MetaRoot())
+	}
+	if want := formatBucketURL(s.ObjectStore.Endpoint, s.ObjectStore.Bucket); f.Bucket != want {
+		return fmt.Errorf("%w: format.bucket %q does not name the spec's object store %q",
+			ErrSpec, f.Bucket, want)
+	}
+	if f.ExpectedUUID != s.FormatUUID {
+		return fmt.Errorf("%w: format.expected_uuid %q and format_uuid %q are two spellings of one fact and disagree",
+			ErrSpec, f.ExpectedUUID, s.FormatUUID)
+	}
+	// MayFormat is the authorisation and ExpectedUUID is the reason for it. A
+	// spec that grants the first without the second is a licence to format over
+	// a filesystem that already exists.
+	if s.MayFormat != (f.ExpectedUUID == "") {
+		return fmt.Errorf("%w: may_format is %t but format.expected_uuid is %q",
+			ErrSpec, s.MayFormat, f.ExpectedUUID)
+	}
+	if f.CapacityBytes < 0 || f.Inodes < 0 {
+		return fmt.Errorf("%w: format ceiling is negative (%d bytes / %d inodes)",
+			ErrSpec, f.CapacityBytes, f.Inodes)
 	}
 	return nil
+}
+
+// formatBucketURL composes `--bucket` from the two object-store coordinates,
+// byte-for-byte as the control-plane does (storagevol.FormatBucketURL). It is a
+// copy of that derivation rather than a looser comparison so that the check
+// above is a drift guard and not a trap for a trailing slash in a deployment's
+// endpoint.
+func formatBucketURL(endpoint, bucket string) string {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	bucket = strings.Trim(strings.TrimSpace(bucket), "/")
+	if endpoint == "" || bucket == "" {
+		return ""
+	}
+	return endpoint + "/" + bucket
 }
 
 // validateRestoreInstruction checks the rev-3 pair. Everything it refuses is a
@@ -386,22 +494,4 @@ func (s *MountSpec) MetaRoot() string {
 		return trimmed[:i+1]
 	}
 	return trimmed
-}
-
-// EffectiveFormat is what a first-boot format uses. When the control-plane
-// omits `format_spec` (PLO-330 has not shipped it yet) the worker derives the
-// contract from the rest of the spec and the crash-consistency floor rather
-// than refusing, because refusing would make every volume unformattable.
-func (s *MountSpec) EffectiveFormat() FormatSpec {
-	f := FormatSpec{TrashDays: DefaultTrashDays, Storage: "s3"}
-	if s.Format != nil {
-		f = *s.Format
-		if f.TrashDays < DefaultTrashDays {
-			f.TrashDays = DefaultTrashDays
-		}
-		if f.Storage == "" {
-			f.Storage = "s3"
-		}
-	}
-	return f
 }
