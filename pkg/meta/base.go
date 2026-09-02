@@ -888,8 +888,16 @@ func (m *baseMeta) expireTime() int64 {
 // It exists so a distribution whose right to write is granted by something
 // outside the filesystem — a lease that can expire or be revoked — can make
 // every mutation fail with EROFS at once, instead of gating the handful of
-// call sites somebody remembered. The nine sites that consult readOnly() are
-// precisely the ones that already returned EROFS.
+// call sites somebody remembered.
+//
+// Thirteen sites consult readOnly(). Nine are upstream's namespace mutators,
+// which already answered EROFS under --read-only. The other four — Write,
+// Truncate, SetAttr and Fallocate — are the data path, and they were added for
+// PLO-323 F-2: gating Open with write flags stops a NEW writable handle, but a
+// handle opened before a revocation keeps committing slices through Write, so
+// a lease that has been taken away is not enforced at all on the path that
+// matters. That also tightens --read-only in the default build: a mount opened
+// read-only now refuses these four outright rather than relying on Open.
 var writeBarrier func() bool
 
 // readOnly reports whether this client may mutate the filesystem.
@@ -1506,6 +1514,9 @@ func (m *baseMeta) GetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 }
 
 func (m *baseMeta) SetAttr(ctx Context, inode Ino, set uint16, sugidclearmode uint8, attr *Attr) syscall.Errno {
+	if m.readOnly() {
+		return syscall.EROFS
+	}
 	defer m.timeit("SetAttr", time.Now())
 	inode = m.checkRoot(inode)
 	var oldAttr Attr
@@ -2198,6 +2209,9 @@ func (m *baseMeta) Close(ctx Context, inode Ino) syscall.Errno {
 }
 
 func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
+	if m.readOnly() {
+		return syscall.EROFS
+	}
 	defer m.timeit("Write", time.Now())
 	f := m.of.find(inode)
 	if f != nil {
@@ -2224,6 +2238,9 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 }
 
 func (m *baseMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, attr *Attr, skipPermCheck bool) syscall.Errno {
+	if m.readOnly() {
+		return syscall.EROFS
+	}
 	defer m.timeit("Truncate", time.Now())
 	f := m.of.find(inode)
 	if f != nil {
@@ -2244,6 +2261,9 @@ func (m *baseMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, 
 }
 
 func (m *baseMeta) Fallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64, flength *uint64) syscall.Errno {
+	if m.readOnly() {
+		return syscall.EROFS
+	}
 	if mode&fallocCollapesRange != 0 && mode != fallocCollapesRange {
 		return syscall.EINVAL
 	}

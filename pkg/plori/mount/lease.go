@@ -80,14 +80,29 @@ func (d *Deadline) Update(expiresAt time.Time, margin time.Duration, now time.Ti
 	d.wallExpiry = expiresAt
 }
 
-// WriteAllowed reports whether a new write may be submitted now. This is the
-// check threat-model §7.2 requires to run immediately before every write
-// submission rather than on a timer: a timer that fires every second still
-// permits a second of writes past the fence.
+// WriteAllowed reports whether the mount is still inside its write-stop
+// margin. It is the supervisor's trigger to begin the ordered stop, NOT the
+// per-submission check: the per-submission check threat-model.md:812-815 asks
+// for lives in the metadata engine, which re-reads Expiry on every gated
+// operation (meta.PloriSetWriteExpiry, PLO-323 F-5). Two instants, one
+// mechanism: the margin stops the mount, the expiry stops the writes.
+//
+// Before F-5 this function was the only deadline check in the process and it
+// ran on a one-second ticker, which is precisely the timer the requirement it
+// cites forbids.
 func (d *Deadline) WriteAllowed(now time.Time) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return now.Before(d.margin)
+}
+
+// Expiry is the monotonic instant at which the lease itself dies. It is what
+// the metadata engine's write gate is armed with: after it, another writer may
+// exist, so nothing may be committed — not even the drain.
+func (d *Deadline) Expiry() time.Time {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.expiry
 }
 
 // Expired reports whether the lease itself is gone, margin included.

@@ -381,6 +381,27 @@ func (l *Litestream) Stop(ctx context.Context) error {
 	}
 }
 
+// Abort kills replication without letting it sync. SIGTERM would make
+// litestream run its own shutdown sync, and a writer fenced out of band must
+// not push its remaining LTX into the metadata prefix its successor restores
+// from: no barrier ran, so that history can reference blocks the object store
+// never received (PLO-323 F-1).
+func (l *Litestream) Abort(ctx context.Context) error {
+	if l.cmd == nil || l.done == nil {
+		return nil
+	}
+	if err := l.cmd.Process.Kill(); err != nil {
+		return fmt.Errorf("kill litestream: %w", err)
+	}
+	select {
+	case <-l.done:
+		l.done = nil
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("litestream did not exit after SIGKILL: %w", ctx.Err())
+	}
+}
+
 func (l *Litestream) run(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, l.Bin, args...)
 	cmd.Env = os.Environ()

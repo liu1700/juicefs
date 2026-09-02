@@ -161,16 +161,32 @@ type Volume interface {
 	// fresh Format from the engine rather than persisting the in-memory one,
 	// which carries the injected credential.
 	ApplyGrant(ctx context.Context, bytes, inodes int64) error
-	// FenceWrites stops the filesystem accepting new writes. It is called
-	// before every barrier that must not be outlived by its authority (Q7)
-	// and is the first step of the ordered shutdown.
+	// SetWriteExpiry publishes the monotonic instant at which this mount's
+	// lease dies. The metadata engine re-reads it before every gated
+	// operation, which is the per-submission deadline check threat-model.md
+	// :812-815 requires and the one-second ticker never was (PLO-323 F-5).
+	SetWriteExpiry(at time.Time)
+	// FenceWrites seals the filesystem: after it, every mutating metadata
+	// operation answers EROFS, including the slice commit of a handle opened
+	// before the call (PLO-323 F-2).
+	//
+	// It is total, so it is NOT the opening move of an ordered stop — the
+	// bounded flush that stop reserves the write-stop margin for commits
+	// through the very path this seals (threat-model.md §7.5). The supervisor
+	// calls it immediately when the authority is gone out of band, and
+	// otherwise only once the mount is detached.
 	FenceWrites()
-	// Fenced reports whether FenceWrites has been called. The write path
-	// consults it before every submission (threat-model §7.2).
+	// Fenced reports whether FenceWrites has been called.
 	Fenced() bool
 	// Unmount detaches the mount with `umount --flush` semantics: fail-closed
 	// if the flush does not complete.
 	Unmount(ctx context.Context) error
+	// Detach unmounts WITHOUT flushing — a lazy detach. It is the out-of-band
+	// fence's way out: a writer that has lost its epoch must not push staged
+	// bytes into a data prefix it no longer owns, and `umount --flush` would.
+	// It is also the only unmount that can succeed once FenceWrites has sealed
+	// the engine, because that flush would answer EROFS (PLO-323 F-1, F-2).
+	Detach(ctx context.Context) error
 	// Close closes the metadata session and the SQLite database.
 	Close() error
 }
@@ -210,6 +226,11 @@ type Replicator interface {
 	// Stop signals a graceful shutdown (which performs a final sync) and
 	// waits for the process to exit.
 	Stop(ctx context.Context) error
+	// Abort stops replication WITHOUT a final sync. A writer fenced out of
+	// band must not push its remaining LTX into the metadata prefix a
+	// successor may restore from: the barrier it skipped means that history
+	// can reference blocks the store never received (PLO-323 F-1).
+	Abort(ctx context.Context) error
 }
 
 // Fencer claims the epoch's fence marker in the object store.
@@ -218,10 +239,14 @@ type Fencer interface {
 	// ErrFenceMarkerHeld when the store answers 412, which means another
 	// writer reached this epoch.
 	Claim(ctx context.Context, key string, body []byte) error
+	// ReadMarker fetches the marker at `key`, so a worker that got a 412 can
+	// tell its own predecessor's claim from a stranger's (PLO-323 F-6).
+	ReadMarker(ctx context.Context, key string) (FenceMarker, error)
 	// PriorMetaPrefix returns the newest populated metadata prefix under root
-	// whose epoch is below the given one, or "" when there is none. The
-	// metadata root is partitioned per writer epoch, so a new epoch always
-	// starts with an empty prefix of its own and has to restore from the one
-	// before it.
+	// whose epoch is at or below the given one, or "" when there is none. The
+	// metadata root is partitioned per writer epoch, so a fresh epoch starts
+	// with an empty prefix of its own and restores from the one before it —
+	// but a worker restarted at the SAME epoch restores from its own, which is
+	// by then the newest history there is (PLO-323 F-6c).
 	PriorMetaPrefix(ctx context.Context, root string, epoch int64) (string, error)
 }

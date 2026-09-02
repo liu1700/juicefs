@@ -22,8 +22,10 @@ package mount
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -39,6 +41,30 @@ import (
 // ErrFenceMarkerHeld means the store refused the conditional PUT: another
 // writer already claimed this epoch's metadata prefix.
 var ErrFenceMarkerHeld = errors.New("fence marker already claimed")
+
+// ErrFenceMarkerMissing means the marker key answered 404. A 412 followed by a
+// 404 is a marker that was deleted between the two calls; it is not a claim
+// this worker may take over.
+var ErrFenceMarkerMissing = errors.New("fence marker not found")
+
+// FenceMarker is the body of `agents-meta/<vid>/g<epoch>/fence`.
+//
+// The key already encodes the volume and the epoch, so the body repeating them
+// is not redundancy for its own sake: it is what lets a worker that gets a 412
+// decide whether the claim standing in its way is its own predecessor at the
+// same epoch or a stranger. A body that disagrees with its key is a marker this
+// worker refuses to reason about at all.
+//
+// Holder is the lease identity of the process that claimed it. It is empty
+// today because the control-plane's MountSpec carries no holder — see the
+// finding filed against PLO-395 — and the same-epoch reclaim therefore proves
+// holder identity against the control-plane instead (Supervisor.reclaimOwnMarker).
+type FenceMarker struct {
+	Volume    string `json:"volume"`
+	Epoch     int64  `json:"epoch"`
+	Holder    string `json:"holder,omitempty"`
+	ClaimedAt string `json:"claimed_at"`
+}
 
 // S3Fencer claims the epoch fence marker with `If-None-Match: *`.
 //
@@ -106,6 +132,49 @@ func (f *S3Fencer) Claim(ctx context.Context, key string, body []byte) error {
 	return fmt.Errorf("claim fence marker: %w", err)
 }
 
+// ReadMarker fetches the marker standing at `key`. It is called only after a
+// 412, to find out whose claim it is.
+func (f *S3Fencer) ReadMarker(ctx context.Context, key string) (FenceMarker, error) {
+	out, err := f.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(f.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return FenceMarker{}, fmt.Errorf("%w: %s", ErrFenceMarkerMissing, key)
+		}
+		return FenceMarker{}, fmt.Errorf("read fence marker: %w", err)
+	}
+	defer out.Body.Close()
+	// The marker is a handful of bytes this worker's own predecessor wrote;
+	// cap the read anyway so a misrouted object cannot grow the heap.
+	body, err := io.ReadAll(io.LimitReader(out.Body, 64<<10))
+	if err != nil {
+		return FenceMarker{}, fmt.Errorf("read fence marker body: %w", err)
+	}
+	var m FenceMarker
+	if err := json.Unmarshal(body, &m); err != nil {
+		return FenceMarker{}, fmt.Errorf("decode fence marker %s: %w", key, err)
+	}
+	return m, nil
+}
+
+// isNotFound recognises the 404 a GET of an absent key produces.
+func isNotFound(err error) bool {
+	var respErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == http.StatusNotFound {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return true
+		}
+	}
+	return false
+}
+
 // isPreconditionFailed recognises the 412 the conditional PUT produces. The
 // SDK surfaces it as a transport-level HTTP status rather than a modelled
 // error shape for PutObject, so both forms are checked.
@@ -128,11 +197,19 @@ func isPreconditionFailed(err error) bool {
 //
 // The metadata root is partitioned per writer epoch — `agents-meta/<vid>/g<N>/`
 // — precisely so a fenced-but-alive writer cannot collide with its successor's
-// LTX history. The consequence, which only shows up end to end, is that a new
-// epoch's own prefix is always empty at startup: the previous generation
-// replicated into `g<N-1>/`, and the MountSpec names only `g<N>/`. So the
-// worker replicates forward into its own prefix and restores backward from the
-// newest populated one below it.
+// LTX history. The consequence, which only shows up end to end, is that a fresh
+// epoch's own prefix is empty at startup: the previous generation replicated
+// into `g<N-1>/`, and the MountSpec names only `g<N>/`. So the worker
+// replicates forward into its own prefix and restores backward from the newest
+// populated one at or below it.
+//
+// "At or below", not "below": a worker that crashes and is restarted by the
+// kubelet comes back at the SAME epoch (the issuer replays the epoch for the
+// same Pod — storagespec/issuer.go), and by then `g<N>/` holds that epoch's own
+// LTX history. Restoring from `g<N-1>/` there silently drops everything epoch N
+// wrote (PLO-323 F-6c). A prefix that holds nothing but its own fence marker is
+// skipped by prefixHasReplica, so a fresh epoch — which has just PUT its marker
+// and replicated nothing — still falls through to the generation before it.
 //
 // It is one LIST per mount start, and it is a read of the store rather than of
 // authority: the control-plane still decides which epoch this writer holds; the
@@ -185,8 +262,8 @@ func (f *S3Fencer) prefixHasReplica(ctx context.Context, prefix string) (bool, e
 	return false, nil
 }
 
-// priorPrefixCandidates orders the generation prefixes below `epoch` newest
-// first. Split out from the S3 call so the ordering is testable.
+// priorPrefixCandidates orders the generation prefixes at or below `epoch`
+// newest first. Split out from the S3 call so the ordering is testable.
 func priorPrefixCandidates(prefixes []string, root string, epoch int64) []string {
 	type candidate struct {
 		epoch  int64
@@ -199,7 +276,7 @@ func priorPrefixCandidates(prefixes []string, root string, epoch int64) []string
 			continue
 		}
 		n, err := strconv.ParseInt(seg[1:], 10, 64)
-		if err != nil || n >= epoch {
+		if err != nil || n > epoch {
 			continue
 		}
 		candidates = append(candidates, candidate{n, p})

@@ -49,7 +49,8 @@ func (r *restoreRecorder) SyncAndWait(context.Context) error { return nil }
 func (r *restoreRecorder) TxID(context.Context) (string, error) {
 	return "0000000000000009", nil
 }
-func (r *restoreRecorder) Stop(context.Context) error { return nil }
+func (r *restoreRecorder) Stop(context.Context) error  { return nil }
+func (r *restoreRecorder) Abort(context.Context) error { return nil }
 
 func (r *restoreRecorder) result() (string, time.Time) {
 	r.mu.Lock()
@@ -68,6 +69,9 @@ type countingFencer struct {
 }
 
 func (f *countingFencer) Claim(context.Context, string, []byte) error { return nil }
+func (f *countingFencer) ReadMarker(context.Context, string) (FenceMarker, error) {
+	return FenceMarker{}, ErrFenceMarkerMissing
+}
 func (f *countingFencer) PriorMetaPrefix(context.Context, string, int64) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -216,6 +220,61 @@ func TestALocalDurablePointTheServerNeverHeardAboutWinsWhole(t *testing.T) {
 	}
 	if !anchor.Equal(local) {
 		t.Errorf("restore anchor = %s, want the local point's %s", anchor, local)
+	}
+	if n := fencer.lists(); n != 0 {
+		t.Errorf("listed the metadata root %d times although a durable point was known", n)
+	}
+}
+
+// TestASameEpochRestartUsesItsOwnDurablePoint is the anchor half of PLO-323
+// F-6c. A worker that crashes comes back at the SAME epoch — the issuer replays
+// the epoch for the same Pod — and the durable point that generation left in
+// the state dir is the newest one there is. Skipping it because its epoch is
+// not strictly BELOW this one restores the previous epoch's replica instead and
+// drops everything epoch N had already made durable.
+//
+// It matters more than the prefix alone: without an anchor the restore takes
+// the replica's newest transaction, and after an unclean stop that is exactly
+// the state crash-consistency.md §7 says stats fine and reads EIO.
+func TestASameEpochRestartUsesItsOwnDurablePoint(t *testing.T) {
+	spec := testSpec()
+	spec.FenceEpoch = 9
+	spec.MetaPrefix = testVolumeRoot + "g9/"
+	spec.FenceMarkerKey = spec.MetaPrefix + "fence"
+	if err := spec.Validate(); err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+
+	rep := &restoreRecorder{}
+	// The listing would answer with epoch 8 — the answer this test exists to
+	// reject.
+	fencer := &countingFencer{prior: testVolumeRoot + "g8/"}
+	sup := newSup(t, spec, &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, fencer)
+	sup.Deps.Replicator = rep
+
+	local := time.Date(2026, 9, 2, 12, 15, 0, 0, time.UTC)
+	if err := os.MkdirAll(sup.Paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(sup.Paths.DurablePointPath(), DurablePoint{
+		Volume: spec.StorageVolumeID, FenceEpoch: 9, DurableAt: local,
+		BarrierAt: local.Add(time.Second), ReplicaTxID: "0000000000000099",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan os.Signal, 1)
+	stop <- syscall.SIGTERM
+	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
+		t.Fatalf("exit = %d: %v", got.Exit, got.Err)
+	}
+
+	prefix, got := rep.result()
+	if prefix != spec.MetaPrefix {
+		t.Errorf("restored from %q, want epoch 9's own prefix %q", prefix, spec.MetaPrefix)
+	}
+	if !got.Equal(local) {
+		t.Errorf("restore anchor = %s, want the same epoch's durable point %s", got, local)
 	}
 	if n := fencer.lists(); n != 0 {
 		t.Errorf("listed the metadata root %d times although a durable point was known", n)

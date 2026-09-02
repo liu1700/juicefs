@@ -63,10 +63,17 @@ const (
 // Typed error identifiers carried in the stderr JSON `error` field. The plugin
 // branches on these, never on the prose.
 const (
-	ErrCodeSpecInvalid            = "E_SPEC_INVALID"
-	ErrCodeIdentityMismatch       = "E_IDENTITY_MISMATCH"
-	ErrCodeLeaseLost              = "E_LEASE_LOST"
-	ErrCodeFenceMarkerHeld        = "E_FENCE_MARKER_HELD"
+	ErrCodeSpecInvalid      = "E_SPEC_INVALID"
+	ErrCodeIdentityMismatch = "E_IDENTITY_MISMATCH"
+	ErrCodeLeaseLost        = "E_LEASE_LOST"
+	ErrCodeFenceMarkerHeld  = "E_FENCE_MARKER_HELD"
+	// ErrCodeFencedOutOfBand reports that the epoch was taken away rather than
+	// allowed to run out — stale_epoch/lease_held from a renew, or a fence
+	// marker held by somebody else. Same exit code as any other fence (66); the
+	// distinct identifier is what tells an operator that this worker stopped
+	// WITHOUT a durability barrier and WITHOUT a final replica sync, so its
+	// last writes are gone by design rather than by failure (PLO-323 F-1).
+	ErrCodeFencedOutOfBand        = "E_FENCED_OUT_OF_BAND"
 	ErrCodeRestoreFailed          = "E_RESTORE_FAILED"
 	ErrCodeRestoreIntegrity       = "E_RESTORE_INTEGRITY"
 	ErrCodeObjectStoreUnreachable = "E_OBJECT_STORE_UNREACHABLE"

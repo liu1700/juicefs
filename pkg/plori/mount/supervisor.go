@@ -21,6 +21,7 @@ package mount
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -137,16 +138,25 @@ func (s *Supervisor) start(ctx context.Context) error {
 	// The fence marker is the store-side proof of epoch ownership and must be
 	// claimed BEFORE the first LTX upload, so it goes first — before restore,
 	// before anything is written under meta_prefix.
-	marker := fmt.Sprintf(`{"volume":%q,"epoch":%d,"claimed_at":%q}`,
-		s.Spec.StorageVolumeID, s.Spec.FenceEpoch, s.now().UTC().Format(time.RFC3339Nano))
-	if err := s.Deps.Fencer.Claim(ctx, s.Spec.FenceMarkerKey, []byte(marker)); err != nil {
-		if errors.Is(err, ErrFenceMarkerHeld) {
-			return fatalf(CodeFenced, ErrCodeFenceMarkerHeld, false,
-				"another writer already claimed epoch %d: %s", s.Spec.FenceEpoch, err)
-		}
-		return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true, "claim fence marker: %s", err)
+	marker, err := json.Marshal(FenceMarker{
+		Volume:    s.Spec.StorageVolumeID,
+		Epoch:     s.Spec.FenceEpoch,
+		ClaimedAt: s.now().UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return fatalf(CodeRefused, ErrCodeRestoreFailed, false, "encode fence marker: %s", err)
 	}
-	s.log("fence_marker_claimed", "key", s.Spec.FenceMarkerKey)
+	if err := s.Deps.Fencer.Claim(ctx, s.Spec.FenceMarkerKey, marker); err != nil {
+		if errors.Is(err, ErrFenceMarkerHeld) {
+			if rerr := s.reclaimOwnMarker(ctx); rerr != nil {
+				return rerr
+			}
+		} else {
+			return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true, "claim fence marker: %s", err)
+		}
+	} else {
+		s.log("fence_marker_claimed", "key", s.Spec.FenceMarkerKey)
+	}
 
 	if err := s.restoreOrFormat(ctx); err != nil {
 		return err
@@ -203,6 +213,59 @@ func (s *Supervisor) start(ctx context.Context) error {
 	return nil
 }
 
+// reclaimOwnMarker decides whether the 412 on the fence marker is this
+// worker's own claim at the same epoch, in which case the epoch is already
+// ours and the mount may proceed. Anything it cannot prove stays fenced out.
+//
+// The case is ordinary rather than exotic, which is why it is worth the two
+// round trips: the worker crashes, nothing releases the lease — nothing else
+// may (PLO-323 W4) — the kubelet retries NodePublish, and the control-plane
+// replays the SAME epoch for the same Pod (storagespec/issuer.go). Before this,
+// the new worker's `If-None-Match: *` hit the marker its own predecessor wrote
+// and the volume stayed unmountable for the rest of the lease TTL, on exactly
+// the failure this supervisor exists to survive (F-6).
+//
+// Two proofs, both fail-closed:
+//
+//  1. the marker names this volume and this epoch. The key already encodes
+//     both, so this only rejects a marker whose body disagrees with where it
+//     lives — a store this worker will not reason about further;
+//  2. the control-plane confirms that THIS process is the live holder of that
+//     epoch. That is the holder identity the audit asked for, taken from the
+//     layer that owns it rather than from a string in the marker body: the
+//     renew route authenticates the worker's projected ServiceAccount token and
+//     refuses unless the open lease's holder Pod UID is the caller's own and
+//     its epoch is the one presented (issuer.go authorizeHolder). A replayed
+//     spec, a stranger and a moved-past epoch each get a typed refusal.
+//
+// What this cannot check is that no OTHER process is alive at the same epoch —
+// a wedged predecessor still mounted and still writing would pass both proofs.
+// The plugin owns that boundary: a mounted-but-stale worker must be signalled
+// and detached BEFORE a new mount-spec is requested (PLO-392). The same-epoch
+// reclaim is safe because of that guarantee, not in spite of it.
+func (s *Supervisor) reclaimOwnMarker(ctx context.Context) *Fatal {
+	held := fatalf(CodeFenced, ErrCodeFenceMarkerHeld, false,
+		"another writer already claimed epoch %d (%s)", s.Spec.FenceEpoch, s.Spec.FenceMarkerKey)
+
+	m, err := s.Deps.Fencer.ReadMarker(ctx, s.Spec.FenceMarkerKey)
+	if err != nil {
+		s.log("fence_marker_unreadable", "key", s.Spec.FenceMarkerKey, "error", err.Error())
+		return held
+	}
+	if m.Volume != s.Spec.StorageVolumeID || m.Epoch != s.Spec.FenceEpoch {
+		s.log("fence_marker_foreign", "key", s.Spec.FenceMarkerKey,
+			"marker_volume", m.Volume, "marker_epoch", m.Epoch)
+		return held
+	}
+	if _, err := s.Deps.CP.RenewLease(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch); err != nil {
+		s.log("fence_marker_not_ours", "key", s.Spec.FenceMarkerKey, "error", err.Error())
+		return held
+	}
+	s.log("fence_marker_reclaimed", "key", s.Spec.FenceMarkerKey,
+		"epoch", s.Spec.FenceEpoch, "claimed_at", m.ClaimedAt)
+	return nil
+}
+
 func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// There are up to two known durable points, and the newer one wins WHOLE:
 	// both the prefix to restore from and the instant to stop at come from the
@@ -232,8 +295,13 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 		anchor, from, source = dp.DurableAt, dp.FenceEpoch, s.Spec.RestoreFromPrefix
 		s.log("restore_anchor", "durable_at", anchor, "from_epoch", from, "known_by", "mount_spec")
 	}
+	// `<=`, not `<`: a worker restarted at the SAME epoch — the crash-restart
+	// the kubelet produces, where the issuer replays the epoch for the same Pod
+	// — left this file itself, and it is the newest anchor there is. Restoring
+	// such a restart to the previous epoch's point drops everything epoch N had
+	// already made durable (PLO-323 F-6c).
 	if dp, err := ReadDurablePoint(s.Paths.DurablePointPath()); err == nil && dp != nil {
-		if dp.Volume == s.Spec.StorageVolumeID && dp.FenceEpoch < s.Spec.FenceEpoch && dp.FenceEpoch > from {
+		if dp.Volume == s.Spec.StorageVolumeID && dp.FenceEpoch <= s.Spec.FenceEpoch && dp.FenceEpoch > from {
 			// Its prefix is populated by construction: the file is written
 			// only after a barrier, and a barrier only happens once
 			// replication is running under that epoch's prefix.
@@ -251,17 +319,20 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	s.restoredUnclean = !fileExists(s.Paths.CleanStopPath())
 	_ = os.Remove(s.Paths.CleanStopPath())
 
-	// The metadata root is partitioned per writer epoch, so this epoch's own
+	// The metadata root is partitioned per writer epoch, so a FRESH epoch's own
 	// prefix is empty by construction and the bytes live under an earlier one.
 	// The prefix of the winning durable point above IS that earlier one, which
 	// is why the source is settled there rather than derived a second time.
 	//
 	// With no durable point at all the source is discovered by listing the
-	// metadata root and taking the newest prefix below this epoch that holds
-	// more than a fence marker. That listing stays: it is the only correct
+	// metadata root and taking the newest prefix AT OR BELOW this epoch that
+	// holds more than a fence marker. That listing stays: it is the only correct
 	// answer for a volume no writer has ever reported a durable point for, and
 	// it is what makes `epoch - 1` unnecessary — an epoch that claimed a fence
-	// and replicated nothing is skipped by both paths.
+	// and replicated nothing is skipped by both paths. "At or below" is what
+	// makes the crash-restart case correct: a worker that replicated under
+	// epoch N and died before posting its first durable point comes back at N,
+	// and `g<N>/` is by then the newest history there is (PLO-323 F-6c).
 	if source != "" {
 		s.log("restore_source", "prefix", source, "discovery", "durable_point")
 	} else {
@@ -466,6 +537,13 @@ func dirIsEmpty(dir string) (bool, error) {
 // -------------------------------------------------------------- run loop ---
 
 func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <-chan error) *Fatal {
+	// Arm the metadata engine's own deadline before the first Agent write can
+	// reach it. From here the engine re-checks it on every gated operation, so
+	// a process that is frozen past its expiry and thawed cannot commit — the
+	// guard ticker below is only what decides when to STOP the mount, not what
+	// decides whether a write may be submitted (PLO-323 F-5).
+	s.publishWriteExpiry()
+
 	renew := time.NewTicker(s.Spec.LeaseRenewInterval.D())
 	defer renew.Stop()
 	barrier := time.NewTicker(s.barrierInterval())
@@ -488,7 +566,7 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 		select {
 		case <-stop:
 			s.log("sigterm")
-			return s.shutdown(context.Background(), "shutdown")
+			return s.shutdown(context.Background(), ReasonShutdown)
 
 		case err := <-serveErr:
 			// The FUSE session ended without us asking. JuiceFS's own child
@@ -509,12 +587,12 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 			if jump := ClockJump(renewedAt, now); jump > MaxClockJump {
 				s.log("clock_jump", "delta", jump.String())
 				return s.fenceAndStop(fatalf(CodeFenced, ErrCodeLeaseLost, false,
-					"wall clock moved %s relative to the monotonic clock; treating as a fence trip", jump))
+					"wall clock moved %s relative to the monotonic clock; treating as a fence trip", jump), ReasonFenced)
 			}
 			if !s.deadline.WriteAllowed(now) {
 				s.log("write_stop_margin_reached")
 				return s.fenceAndStop(fatalf(CodeFenced, ErrCodeLeaseLost, false,
-					"lease deadline reached without a successful renewal"))
+					"lease deadline reached without a successful renewal"), ReasonFenced)
 			}
 
 		case <-renew.C:
@@ -526,10 +604,13 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 				if errors.As(err, &cpErr) && cpErr.Fenced() {
 					// Terminal by contract: stale_epoch on renew is never
 					// retried, because a retry is the fenced writer still
-					// believing it holds the volume.
+					// believing it holds the volume. It is also the
+					// OUT-OF-BAND case — the epoch was taken away rather than
+					// run out — so the stop skips the barrier and the final
+					// sync entirely (F-1).
 					s.setRenewOK(false)
-					return s.fenceAndStop(fatalf(CodeFenced, ErrCodeLeaseLost, false,
-						"lease lost: %s", cpErr))
+					return s.fenceAndStop(fatalf(CodeFenced, ErrCodeFencedOutOfBand, false,
+						"lease lost: %s", cpErr), ReasonFencedOutOfBand)
 				}
 				s.setRenewOK(false)
 				s.log("renew_failed", "error", err.Error())
@@ -539,6 +620,7 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 			s.setRenewOK(true)
 			renewedAt = before
 			s.deadline.Update(resp.LeaseExpiresAt, s.Spec.WriteStopMargin.D(), before)
+			s.publishWriteExpiry()
 			if resp.Grant.Epoch > s.appliedGrant() {
 				s.applyGrant(ctx, resp.Grant)
 			}
@@ -648,14 +730,37 @@ func (s *Supervisor) reportUsage(ctx context.Context) {
 
 // --------------------------------------------------------------- shutdown ---
 
-// fenceAndStop is the lease-loss path: stop writes first, then run as much of
-// the ordered shutdown as the remaining authority allows.
-func (s *Supervisor) fenceAndStop(f *Fatal) *Fatal {
-	s.vol.FenceWrites()
+// Terminal reasons handed to /lease/release, and the flag that decides the
+// stop's shape. They are constants rather than literals because shutdown
+// branches on ReasonFencedOutOfBand: it is the difference between a bounded
+// flush and no uploads at all.
+const (
+	// ReasonShutdown — SIGTERM with the lease healthy.
+	ReasonShutdown = "shutdown"
+	// ReasonFenced — the worker's own deadline ran out: the write-stop margin
+	// was reached without a successful renewal, or the clock jumped. The
+	// authority was not taken away, it expired, so the ordered stop runs with
+	// its bounded flush (threat-model.md §7.5).
+	ReasonFenced = "fenced"
+	// ReasonFencedOutOfBand — somebody else holds this volume: a 412 on the
+	// fence marker whose body is not ours, or stale_epoch/lease_held from a
+	// renew. The epoch was taken away, so the stop uploads nothing (F-1).
+	ReasonFencedOutOfBand = "fenced_out_of_band"
+)
+
+// fenceAndStop is the lease-loss path. `reason` decides the shape of the stop:
+// an out-of-band fence seals the filesystem immediately and leaves without
+// touching the store; a deadline trip runs the ordered stop.
+func (s *Supervisor) fenceAndStop(f *Fatal, reason string) *Fatal {
+	if reason == ReasonFencedOutOfBand {
+		// Seal now: this writer provably no longer owns the epoch, so nothing
+		// it still holds open may commit — not one more slice (F-2 + F-1).
+		s.vol.FenceWrites()
+	}
 	s.mu.Lock()
 	s.fenced = true
 	s.mu.Unlock()
-	if stopErr := s.shutdown(context.Background(), "fenced"); stopErr.Exit == CodeBarrierIncomplete {
+	if stopErr := s.shutdown(context.Background(), reason); stopErr.Exit == CodeBarrierIncomplete {
 		// Losing data is the more serious of the two facts, so it wins the
 		// exit code; the fence is still reported in the message.
 		return &Fatal{
@@ -675,8 +780,29 @@ func (s *Supervisor) fenceAndStop(f *Fatal) *Fatal {
 // barrier that outlives its authority is exactly the fault PLO-323 fault 4
 // names. When the bound is exhausted the worker exits 69 — reported data
 // loss — and still releases the lease, because holding it costs the Agent a
-// full TTL and buys nothing: the data is already lost either way.
+// full TTL and buys nothing: the data is already lost either way. (PLO-326 B2
+// asks for "fail visibly WITHOUT releasing"; with F-2's seal a failed stop
+// cannot still be writing, so the amended bullet is "fail visibly, fenced,
+// then release" — threat-model.md §7.)
+//
+// `reason` chooses between two shapes:
+//
+//   - ORDERED (shutdown, fenced, and the startup failures): steps 1-7 as
+//     written. The write-stop margin exists to pay for exactly this drain, so
+//     the metadata seal is NOT step 1 — sealing before the barrier would make
+//     FlushAll answer EROFS and turn every clean stop into reported data loss.
+//     The seal lands the moment the mount is detached, which is the first
+//     instant at which no further filesystem request can arrive.
+//   - OUT OF BAND (ReasonFencedOutOfBand): the epoch belongs to somebody else,
+//     so steps 3 and 5 are skipped entirely and the mount is detached without
+//     a flush. A barrier here would push staged blocks into the SHARED data
+//     prefix this writer no longer owns, and a final sync would push LTX into
+//     the metadata prefix its successor restores from — history that
+//     references blocks the skipped barrier never uploaded (F-1 ruling,
+//     threat-model.md §7).
 func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
+	outOfBand := reason == ReasonFencedOutOfBand
+
 	budget := s.deadline.RemainingLease(s.now())
 	if budget < time.Second {
 		budget = time.Second
@@ -686,45 +812,77 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 
 	var incomplete error
 
-	// 1. fence new operations
-	s.vol.FenceWrites()
+	// 1. fence new operations. Out of band the seal already happened in
+	// fenceAndStop, before anything else could run; repeating it here is
+	// idempotent and keeps this function correct on its own terms.
+	if outOfBand {
+		s.vol.FenceWrites()
+	}
 	s.mu.Lock()
 	s.fenced = true
 	s.mu.Unlock()
 
 	// 2 + 3. drain and run the remote durability barrier
-	tBefore := s.now().UTC()
-	res, err := s.vol.Barrier(ctx)
-	if err != nil {
-		incomplete = fmt.Errorf("durability barrier: %w", err)
-		s.log("shutdown_barrier_failed", "error", err.Error())
-	}
-	res.DurableAt = tBefore
-	if res.BarrierAt.IsZero() {
-		res.BarrierAt = s.now().UTC()
+	// res stays zero out of band, and step 6 skips the report: no barrier ran,
+	// so there is no new durable point to name.
+	var res BarrierResult
+	if !outOfBand {
+		tBefore := s.now().UTC()
+		var err error
+		res, err = s.vol.Barrier(ctx)
+		if err != nil {
+			incomplete = fmt.Errorf("durability barrier: %w", err)
+			s.log("shutdown_barrier_failed", "error", err.Error())
+		}
+		res.DurableAt = tBefore
+		if res.BarrierAt.IsZero() {
+			res.BarrierAt = s.now().UTC()
+		}
 	}
 
 	// 4. unmount, then close SQLite. Barrier failure already blocks unmount
 	// upstream (cmd/umount.go:120-125); that fail-closed behaviour is kept.
-	if err := s.vol.Unmount(ctx); err != nil && incomplete == nil {
-		incomplete = fmt.Errorf("unmount: %w", err)
+	// Out of band the mount is DETACHED instead — `umount --flush` would push
+	// the staged writeback into a data prefix this writer no longer owns.
+	if outOfBand {
+		if err := s.vol.Detach(ctx); err != nil {
+			s.log("shutdown_detach_failed", "error", err.Error())
+		}
+	} else {
+		if err := s.vol.Unmount(ctx); err != nil && incomplete == nil {
+			incomplete = fmt.Errorf("unmount: %w", err)
+		}
+		// Seal the metadata engine now that no further filesystem request can
+		// arrive. Everything after this point — Close, the final sync — runs
+		// against a filesystem nothing can mutate.
+		s.vol.FenceWrites()
 	}
 	if err := s.vol.Close(); err != nil && incomplete == nil {
 		incomplete = fmt.Errorf("close metadata: %w", err)
 	}
 
 	// 5. final replication sync, then stop the replicator (which performs its
-	// own shutdown sync).
-	if err := s.Deps.Replicator.SyncAndWait(ctx); err != nil && incomplete == nil {
-		incomplete = fmt.Errorf("final replica sync: %w", err)
-	}
-	if err := s.Deps.Replicator.Stop(ctx); err != nil && incomplete == nil {
-		incomplete = fmt.Errorf("stop replication: %w", err)
+	// own shutdown sync). Out of band both are skipped and the replicator is
+	// killed instead, so nothing this writer staged reaches its epoch's prefix.
+	if outOfBand {
+		if err := s.Deps.Replicator.Abort(ctx); err != nil {
+			s.log("shutdown_replicator_abort_failed", "error", err.Error())
+		}
+	} else {
+		if err := s.Deps.Replicator.SyncAndWait(ctx); err != nil && incomplete == nil {
+			incomplete = fmt.Errorf("final replica sync: %w", err)
+		}
+		if err := s.Deps.Replicator.Stop(ctx); err != nil && incomplete == nil {
+			incomplete = fmt.Errorf("stop replication: %w", err)
+		}
 	}
 
 	// 6. report the durable point and the final usage. Both are best effort:
-	// they inform the control-plane, they do not make anything durable.
-	if incomplete == nil {
+	// they inform the control-plane, they do not make anything durable. Out of
+	// band there is nothing truthful to report: no barrier ran, so no new
+	// durable point exists, and a usage figure for a volume somebody else owns
+	// would overwrite the successor's.
+	if incomplete == nil && !outOfBand {
 		s.reportDurablePoint(context.WithoutCancel(ctx), res)
 		s.reportUsage(context.WithoutCancel(ctx))
 	}
@@ -732,6 +890,12 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// 7. release the writer lease, always.
 	s.releaseLease(reason)
 
+	if outOfBand {
+		// Not a clean stop and not a data-loss report: the epoch was taken
+		// away. No `clean` marker, so the next generation repairs.
+		return fatalf(CodeFenced, ErrCodeFencedOutOfBand, false,
+			"fenced out of band; stopped without a barrier or a final sync")
+	}
 	if incomplete != nil {
 		return fatalf(CodeBarrierIncomplete, ErrCodeBarrierIncomplete, false,
 			"stop did not complete inside the write-stop window: %s", incomplete)
@@ -742,6 +906,17 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 		s.log("clean_marker_write_failed", "error", err.Error())
 	}
 	return &Fatal{Exit: CodeOK, Err: errors.New("clean stop")}
+}
+
+// publishWriteExpiry hands the metadata engine the instant its write gate must
+// refuse at. It is called once before the loop starts and again after every
+// renewal, so the engine's own view of the deadline can never be older than the
+// last acknowledged renewal.
+func (s *Supervisor) publishWriteExpiry() {
+	if s.vol == nil {
+		return
+	}
+	s.vol.SetWriteExpiry(s.deadline.Expiry())
 }
 
 func (s *Supervisor) releaseLease(reason string) {
@@ -759,7 +934,12 @@ func reasonFor(f *Fatal) string {
 	case CodeIdentityMismatch:
 		return "identity_mismatch"
 	case CodeFenced:
-		return "fenced"
+		// A marker held by somebody else is the startup half of the same fact
+		// the renew route reports as stale_epoch: this volume is not ours.
+		if f.ErrCode == ErrCodeFenceMarkerHeld || f.ErrCode == ErrCodeFencedOutOfBand {
+			return ReasonFencedOutOfBand
+		}
+		return ReasonFenced
 	case CodeRestoreFailed:
 		return "restore_failed"
 	case CodeObjectStore:
