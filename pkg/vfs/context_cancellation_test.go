@@ -62,7 +62,7 @@ func createCancellationTestReader(t *testing.T, store chunk.ChunkStore) (*dataRe
 	mp := "/jfs"
 	metaConf := meta.DefaultConf()
 	metaConf.MountPoint = mp
-	m := meta.NewClient("memkv://", metaConf)
+	m := meta.NewClient(defaultTestMetaURI(), metaConf)
 	format := &meta.Format{
 		Name:        "test-" + uuid.New().String(),
 		UUID:        uuid.New().String(),
@@ -202,7 +202,13 @@ func decodeControlOutput(data []byte) ([]byte, syscall.Errno) {
 
 func runInternalControlWithCancel(t *testing.T, v *VFS, cmd uint32, payload []byte) ([]byte, syscall.Errno) {
 	t.Helper()
-	ctx := meta.NewContext(10, 1, []uint32{1})
+	// A `.control` command is an operator action, and under the plori profile
+	// the dispatcher enforces that: internalMsgGate (internal_plori.go) answers
+	// EACCES to every uid but root and the uid the mount runs as, so a hardcoded
+	// uid 1 here would assert the authorization path instead of the
+	// cancellation path this test is about. The current uid is admitted on both
+	// builds -- the default build installs no gate at all.
+	ctx := meta.NewContext(10, uint32(utils.GetCurrentUID()), []uint32{uint32(utils.GetCurrentGID())})
 	out := &bytes.Buffer{}
 	done := make(chan struct{})
 	go func() {

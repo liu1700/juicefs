@@ -86,6 +86,12 @@ jobs:
       - name: Unit tests for ./pkg/meta under the release tag set
         run: make test.plori.meta
 
+      - name: Unit tests for ./pkg/chunk, ./pkg/vfs and ./pkg/plori under the release tag set
+        run: make test.plori.unit
+
+      - name: Upstream unit tests on the default build
+        run: make test.plori.upstream
+
       - name: Gate reachable Go vulnerabilities for the artifact configuration
         run: |
           python3 hack/check_govulncheck_test.py
