@@ -60,14 +60,15 @@ type Supervisor struct {
 	deadline *Deadline
 	vol      Volume
 
-	mu            sync.Mutex
-	lastBarrier   BarrierResult
-	lastTxID      string
-	grantApplied  int64
-	lastUsage     Usage
-	lastRenewOK   bool
-	fenced        bool
-	formattedHere bool
+	mu              sync.Mutex
+	lastBarrier     BarrierResult
+	lastTxID        string
+	grantApplied    int64
+	restoredUnclean bool
+	lastUsage       Usage
+	lastRenewOK     bool
+	fenced          bool
+	formattedHere   bool
 }
 
 func (s *Supervisor) now() time.Time {
@@ -179,6 +180,10 @@ func (s *Supervisor) start(ctx context.Context) error {
 	}
 	s.log("sessions_purged", "count", n)
 
+	if err := s.repairAfterUncleanStop(ctx); err != nil {
+		return err
+	}
+
 	if err := s.Deps.Replicator.Start(ctx); err != nil {
 		return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true, "start replication: %s", err)
 	}
@@ -218,7 +223,7 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// (PLO-316 wave 2 measured 870 ms / 12 LIST / 34 MiB on 11k objects, so it
 	// is affordable unconditionally — never path-scoped, which is 15x worse).
 	// Until then the condition is reported, not repaired.
-	unclean := !fileExists(s.Paths.CleanStopPath())
+	s.restoredUnclean = !fileExists(s.Paths.CleanStopPath())
 	_ = os.Remove(s.Paths.CleanStopPath())
 
 	// The metadata root is partitioned per writer epoch, so this epoch's own
@@ -237,9 +242,9 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	err = s.Deps.Replicator.Restore(ctx, source, anchor)
 	switch {
 	case err == nil:
-		if unclean {
+		if s.restoredUnclean {
 			s.log("unclean_generation", "error", ErrCodeRestoredToBarrier,
-				"restored_to", anchor, "repair", "not_implemented_PLO-320")
+				"restored_to", anchor, "repair", "pending")
 		}
 		return nil
 	case errors.Is(err, ErrReplicaEmpty):
@@ -321,6 +326,40 @@ func (s *Supervisor) refusals(ctx context.Context) error {
 	if err := checkCacheDirTenant(s.Paths.CacheDir, s.vol.Identity().UUID); err != nil {
 		return fatalf(CodeRefused, ErrCodeCacheDirTenantMismatch, false, "%s", err)
 	}
+	return nil
+}
+
+// repairAfterUncleanStop is crash-consistency.md §7 d3.
+//
+// A generation that did not write the clean marker died before its ordered
+// stop finished, so the metadata Litestream replicated can reference blocks
+// the writeback cache never uploaded. Those files stat fine and read EIO —
+// the exact crux the M0 harness reproduced — and no existing JuiceFS command
+// repairs them: `fsck` detects lost objects but its --repair only fixes
+// directories (cmd/fsck.go:59-76).
+//
+// It runs unconditionally after an unclean generation and never after a clean
+// one: PLO-316 wave 2 measured a full scan at 870 ms / 12 LIST / 34 MiB on
+// 11k objects, so the full scan is affordable and a path-scoped one is 15x
+// worse. It runs before replication starts so the repair is inside the first
+// transaction this epoch replicates.
+//
+// A repair failure is fatal and not retryable in place: serving a filesystem
+// whose damage was neither bounded nor recorded is worse than refusing to
+// mount it.
+func (s *Supervisor) repairAfterUncleanStop(ctx context.Context) error {
+	if !s.restoredUnclean || s.formattedHere {
+		return nil
+	}
+	report, err := s.vol.RepairAfterRestore(ctx)
+	if err != nil {
+		return fatalf(CodeRestoreFailed, ErrCodeRestoredToBarrier, false,
+			"repair the restored volume: %s", err)
+	}
+	s.log("restore_repair", "error", ErrCodeRestoredToBarrier,
+		"scanned", report.Scanned, "checked", report.Checked,
+		"missing", report.Missing, "files", report.Files,
+		"truncated", report.Truncated, "elapsed_ms", report.Elapsed.Milliseconds())
 	return nil
 }
 

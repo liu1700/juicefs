@@ -21,7 +21,6 @@ package cmd
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -38,6 +37,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
 	pmount "github.com/juicedata/juicefs/pkg/plori/mount"
+	prestore "github.com/juicedata/juicefs/pkg/plori/restore"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/juicedata/juicefs/pkg/vfs"
 	"github.com/prometheus/client_golang/prometheus"
@@ -323,23 +323,58 @@ type ploriVolume struct {
 
 func (p *ploriVolume) Identity() pmount.FormatIdentity { return p.identity }
 
-// IntegrityCheck runs SQLite's own check over the restored page image.
+// IntegrityCheck runs SQLite's own check over the restored page image and,
+// on the same pass, refuses a Format that must not be replicated onward.
 // Litestream's restore-time check proves the LTX chain replays; this proves
-// the database it produced is not corrupt.
+// the database it produced is sound, credential-free (threat-model F-9) and
+// has the trash the Rank 1 protocol depends on.
 func (p *ploriVolume) IntegrityCheck(ctx context.Context) error {
-	db, err := sql.Open("sqlite3", p.paths.MetaPath())
+	_, err := prestore.VerifyRestored(ctx, p.paths.MetaPath(), false)
+	return err
+}
+
+// RepairAfterRestore is the restore-time missing-block repair. The scan reuses
+// cmd/fsck.go's traversal shape without its full-prefix LIST, and the repair
+// bounds each damaged file at its last readable byte and marks it; it never
+// deletes anything.
+func (p *ploriVolume) RepairAfterRestore(ctx context.Context) (pmount.RepairReport, error) {
+	format, err := p.m.Load(false)
 	if err != nil {
-		return fmt.Errorf("open metadata for integrity check: %w", err)
+		return pmount.RepairReport{}, fmt.Errorf("load format for repair: %w", err)
 	}
-	defer db.Close()
-	var result string
-	if err := db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); err != nil {
-		return fmt.Errorf("integrity_check: %w", err)
+	skip, err := prestore.DeletedInos(meta.Background(), p.m)
+	if err != nil {
+		// A file already queued for deletion is allowed to have lost its
+		// blocks. Without that list every such file looks like damage, so a
+		// failure here is a reason to stop, not to over-report.
+		return pmount.RepairReport{}, fmt.Errorf("list deleted inodes: %w", err)
 	}
-	if result != "ok" {
-		return fmt.Errorf("integrity_check reported %q", result)
+	scan, err := prestore.ScanMissingBlocks(ctx, p.m,
+		object.WithPrefix(p.blob, "chunks/"),
+		prestore.ScanOptions{Format: format, SkipInos: skip})
+	if err != nil {
+		return pmount.RepairReport{}, err
 	}
-	return nil
+	report := pmount.RepairReport{
+		Scanned: scan.SlicesScanned,
+		Checked: scan.BlocksChecked,
+		Missing: len(scan.Missing),
+		Files:   scan.InodesAffected,
+		Elapsed: scan.Duration,
+	}
+	if len(scan.Missing) == 0 {
+		return report, nil
+	}
+	q, err := prestore.Quarantine(ctx, p.m, scan.Missing, prestore.ModeTruncate, format)
+	if err != nil {
+		return report, err
+	}
+	for _, e := range q.Entries {
+		if e.TruncatedTo != nil {
+			report.Truncated++
+		}
+	}
+	return report, nil
 }
 
 func (p *ploriVolume) StoredUUID(ctx context.Context) (string, error) {
