@@ -80,6 +80,7 @@ jobs:
           fi
           make test.plori.profile
           make test.plori.benchmark
+          make test.plori.sqlite
           hack/verify-plori-binary.sh ./juicefs.plori
 
       - name: Gate reachable Go vulnerabilities for the artifact configuration
@@ -119,6 +120,86 @@ jobs:
           sudo ./juicefs.plori durability --timeout 2m /mnt/plori-ci
           test "$(sudo cat /mnt/plori-ci/probe)" = durable
           sudo ./juicefs.plori umount --flush --flush-timeout 2m /mnt/plori-ci
+
+      - name: Exercise the SQLite metadata lifecycle
+        env:
+          AWS_ACCESS_KEY_ID: plori-ci
+          AWS_SECRET_ACCESS_KEY: plori-ci-secret
+          AWS_REGION: us-east-1
+          META: sqlite3:///tmp/plori-sqlite/meta.db
+        run: |
+          set -euo pipefail
+          install -d /tmp/plori-sqlite
+          sudo install -d -m 0755 /mnt/plori-sqlite
+
+          # Format on a local SQLite metadata file against the same MinIO
+          # bucket family the Redis path uses.
+          # No --access-key/--secret-key: only the AWS SDK's own environment
+          # variables are set, and `format` copies ACCESS_KEY/SECRET_KEY (not
+          # AWS_*) into the stored Format, so the credentials never reach the
+          # metadata file. A replica of that file is then not a credential leak.
+          ./juicefs.plori format --storage s3 \
+            --bucket http://127.0.0.1:9000/plori-ci-sqlite \
+            --trash-days 1 "$META" plori-sqlite
+          ./juicefs.plori status "$META" > /dev/null
+          if grep -a -q -e plori-ci-secret -e AccessKey -e SecretKey /tmp/plori-sqlite/meta.db; then
+            echo "the SQLite metadata file carries object storage credentials" >&2
+            exit 1
+          fi
+
+          # The pinned PRAGMA contract must be observable in the mount log and
+          # must not carry the DSN, which contains the database path.
+          sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION \
+            ./juicefs.plori mount -d "$META" /mnt/plori-sqlite \
+            --cache-dir "$RUNNER_TEMP/jfs-sqlite-cache" --writeback --no-usage-report \
+            --no-syslog --log "$RUNNER_TEMP/plori-sqlite.log"
+          for _ in $(seq 1 30); do
+            mountpoint --quiet /mnt/plori-sqlite && break
+            sleep 1
+          done
+          mountpoint --quiet /mnt/plori-sqlite
+          grep -F 'SQLite metadata: journal_mode=WAL synchronous=NORMAL busy_timeout=5000ms' \
+            "$RUNNER_TEMP/plori-sqlite.log"
+          if grep -F 'meta.db' "$RUNNER_TEMP/plori-sqlite.log"; then
+            echo "mount log leaks the metadata DSN" >&2
+            exit 1
+          fi
+
+          # Directory quota below the 1 GiB the CSI driver would round to zero.
+          sudo install -d -m 0777 /mnt/plori-sqlite/bounded
+          sudo ./juicefs.plori quota set "$META" --path /bounded --capacity 64M
+          sudo ./juicefs.plori quota get "$META" --path /bounded
+
+          # Write, fence, and prove the bytes survive an abrupt kill.
+          head -c 4194304 /dev/urandom | sudo tee /mnt/plori-sqlite/bounded/blob >/dev/null
+          sudo sha256sum /mnt/plori-sqlite/bounded/blob | cut -d' ' -f1 > "$RUNNER_TEMP/blob.sha"
+          sudo ./juicefs.plori durability --timeout 2m /mnt/plori-sqlite
+          sudo pkill -KILL -f 'juicefs.plori mount' || true
+          sudo fusermount3 -u /mnt/plori-sqlite || true
+          sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION \
+            ./juicefs.plori mount -d "$META" /mnt/plori-sqlite \
+            --cache-dir "$RUNNER_TEMP/jfs-sqlite-cache2" --writeback --no-usage-report --no-syslog
+          for _ in $(seq 1 30); do
+            mountpoint --quiet /mnt/plori-sqlite && break
+            sleep 1
+          done
+          test "$(sudo sha256sum /mnt/plori-sqlite/bounded/blob | cut -d' ' -f1)" \
+            = "$(cat "$RUNNER_TEMP/blob.sha")"
+          sudo ./juicefs.plori umount --flush --flush-timeout 2m /mnt/plori-sqlite
+
+          # Offline checks on the recovered database.
+          ./juicefs.plori fsck "$META"
+          ./juicefs.plori dump "$META" "$RUNNER_TEMP/plori-sqlite.json"
+          ./juicefs.plori load sqlite3:///tmp/plori-sqlite/restored.db \
+            "$RUNNER_TEMP/plori-sqlite.json"
+          ./juicefs.plori status sqlite3:///tmp/plori-sqlite/restored.db > /dev/null
+
+      - name: Clean up the SQLite mount
+        if: always()
+        run: |
+          if mountpoint --quiet /mnt/plori-sqlite; then
+            sudo ./juicefs.plori umount /mnt/plori-sqlite || sudo fusermount3 -u /mnt/plori-sqlite
+          fi
 
       - name: Regression - metadata backup under the plori profile
         env:
