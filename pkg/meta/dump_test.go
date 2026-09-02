@@ -90,27 +90,3 @@ func (c *failFastDumpScan) scan(prefix []byte, handler func(key, value []byte) b
 	}
 	return io.ErrClosedPipe
 }
-
-func TestMemKVDumpMetaNoGoroutineLeakOnFailure(t *testing.T) {
-	testDumpMetaNoGoroutineLeakOnFailure(t,
-		func(t *testing.T) Meta {
-			t.Helper()
-			m, err := newKVMeta("memkv", "jfs-dump-leak", testConfig())
-			if err != nil {
-				t.Fatalf("create meta: %s", err)
-			}
-			if err := m.Reset(); err != nil {
-				t.Fatalf("reset meta: %s", err)
-			}
-			if err := m.Init(testFormat(), true); err != nil {
-				t.Fatalf("init meta: %s", err)
-			}
-			return m
-		},
-		func(t *testing.T, m Meta) {
-			t.Helper()
-			km := m.(*kvMeta)
-			km.client = &failFastDumpScan{tkvClient: km.client}
-		},
-	)
-}

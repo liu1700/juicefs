@@ -83,6 +83,9 @@ jobs:
           make test.plori.sqlite
           hack/verify-plori-binary.sh ./juicefs.plori
 
+      - name: Unit tests for ./pkg/meta under the release tag set
+        run: make test.plori.meta
+
       - name: Gate reachable Go vulnerabilities for the artifact configuration
         run: |
           python3 hack/check_govulncheck_test.py

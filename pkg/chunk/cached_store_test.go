@@ -353,7 +353,7 @@ func TestRemoteDurabilityFence(t *testing.T) {
 	require.NoError(t, got.err)
 	require.Zero(t, got.status.PendingBlocks)
 
-	require.NoError(t, store.EvictCache(101, uint32(len(data))))
+	require.NoError(t, store.EvictCache(101, uint32(len(data)), nil))
 	p := NewPage(make([]byte, len(data)))
 	defer p.Release()
 	n, err := store.NewReader(101, len(data)).ReadAt(context.Background(), p, 0)

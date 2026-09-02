@@ -1,3 +1,9 @@
+// The memkv metadata engine is excluded from the Plori release profile
+// (see tkv_mem.go); it is this model test's default -rapid.meta engine and
+// the owner of the setting file the model resets between runs.
+//go:build !plori
+// +build !plori
+
 /*
  * JuiceFS, Copyright 2023 Juicedata, Inc.
  *

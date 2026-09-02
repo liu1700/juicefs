@@ -69,13 +69,25 @@ test.plori.benchmark:
 test.plori.backup:
 	$(PLORI_CGO) go test -count=1 -v -tags "$(PLORI_TAGS)" ./pkg/vfs/ -run TestBackupPloriProfile
 
-# The SQLite PRAGMA contract lives in tag-neutral code (pkg/meta/sql.go), so it
-# is tested on the default build. ./pkg/meta's test package does not compile
-# under PLORI_TAGS: tkv_test.go and sql_test.go reference symbols that
-# nobadger/noetcd/nomysql remove. That the release profile actually carries the
-# driver is covered by test.plori.profile and hack/verify-plori-binary.sh.
+# The SQLite PRAGMA contract on the default build. test.plori.meta below runs
+# the same tests, and the rest of ./pkg/meta, under the release tag set.
 test.plori.sqlite:
 	$(PLORI_CGO) go test -count=1 -v ./pkg/meta/ -run TestSQLitePragma
+
+# ./pkg/meta under the exact tag set the release binary is built with, so the
+# SQLite engine is exercised by the metadata engine's own shared test body
+# (testMeta) and not only by the CI lifecycle smoke.
+#
+# Needs a Redis server on 127.0.0.1:6379 for the Redis half of the suite.
+# SKIP_NON_CORE is upstream's own gate for the tests that need KeyDB, a Redis
+# cluster or PostgreSQL. The two skipped tests hardcode metadata engines the
+# Plori profile removes (badger, tikv); NewClient calls logger.Fatalf on an
+# unknown driver, so either one aborts the whole test binary instead of failing
+# just itself. Everything else is expected to pass: keep this a skip list, not
+# a -run allowlist, so a new upstream test is picked up by default.
+test.plori.meta:
+	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 20m \
+		-tags "$(PLORI_TAGS)" -skip '^TestLoadDump$$|^TestLoadDumpV2$$' ./pkg/meta/
 
 test.plori.security:
 	python3 hack/verify_plori_security_test.py
@@ -130,7 +142,7 @@ juicefs.exe: /usr/local/include/winfsp cmd/*.go pkg/*/*.go
 _juicefs.exe:
 	powershell -Command "$$env:PATH+=';C:\mingw64\bin'; $$env:CGO_ENABLED='1'; $$env:CGO_CFLAGS='-IC:/WinFsp/inc/fuse'; go build -ldflags='-s -w' -o juicefs.exe ."
 
-.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.backup test.plori.sqlite test.plori.security test.java.security plori.tags
+.PHONY: snapshot release debug test test.plori.profile test.plori.benchmark test.plori.backup test.plori.sqlite test.plori.meta test.plori.security test.java.security plori.tags
 
 plori.tags:
 	@printf '%s\n' "$(PLORI_TAGS)"

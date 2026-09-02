@@ -1,3 +1,8 @@
+// The memkv metadata engine is excluded from the Plori release profile
+// (see tkv_mem.go), and the tests below are built on it.
+//go:build !plori
+// +build !plori
+
 /*
  * JuiceFS, Copyright 2026 Juicedata, Inc.
  *
