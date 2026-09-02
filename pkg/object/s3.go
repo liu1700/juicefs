@@ -35,7 +35,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws/middleware"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -417,10 +416,10 @@ func defaultChecksumOpts() []func(*config.LoadOptions) error {
 func autoS3Region(bucketName, accessKey, secretKey, token string) (string, error) {
 	var cfg aws.Config
 	var err error
-	if accessKey != "" {
+	if provider := s3Credentials(accessKey, secretKey, token); provider != nil {
 		var loadOpts []func(*config.LoadOptions) error
 		loadOpts = append(loadOpts, defaultChecksumOpts()...)
-		loadOpts = append(loadOpts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, token)))
+		loadOpts = append(loadOpts, config.WithCredentialsProvider(provider))
 		cfg, err = config.LoadDefaultConfig(ctx, loadOpts...)
 	} else {
 		cfg, err = config.LoadDefaultConfig(ctx, defaultChecksumOpts()...)
@@ -616,8 +615,8 @@ func newS3(endpoint, accessKey, secretKey, token string) (ObjectStorage, error) 
 	loadOpts = append(loadOpts, defaultChecksumOpts()...)
 	if accessKey == "anonymous" {
 		loadOpts = append(loadOpts, config.WithCredentialsProvider(aws.AnonymousCredentials{}))
-	} else if accessKey != "" {
-		loadOpts = append(loadOpts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, token)))
+	} else if provider := s3Credentials(accessKey, secretKey, token); provider != nil {
+		loadOpts = append(loadOpts, config.WithCredentialsProvider(provider))
 	}
 	cfg, err = config.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {

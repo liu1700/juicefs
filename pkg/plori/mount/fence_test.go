@@ -27,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/juicedata/juicefs/pkg/plori/creds"
 )
 
 // conditionalPutShim is the smallest S3 surface the fencer needs: a PUT that
@@ -66,7 +68,11 @@ func TestFenceMarkerIsClaimedOnceAndRefusedTwice(t *testing.T) {
 
 	ctx := context.Background()
 	store := ObjectStore{Endpoint: srv.URL, Bucket: "plorifs", Region: "us-east-1", CredentialSource: CredentialSourceNodeSecret}
-	fencer, err := NewS3Fencer(ctx, store, "key", "secret")
+	src, err := creds.Static("key", "secret")
+	if err != nil {
+		t.Fatalf("creds.Static: %v", err)
+	}
+	fencer, err := NewS3Fencer(ctx, store, src.Provider())
 	if err != nil {
 		t.Fatalf("NewS3Fencer: %v", err)
 	}
@@ -81,7 +87,7 @@ func TestFenceMarkerIsClaimedOnceAndRefusedTwice(t *testing.T) {
 }
 
 func TestFencerRefusesWithoutACredential(t *testing.T) {
-	_, err := NewS3Fencer(context.Background(), ObjectStore{Endpoint: "https://example.invalid", Bucket: "b"}, "", "")
+	_, err := NewS3Fencer(context.Background(), ObjectStore{Endpoint: "https://example.invalid", Bucket: "b"}, nil)
 	if !errors.Is(err, ErrSpec) {
 		t.Fatalf("a missing credential must be a spec-class refusal, got %v", err)
 	}

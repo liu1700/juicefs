@@ -85,6 +85,14 @@ type Litestream struct {
 	SocketPath string
 	DBPath     string
 
+	// Env builds the environment every litestream process is started with. It
+	// is a function rather than a slice because it is where the object key
+	// enters the child, and the key can change while the worker runs: a
+	// rotation restarts the child and this is read again (PLO-322). Nil means
+	// the child inherits this process's environment unchanged, which is the
+	// environment-variable path.
+	Env func() []string
+
 	cmd  *exec.Cmd
 	done chan error
 
@@ -253,7 +261,7 @@ func (l *Litestream) Start(ctx context.Context) error {
 	cmd := exec.Command(l.Bin, "replicate", "-config", l.ConfigPath)
 	cmd.Stdout = os.Stderr // one stream; the plugin reads the last stderr line
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	cmd.Env = l.env()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start litestream: %w", err)
 	}
@@ -404,9 +412,63 @@ func (l *Litestream) Abort(ctx context.Context) error {
 
 func (l *Litestream) run(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, l.Bin, args...)
-	cmd.Env = os.Environ()
+	cmd.Env = l.env()
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+func (l *Litestream) env() []string {
+	if l.Env == nil {
+		return os.Environ()
+	}
+	return l.Env()
+}
+
+// ReloadCredentials restarts replication so the child picks up the object key
+// the worker now holds.
+//
+// Litestream reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY once, at startup,
+// and has no control-socket route that replaces them, so a restart is the only
+// mechanism. What makes the restart free is that Litestream's position is on
+// disk in the state directory, not in the process: a restarted child compares
+// its local state against the replica and continues, which is exactly what it
+// does after a crash. Nothing is lost that a crash would not already have to
+// survive.
+//
+// The final sync before the restart is best effort on purpose. In the
+// rotation this method exists for, the OLD key is already dead by the time the
+// new one arrives — one key pair per subscription, regenerated wholesale
+// (PLO-351) — so the sync will usually fail, and treating that as an error
+// would turn every rotation into a stopped replicator. Whatever it could not
+// push is still in the local WAL and goes out on the next sync under the new
+// key.
+func (l *Litestream) ReloadCredentials(ctx context.Context) error {
+	if l.cmd == nil || l.done == nil {
+		return nil // not replicating yet; Start will read the current key
+	}
+	sync, cancel := context.WithTimeout(ctx, 10*time.Second)
+	syncErr := l.SyncAndWait(sync)
+	cancel()
+
+	stop, cancel := context.WithTimeout(ctx, 20*time.Second)
+	stopErr := l.Stop(stop)
+	cancel()
+	if stopErr != nil {
+		// Stop's own shutdown sync is signing with the same dead key, so a
+		// timeout here is the expected case rather than an anomaly. Kill it:
+		// leaving the old child alive would put two replicators on one
+		// database.
+		abort, cancelAbort := context.WithTimeout(ctx, 10*time.Second)
+		abortErr := l.Abort(abort)
+		cancelAbort()
+		if abortErr != nil {
+			return fmt.Errorf("stop litestream for credential reload: %w (kill: %v)", stopErr, abortErr)
+		}
+	}
+	if err := l.Start(ctx); err != nil {
+		return fmt.Errorf("restart litestream after credential reload: %w (final sync: %v)", err, syncErr)
+	}
+	return nil
 }
 
 func isSignalExit(err error) bool {
