@@ -818,9 +818,11 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	s.mu.Unlock()
 
 	// 2 + 3. drain and run the remote durability barrier
+	// res stays zero out of band, and step 6 skips the report: no barrier ran,
+	// so there is no new durable point to name.
 	var res BarrierResult
-	tBefore := s.now().UTC()
 	if !outOfBand {
+		tBefore := s.now().UTC()
 		var err error
 		res, err = s.vol.Barrier(ctx)
 		if err != nil {
