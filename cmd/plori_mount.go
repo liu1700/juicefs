@@ -22,8 +22,10 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -36,6 +38,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/plori/creds"
 	pmount "github.com/juicedata/juicefs/pkg/plori/mount"
 	prestore "github.com/juicedata/juicefs/pkg/plori/restore"
 	"github.com/juicedata/juicefs/pkg/version"
@@ -69,6 +72,7 @@ machine.`,
 			&cli.StringFlag{Name: "cache-dir", Required: true, Usage: "JuiceFS writeback cache directory, one per volume"},
 			&cli.StringFlag{Name: "control-plane-url", Required: true, Usage: "base URL of the control-plane"},
 			&cli.StringFlag{Name: "token-file", Required: true, Usage: "projected ServiceAccount token, re-read on every call"},
+			&cli.StringFlag{Name: "credential-file", EnvVars: []string{"PLORI_OBJECT_CREDENTIAL_FILE"}, Usage: "JSON object credential, re-read while the worker runs; without it the AWS_* environment is used and the key cannot rotate"},
 			&cli.StringFlag{Name: "litestream-bin", Value: "litestream", Usage: "path to the pinned litestream binary"},
 			&cli.StringFlag{Name: "log-format", Value: "json", Usage: "log format (json)"},
 		},
@@ -87,19 +91,32 @@ func ploriMount(c *cli.Context) error {
 	if err != nil {
 		exitTerminal("", 0, pmount.Classify(err))
 	}
-	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
-	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
-	if accessKey == "" || secretKey == "" {
+	source, err := objectCredential(c.String("credential-file"))
+	if err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, &pmount.Fatal{
 			Exit:      pmount.CodeObjectStore,
 			ErrCode:   pmount.ErrCodeObjectStoreUnreachable,
 			Retryable: true,
-			Err:       fmt.Errorf("no object credential in the worker environment; credential_source is %q", spec.ObjectStore.CredentialSource),
+			Err:       fmt.Errorf("%s; credential_source is %q", err, spec.ObjectStore.CredentialSource),
 		})
 	}
+	// Install the provider before anything builds a storage client. From here
+	// every S3 client in this process signs with whatever pair the source
+	// holds at request time, and the access key in the in-memory Format is a
+	// placeholder rather than a credential (credentialPatch).
+	object.SetS3CredentialsProvider(source.Provider())
+	if !object.S3CredentialsProviderInstalled() {
+		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, &pmount.Fatal{
+			Exit:      pmount.CodeObjectStore,
+			ErrCode:   pmount.ErrCodeObjectStoreUnreachable,
+			Retryable: false,
+			Err:       errors.New("object credential provider did not install"),
+		})
+	}
+	credentials := pmount.NewCredentialWatcher(source, ploriLog)
 
 	ctx := context.Background()
-	fencer, err := pmount.NewS3Fencer(ctx, spec.ObjectStore, accessKey, secretKey)
+	fencer, err := pmount.NewS3Fencer(ctx, spec.ObjectStore, source.Provider())
 	if err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
 	}
@@ -109,6 +126,11 @@ func ploriMount(c *cli.Context) error {
 		ConfigPath: filepath.Join(paths.StateDir, "litestream.yml"),
 		SocketPath: filepath.Join(paths.StateDir, "litestream.sock"),
 		DBPath:     paths.MetaPath(),
+		// Litestream is the one consumer that cannot be handed a new key in
+		// place, so it gets it the only way an exec'd child can: its own
+		// environment, rebuilt every time it starts. This process's own
+		// environment holds no credential on the file path.
+		Env: func() []string { return source.Env(os.Environ()) },
 	}
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
@@ -132,10 +154,11 @@ func ploriMount(c *cli.Context) error {
 		Paths:   paths,
 		Options: opts,
 		Deps: pmount.Deps{
-			FS:                   &ploriFS{paths: paths, accessKey: accessKey, secretKey: secretKey, opts: opts},
+			FS:                   &ploriFS{paths: paths, opts: opts, credentials: credentials},
 			CP:                   pmount.NewClient(c.String("control-plane-url"), paths.TokenFile, 10*time.Second),
 			Replicator:           ls,
 			Fencer:               fencer,
+			Credentials:          credentials,
 			ControlGateInstalled: vfs.InternalMsgGateInstalled,
 			Log:                  ploriLog,
 		},
@@ -173,10 +196,36 @@ func ploriLog(event string, kv ...any) {
 // The JuiceFS half of the supervisor.
 // ---------------------------------------------------------------------------
 
+// objectCredential resolves where this worker's object key comes from.
+//
+// A file is the rotating path and the one the CSI node plugin is expected to
+// use: the plugin re-stages the node Secret into the worker's private run
+// directory as one JSON document, the same way it already re-stages the
+// projected ServiceAccount token, and the worker re-reads it while it runs.
+// The environment is the pre-rotation path and still works exactly as it did;
+// what it cannot do is change while the process lives, which is why the file
+// exists (PLO-322).
+func objectCredential(path string) (*creds.Source, error) {
+	if path != "" {
+		source, err := creds.FromFile(path)
+		if err != nil {
+			// The path is plugin-built and the error text is the file's
+			// SHAPE, never its content (creds.Source.Reload).
+			return nil, fmt.Errorf("object credential file %s: %s", path, err)
+		}
+		return source, nil
+	}
+	source, err := creds.Static(os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY"))
+	if err != nil {
+		return nil, errors.New("no object credential: neither --credential-file nor AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY is set")
+	}
+	return source, nil
+}
+
 type ploriFS struct {
-	paths                pmount.Paths
-	accessKey, secretKey string
-	opts                 pmount.MountOptions
+	paths       pmount.Paths
+	opts        pmount.MountOptions
+	credentials *pmount.CredentialWatcher
 }
 
 // metaURI is the local SQLite metadata engine. It is deliberately a plain
@@ -184,23 +233,95 @@ type ploriFS struct {
 // the private state directory would expose it to the Agent.
 func (f *ploriFS) metaURI() string { return "sqlite3://" + f.paths.MetaPath() }
 
-// credentialPatch injects the object key into an in-memory Format immediately
-// before the storage client is built, and never anywhere else.
+// credentialSentinel is what the in-memory Format carries where a credential
+// used to go.
+//
+// pkg/object's S3 backend treats a non-empty access key as "sign with this"
+// and an empty one as "use the SDK's own chain", so the field has to hold
+// SOMETHING for the backend to install a provider at all. Under the plori tag
+// the provider it installs is the process's rotating one
+// (object.SetS3CredentialsProvider), which ignores these values completely —
+// so the honest thing to put here is a string that is visibly not a
+// credential.
+//
+// Two things fall out of that, and both are the point. The real key is never
+// written into a meta.Format at all, so it cannot reach the Format JSON, the
+// SQLite `setting` row, a dump, or the LTX stream the replica is made of, even
+// by a future edit that forgets to strip it (threat-model F-9 — the strip in
+// Format below becomes a second line of defence rather than the only one). And
+// the value never changes, so NewReloadableStorage's "did the credential
+// change" comparison stays false across a rotation and its log line
+// (cmd/mount.go:479, which prints `ak=%q`) can never print a live access key.
+const credentialSentinel = "plori-mount-rotating-credential"
+
+// credentialPatch fills the in-memory Format immediately before the storage
+// client is built, and never anywhere else.
 //
 // cmd.NewReloadableStorage runs `patch` before createStorage and again on
-// every OnReload (mount.go:461-483), which is what keeps the key out of the
-// replicated SQLite: the stored Format has empty AccessKey/SecretKey and this
-// function supplies them for the lifetime of one storage client only.
-// KeyEncrypted is cleared as well — Format.Decrypt() would otherwise try to
-// AES-open the plaintext we just injected (pkg/meta/config.go:263-296).
+// every OnReload (mount.go:461-483). KeyEncrypted is cleared as well —
+// Format.Decrypt() would otherwise try to AES-open the plaintext we just
+// injected (pkg/meta/config.go:263-296).
 func (f *ploriFS) credentialPatch() func(*meta.Format) {
 	return func(fmtp *meta.Format) {
-		fmtp.AccessKey = f.accessKey
-		fmtp.SecretKey = f.secretKey
+		fmtp.AccessKey = credentialSentinel
+		fmtp.SecretKey = credentialSentinel
 		fmtp.SessionToken = ""
 		fmtp.KeyEncrypted = false
 	}
 }
+
+// watchCredential wraps a storage client so the object store's own answer
+// reaches the credential watcher.
+//
+// It is the second of the watcher's two inputs and the only one that can tell
+// a key that has been replaced from a key that has been revoked: the file says
+// what the credential is, and this says whether it still works. Only the verbs
+// the mount actually issues are overridden; the rest of ObjectStorage is
+// forwarded by the embedded interface.
+type watchCredential struct {
+	object.ObjectStorage
+	w *pmount.CredentialWatcher
+}
+
+func (c *watchCredential) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	r, err := c.ObjectStorage.Get(ctx, key, off, limit, getters...)
+	c.w.Observe(err)
+	return r, err
+}
+
+func (c *watchCredential) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+	err := c.ObjectStorage.Put(ctx, key, in, getters...)
+	c.w.Observe(err)
+	return err
+}
+
+func (c *watchCredential) Delete(ctx context.Context, key string, getters ...object.AttrGetter) error {
+	err := c.ObjectStorage.Delete(ctx, key, getters...)
+	c.w.Observe(err)
+	return err
+}
+
+func (c *watchCredential) Head(ctx context.Context, key string) (object.Object, error) {
+	o, err := c.ObjectStorage.Head(ctx, key)
+	if !os.IsNotExist(err) {
+		// A missing object is the fencer's and the scanner's normal answer,
+		// and it proves the credential worked.
+		c.w.Observe(err)
+	}
+	return o, err
+}
+
+func (c *watchCredential) List(ctx context.Context, prefix, startAfter, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
+	objs, more, next, err := c.ObjectStorage.List(ctx, prefix, startAfter, token, delimiter, limit, followLink)
+	c.w.Observe(err)
+	return objs, more, next, err
+}
+
+// Shutdown forwards to the wrapped client. object.Shutdown finds it by
+// interface assertion, and an embedded ObjectStorage does not carry a method
+// that is not on that interface, so without this the real client's connection
+// pool would never be closed.
+func (c *watchCredential) Shutdown() { object.Shutdown(c.ObjectStorage) }
 
 // Format creates the filesystem. The persisted Format carries no credential:
 // object.CreateStorage is handed empty keys and the AWS SDK resolves them from
@@ -290,6 +411,11 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 	if err != nil {
 		return nil, fmt.Errorf("object storage: %w", err)
 	}
+	// From here every object operation this mount makes reports back to the
+	// credential watcher. Format does not need the same wrapper: a credential
+	// the store refuses during format fails the format, which is already exit
+	// 68, whereas this path has to survive a rotation without stopping.
+	blob = &watchCredential{ObjectStorage: blob, w: f.credentials}
 	registerer, registry := wrapRegister(c, f.paths.MountPoint, format.Name)
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(m, store, chunkConf)
