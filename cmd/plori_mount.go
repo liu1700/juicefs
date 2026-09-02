@@ -279,6 +279,11 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 		return nil, fmt.Errorf("load format: %w", err)
 	}
 	chunkConf := getChunkConf(c, format)
+	// The writeback backlog is the loss window on node death AND the work the
+	// ordered stop has to drain inside the lease. Neither is bounded upstream,
+	// which is what PLO-346 measured; the Plori profile bounds it and the
+	// supervisor tightens it from the drain rate it measures (PLO-383).
+	chunkConf.MaxStagingBacklog = pmount.DefaultMaxStagingBacklog
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
 	blob, err := NewReloadableStorage(format, m, f.credentialPatch())
@@ -481,6 +486,16 @@ func (p *ploriVolume) PendingBlocks() uint64 {
 		return store.RemoteDurabilityStatus().PendingBlocks
 	}
 	return 0
+}
+
+// SetStagingBacklogCap moves the chunk store's backlog ceiling live. The
+// supervisor recomputes it from the drain rate it has measured, so a node that
+// has become slow holds a shallower backlog rather than one it can no longer
+// drain inside the write-stop window (PLO-383).
+func (p *ploriVolume) SetStagingBacklogCap(blocks int64) {
+	if store, ok := p.store.(chunk.StagingBacklogLimiter); ok {
+		store.SetStagingBacklogCap(blocks)
+	}
 }
 
 func (p *ploriVolume) Usage(ctx context.Context) (pmount.Usage, error) {

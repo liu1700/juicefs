@@ -155,6 +155,16 @@ type Volume interface {
 	// PendingBlocks is the cheap, non-blocking writeback status used by
 	// health.json.
 	PendingBlocks() uint64
+	// SetStagingBacklogCap bounds how many blocks may sit staged and not yet
+	// uploaded. Above the cap a write is uploaded THROUGH rather than staged:
+	// the writer waits for the object store and the backlog stops growing.
+	// Nothing is dropped and nothing answers an error.
+	//
+	// The supervisor moves it as the measured drain rate moves, so the deepest
+	// backlog it allows is always one the ordered stop can still drain inside
+	// the lease (PLO-383). A cap of 0 is unlimited, which is what a volume
+	// gets if the profile constant is ever set to 0.
+	SetStagingBacklogCap(blocks int64)
 	// Usage reports current consumption.
 	Usage(ctx context.Context) (Usage, error)
 	// ApplyGrant writes a new quota ceiling into the metadata. It must load a

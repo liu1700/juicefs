@@ -48,6 +48,23 @@ type Health struct {
 	UsedBytes         int64     `json:"used_bytes"`
 	UsedInodes        int64     `json:"used_inodes"`
 	GrantEpochApplied int64     `json:"grant_epoch_applied"`
+	// ProjectedDrainSeconds is how long PendingBlocks would take to become
+	// durable at the drain rate this worker has measured. It is what makes the
+	// third stop instant possible: the plugin waits write_stop_margin + this
+	// before SIGKILL instead of a constant, and an operator can see a mount
+	// whose backlog has outgrown its stop window before the stop happens
+	// (PLO-383). Raw, not clamped -- the worker publishes what it believes and
+	// each consumer clamps to its own budget.
+	ProjectedDrainSeconds float64 `json:"projected_drain_seconds"`
+	// DrainRateBlocksPerSecond is the same measurement in the form a dashboard
+	// reads. Seeded from the production-node measurement and replaced by this
+	// mount's own barriers; DrainSamples is 0 while it is still the seed.
+	DrainRateBlocksPerSecond float64 `json:"drain_rate_blocks_per_s"`
+	DrainSamples             int     `json:"drain_samples"`
+	// StagingBacklogCap is the backlog ceiling in force, in blocks. Writes
+	// above it are uploaded through rather than staged, which is what keeps
+	// ProjectedDrainSeconds inside the stop window.
+	StagingBacklogCap int64 `json:"staging_backlog_cap"`
 	// QuotaExhausted is true from the moment the volume ceiling refuses an
 	// operation until a larger grant epoch is applied. It is what tells an
 	// operator (and PLO-325's metrics) the difference between an Agent that is

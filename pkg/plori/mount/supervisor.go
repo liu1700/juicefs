@@ -60,6 +60,10 @@ type Supervisor struct {
 
 	deadline *Deadline
 	vol      Volume
+	// drain is the measured answer to "how long is the backlog in front of a
+	// stop". It is what turns the write-stop margin from a constant into a
+	// bound (PLO-383).
+	drain *DrainModel
 
 	mu              sync.Mutex
 	lastBarrier     BarrierResult
@@ -74,6 +78,13 @@ type Supervisor struct {
 	lastRenewOK     bool
 	fenced          bool
 	formattedHere   bool
+	// leaseTTL is the full lease length as the control-plane last issued it,
+	// observed rather than configured: the worker is never told the TTL, but
+	// every renewal's answer is one measurement of it. It bounds how early the
+	// ordered stop may begin.
+	leaseTTL time.Duration
+	// backlogCap is the staging cap currently pushed down to the chunk store.
+	backlogCap int64
 }
 
 func (s *Supervisor) now() time.Time {
@@ -125,6 +136,13 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 
 func (s *Supervisor) start(ctx context.Context) error {
 	s.deadline = NewDeadline(s.Spec.LeaseExpiresAt, s.Spec.WriteStopMargin.D(), s.now())
+	s.drain = NewDrainModel(DefaultDrainPerBlock)
+	// The spec does not carry the lease TTL, so seed it from what is left of
+	// the lease the spec arrived with. That UNDERSTATES the real TTL by
+	// however long the spec took to reach this process, and understating it
+	// only makes the stop start later and the backlog cap tighter -- the safe
+	// direction. The first renewal replaces it with the exact figure.
+	s.setLeaseTTL(s.Spec.LeaseExpiresAt.Sub(s.now().UTC()))
 
 	if err := os.MkdirAll(s.Paths.StateDir, 0o700); err != nil {
 		return fatalf(CodeRefused, ErrCodeRestoreFailed, false, "create state dir: %s", err)
@@ -556,6 +574,10 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 	// guard ticker below is only what decides when to STOP the mount, not what
 	// decides whether a write may be submitted (PLO-323 F-5).
 	s.publishWriteExpiry()
+	// Push the first backlog cap down before the Agent can write a byte. Until
+	// this call the chunk store is unlimited, which is upstream's behaviour and
+	// the state PLO-346 measured 1,008 staged blocks in.
+	s.retuneBacklog()
 
 	renew := time.NewTicker(s.Spec.LeaseRenewInterval.D())
 	defer renew.Stop()
@@ -602,8 +624,17 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 				return s.fenceAndStop(fatalf(CodeFenced, ErrCodeLeaseLost, false,
 					"wall clock moved %s relative to the monotonic clock; treating as a fence trip", jump), ReasonFenced)
 			}
-			if !s.deadline.WriteAllowed(now) {
-				s.log("write_stop_margin_reached")
+			// The ordered stop begins at the write-stop margin MINUS however
+			// long the backlog in front of it is projected to take, which is
+			// threat-model.md §7.5's third instant. With an empty queue the
+			// projection is zero and this is exactly the old margin trigger;
+			// with a queue it is the only way the drain the margin was
+			// supposed to pay for actually fits inside the lease (PLO-383).
+			if early := s.stopEarliness(); s.deadline.StopDue(now, early) {
+				s.log("write_stop_margin_reached",
+					"pending_blocks", s.vol.PendingBlocks(),
+					"projected_drain", s.drain.Project(s.vol.PendingBlocks()).String(),
+					"started_early_by", early.String())
 				return s.fenceAndStop(fatalf(CodeFenced, ErrCodeLeaseLost, false,
 					"lease deadline reached without a successful renewal"), ReasonFenced)
 			}
@@ -634,8 +665,10 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 			s.setRenewOK(true)
 			s.ackDelivered(resp.Grant.AckedEpoch)
 			renewedAt = before
+			s.setLeaseTTL(resp.LeaseExpiresAt.Sub(before.UTC()))
 			s.deadline.Update(resp.LeaseExpiresAt, s.Spec.WriteStopMargin.D(), before)
 			s.publishWriteExpiry()
+			s.retuneBacklog()
 			if resp.Grant.Epoch > s.appliedGrant() {
 				s.applyGrant(ctx, resp.Grant)
 			} else if resp.OverBudget {
@@ -675,11 +708,17 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 	// and reported. crash-consistency.md §5: the barrier's own completion
 	// time is not a safe restore point.
 	tBefore := s.now().UTC()
+	// The periodic barrier IS a drain of the live backlog, so it is the one
+	// honest measurement of how long a drain takes on this node, under this
+	// workload, right now. Sampling anything else would be a model; this is an
+	// observation (PLO-383).
+	pendingBefore, startedAt := s.vol.PendingBlocks(), s.now()
 	res, err := s.vol.Barrier(bctx)
 	if err != nil {
 		s.log("barrier_failed", "error", err.Error())
 		return
 	}
+	s.observeDrain(pendingBefore, s.now().Sub(startedAt))
 	res.DurableAt = tBefore
 	if res.BarrierAt.IsZero() {
 		res.BarrierAt = s.now().UTC()
@@ -913,13 +952,24 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// res stays zero out of band, and step 6 skips the report: no barrier ran,
 	// so there is no new durable point to name.
 	var res BarrierResult
+	var pendingBefore uint64
 	if !outOfBand {
 		tBefore := s.now().UTC()
+		pendingBefore = s.vol.PendingBlocks()
+		startedAt := s.now()
 		var err error
 		res, err = s.vol.Barrier(ctx)
 		if err != nil {
 			incomplete = fmt.Errorf("durability barrier: %w", err)
-			s.log("shutdown_barrier_failed", "error", err.Error())
+			s.log("shutdown_barrier_failed", "error", err.Error(),
+				"pending_blocks_at_start", pendingBefore, "budget", budget.String())
+		} else {
+			// A completed stop barrier is the most informative drain sample
+			// there is -- it is the exact operation the projection exists to
+			// predict -- so it feeds the model even though this process is
+			// about to exit: the model is what sizes the cap, and the cap is
+			// read back by whatever mounts this volume next.
+			s.observeDrain(pendingBefore, s.now().Sub(startedAt))
 		}
 		res.DurableAt = tBefore
 		if res.BarrierAt.IsZero() {
@@ -984,8 +1034,14 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 			"fenced out of band; stopped without a barrier or a final sync")
 	}
 	if incomplete != nil {
+		// The shortfall is measured, not asserted: how much time the stop had,
+		// how deep the backlog was, and how much of it is still staged. Exit 69
+		// already means "data was lost"; PLO-383 makes it say how much, because
+		// "the margin was not enough" is only actionable with the number that
+		// would have been (benchmark-real-node.md §5).
 		return fatalf(CodeBarrierIncomplete, ErrCodeBarrierIncomplete, false,
-			"stop did not complete inside the write-stop window: %s", incomplete)
+			"stop did not complete inside the write-stop window (%s): %s",
+			s.shortfall(budget, pendingBefore), incomplete)
 	}
 	// The marker is written last and only here, so its absence at the next
 	// start is exactly "the previous generation did not finish its stop".
@@ -1004,6 +1060,113 @@ func (s *Supervisor) publishWriteExpiry() {
 		return
 	}
 	s.vol.SetWriteExpiry(s.deadline.Expiry())
+}
+
+// ---------------------------------------------------------- drain model ---
+
+// setLeaseTTL records the full lease length as the control-plane last issued
+// it. Nothing tells the worker the TTL; every renewal answer is a measurement
+// of it, and this is where that measurement is kept.
+func (s *Supervisor) setLeaseTTL(ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.leaseTTL = ttl
+	s.mu.Unlock()
+}
+
+func (s *Supervisor) currentLeaseTTL() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.leaseTTL
+}
+
+// maxStopEarliness bounds how much earlier than the write-stop margin the
+// ordered stop is allowed to begin.
+//
+// Without a bound the projection alone decides, and a projection large enough
+// to reach past a whole lease would make the stop due the instant the lease is
+// renewed -- tearing down a mount that is renewing normally, which is a worse
+// failure than the one being fixed. The bound is stated as renewals rather
+// than as a duration: leave two renew intervals between the last successful
+// renewal and the earliest possible stop, so the stop still takes two
+// consecutive renewal failures to trigger, exactly as it did when the trigger
+// was the bare margin.
+func (s *Supervisor) maxStopEarliness() time.Duration {
+	early := s.currentLeaseTTL() - s.Spec.WriteStopMargin.D() - 2*s.Spec.LeaseRenewInterval.D()
+	if early < 0 {
+		return 0
+	}
+	return early
+}
+
+// stopEarliness is how much earlier than the margin the stop begins right now:
+// the projected drain of the live backlog, clamped to what the lease can pay
+// for. Zero -- an empty queue, or a lease with no room -- is the old behaviour
+// exactly.
+func (s *Supervisor) stopEarliness() time.Duration {
+	projected := s.drain.Project(s.vol.PendingBlocks())
+	if maxEarly := s.maxStopEarliness(); projected > maxEarly {
+		return maxEarly
+	}
+	return projected
+}
+
+// drainBudget is the time the ordered stop is guaranteed for its drain: the
+// margin, plus however much earlier than the margin it is allowed to begin.
+// It is what the backlog cap is sized against, so that the deepest backlog the
+// store will hold is always one this budget can drain.
+func (s *Supervisor) drainBudget() time.Duration {
+	return s.Spec.WriteStopMargin.D() + s.maxStopEarliness()
+}
+
+// observeDrain folds a completed barrier into the model and re-sizes the cap
+// from it. The two belong together: a new measurement that did not move the
+// cap would leave the store holding a backlog the new measurement says is too
+// deep.
+func (s *Supervisor) observeDrain(blocks uint64, elapsed time.Duration) {
+	before := s.drain.PerBlock()
+	s.drain.Observe(blocks, elapsed)
+	if after := s.drain.PerBlock(); after != before {
+		s.log("drain_rate_measured", "blocks", blocks, "elapsed", elapsed.String(),
+			"per_block", after.String(), "blocks_per_second", s.drain.RatePerSecond())
+	}
+	s.retuneBacklog()
+}
+
+// retuneBacklog pushes the current cap down to the chunk store.
+//
+// This is the back-pressure half of PLO-383, and it is deliberately the same
+// mechanism as the projection rather than a second one: the cap is whatever
+// backlog the measured drain rate says still fits in the stop's budget, never
+// more than the profile ceiling. A store at its cap uploads through instead of
+// staging, so the writer waits for the object store and the backlog stops
+// growing -- no error, no dropped data, and no EROFS on a mount whose lease is
+// perfectly healthy.
+func (s *Supervisor) retuneBacklog() {
+	if s.vol == nil {
+		return
+	}
+	want := s.drain.CapForBudget(s.drainBudget(), DefaultMaxStagingBacklog)
+	s.mu.Lock()
+	changed := want != s.backlogCap
+	s.backlogCap = want
+	s.mu.Unlock()
+	if changed {
+		s.log("staging_backlog_cap", "blocks", want, "budget", s.drainBudget().String(),
+			"per_block", s.drain.PerBlock().String())
+	}
+	s.vol.SetStagingBacklogCap(want)
+}
+
+// shortfall describes, in one string, why a stop ran out of time: what it had,
+// what it was asked to drain, and what is still staged.
+func (s *Supervisor) shortfall(budget time.Duration, pendingAtStart uint64) string {
+	remaining := s.vol.PendingBlocks()
+	return fmt.Sprintf("budget %s, %d blocks staged at the start and %d still staged, projected %s at %.1f blocks/s",
+		budget.Round(time.Millisecond), pendingAtStart, remaining,
+		s.drain.Project(remaining).Round(time.Millisecond), s.drain.RatePerSecond())
 }
 
 func (s *Supervisor) releaseLease(reason string) {
@@ -1079,7 +1242,11 @@ func (s *Supervisor) writeHealth() {
 		GrantEpochApplied: s.grantApplied,
 		QuotaExhausted:    s.quotaExhausted,
 		Fenced:            s.fenced,
+		StagingBacklogCap: s.backlogCap,
 	}
+	h.ProjectedDrainSeconds = s.drain.Project(h.PendingBlocks).Seconds()
+	h.DrainRateBlocksPerSecond = s.drain.RatePerSecond()
+	h.DrainSamples = s.drain.Samples()
 	if !s.lastBarrier.BarrierAt.IsZero() {
 		h.ReplicaLagMs = s.now().Sub(s.lastBarrier.BarrierAt).Milliseconds()
 	}
