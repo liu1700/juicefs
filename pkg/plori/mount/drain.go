@@ -83,7 +83,7 @@ func NewDrainModel(seed time.Duration) *DrainModel {
 // every time the mount is quiet -- which is the regime the wave-2 measurement
 // was taken in, and the reason its number was a floor rather than a bound.
 func (d *DrainModel) Observe(blocks uint64, elapsed time.Duration) {
-	if blocks < minDrainSample || elapsed <= 0 {
+	if d == nil || blocks < minDrainSample || elapsed <= 0 {
 		return
 	}
 	sample := elapsed / time.Duration(blocks)
@@ -101,7 +101,15 @@ func (d *DrainModel) Observe(blocks uint64, elapsed time.Duration) {
 }
 
 // PerBlock is the current estimate of one block's drain cost.
+//
+// A nil model is the seed. The type is total on purpose: health.json is written
+// on failure paths and by callers that never ran the startup chain, and a
+// supervisor that has not measured anything yet should read as "nothing
+// measured yet" rather than crash while reporting why it is stopping.
 func (d *DrainModel) PerBlock() time.Duration {
+	if d == nil {
+		return DefaultDrainPerBlock
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.perBlock
@@ -110,6 +118,9 @@ func (d *DrainModel) PerBlock() time.Duration {
 // Samples is how many barriers have been measured. Zero means the model is
 // still the seed.
 func (d *DrainModel) Samples() int {
+	if d == nil {
+		return 0
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.samples

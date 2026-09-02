@@ -385,3 +385,38 @@ func TestTheStopBarrierFeedsTheDrainModel(t *testing.T) {
 		t.Fatalf("per_block = %s, want the measured value, not the seed", got)
 	}
 }
+
+// A Supervisor that never ran its startup chain still writes health.json — on
+// every failure path, and in the tests that build one directly. A nil model
+// there has to read as "nothing measured yet", not crash the process while it
+// is reporting why it is stopping. (Found by merging PLO-322's fork PR, whose
+// credential tests call writeHealth on a bare Supervisor.)
+func TestAnUnstartedSupervisorStillWritesHealth(t *testing.T) {
+	var m *DrainModel
+	if got := m.PerBlock(); got != DefaultDrainPerBlock {
+		t.Fatalf("nil model per_block = %s, want the seed %s", got, DefaultDrainPerBlock)
+	}
+	if m.Samples() != 0 {
+		t.Fatalf("nil model samples = %d, want 0", m.Samples())
+	}
+	m.Observe(100, time.Second) // must not panic and must not record
+	if m.Samples() != 0 {
+		t.Fatalf("nil model recorded a sample")
+	}
+	if got := m.Project(10); got != 10*DefaultDrainPerBlock {
+		t.Fatalf("nil model projection = %s, want %s", got, 10*DefaultDrainPerBlock)
+	}
+	if got := m.CapForBudget(prodBudget, DefaultMaxStagingBacklog); got != DefaultMaxStagingBacklog {
+		t.Fatalf("nil model cap = %d, want the ceiling", got)
+	}
+
+	sup, _ := drainSup(t)
+	sup.drain = nil
+	if err := os.MkdirAll(sup.Paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sup.writeHealth()
+	if _, err := os.Stat(sup.Paths.HealthPath()); err != nil {
+		t.Fatalf("an unstarted supervisor wrote no health file: %s", err)
+	}
+}

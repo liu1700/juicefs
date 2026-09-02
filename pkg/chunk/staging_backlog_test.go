@@ -20,6 +20,7 @@ package chunk
 import (
 	"bytes"
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -36,13 +37,29 @@ import (
 func backlogTestConf(t *testing.T) Config {
 	t.Helper()
 	config := defaultConf
-	config.CacheDir = t.TempDir()
+	config.CacheDir = backlogCacheDir(t)
 	config.CacheSize = 1 << 30
 	config.FreeSpace = 0.0001
 	config.Writeback = true
 	config.WritebackThresholdSize = config.BlockSize + 1
 	config.PutTimeout = 30 * time.Second
 	return config
+}
+
+// backlogCacheDir is t.TempDir() without the cleanup assertion.
+//
+// NewCachedStore has no Close: its uploader, its delayed-staging sweep and its
+// cache scanner run for the life of the process. t.TempDir() fails the test if
+// its RemoveAll races one of them writing a block back ("directory not empty"),
+// which says nothing about the code under test.
+func backlogCacheDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "backlog-cache-")
+	if err != nil {
+		t.Fatalf("cache dir: %s", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
 }
 
 func stagedBlocks(store ChunkStore) uint64 {
