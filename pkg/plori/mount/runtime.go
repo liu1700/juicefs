@@ -181,9 +181,11 @@ type Volume interface {
 	// Unmount detaches the mount with `umount --flush` semantics: fail-closed
 	// if the flush does not complete.
 	Unmount(ctx context.Context) error
-	// Detach unmounts WITHOUT flushing. It is the out-of-band fence's way out:
-	// a writer that has lost its epoch must not push staged bytes into a data
-	// prefix it no longer owns, and `umount --flush` would (PLO-323 F-1).
+	// Detach unmounts WITHOUT flushing — a lazy detach. It is the out-of-band
+	// fence's way out: a writer that has lost its epoch must not push staged
+	// bytes into a data prefix it no longer owns, and `umount --flush` would.
+	// It is also the only unmount that can succeed once FenceWrites has sealed
+	// the engine, because that flush would answer EROFS (PLO-323 F-1, F-2).
 	Detach(ctx context.Context) error
 	// Close closes the metadata session and the SQLite database.
 	Close() error

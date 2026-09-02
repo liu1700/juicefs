@@ -515,9 +515,12 @@ func (p *ploriVolume) Fenced() bool { return meta.PloriWritesFenced() }
 // operation re-checks it immediately before it runs (PLO-323 F-5).
 func (p *ploriVolume) SetWriteExpiry(at time.Time) { meta.PloriSetWriteExpiry(at) }
 
-// Detach unmounts without flushing. Unmount is the ordered path; this is the
-// out-of-band fence's, where a flush would push staged bytes into a data prefix
-// this writer no longer owns (PLO-323 F-1).
+// Detach unmounts without flushing: `fusermount -uz`, the lazy detach the
+// plugin's own recycle path already uses. Unmount is the ordered way out; this
+// is the out-of-band fence's, where the flush `umount --flush` performs would
+// push staged bytes into a data prefix this writer no longer owns, and where
+// the seal that has already been set would make that flush fail and leave the
+// mount attached (PLO-323 F-1).
 func (p *ploriVolume) Detach(context.Context) error {
 	return doUmount(p.paths.MountPoint, true)
 }
