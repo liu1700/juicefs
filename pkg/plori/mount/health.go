@@ -56,6 +56,19 @@ type Health struct {
 	// otherwise indistinguishable from a healthy mount.
 	QuotaExhausted bool `json:"quota_exhausted"`
 	Fenced         bool `json:"fenced"`
+	// CredentialRefreshFailed is true while the worker is running on the last
+	// object key it managed to read, because the current read of the
+	// credential file fails or the store is refusing the key it produced. It
+	// is a warning, not a failure: the worker keeps serving until
+	// CredentialRejectGrace runs out, and this is the only signal an operator
+	// has that a rotation is halfway through (PLO-322).
+	CredentialRefreshFailed bool `json:"credential_refresh_failed"`
+	// CredentialGeneration counts the object keys this worker has run on,
+	// starting at 1. It is how a rotation drill answers "has the fleet picked
+	// the new key up yet" without anything having to name the key. A worker
+	// whose credential cannot rotate at all (the environment-variable path)
+	// stays at 1 forever, which is the same signal read the other way.
+	CredentialGeneration int64 `json:"credential_generation"`
 }
 
 // DurablePoint is the persisted recovery anchor.

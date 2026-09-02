@@ -40,6 +40,12 @@ type Deps struct {
 	CP         ControlPlane
 	Replicator Replicator
 	Fencer     Fencer
+	// Credentials owns the object key: it re-reads the file the key arrives
+	// in, hands the new pair to every S3 client in the process at once, and
+	// bounds how long the worker keeps serving a key the store refuses
+	// (PLO-322). It may be nil in tests that never touch the object store, in
+	// which case the credential tick does nothing.
+	Credentials *CredentialWatcher
 	// ControlGateInstalled reports whether the `.control` uid gate is
 	// compiled in. It is a function rather than a bool so the check is made
 	// against the live vfs package, not against a value someone set.
@@ -572,6 +578,13 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 	// renew interval must not make a healthy mount look stale.
 	health := time.NewTicker(HealthWriteInterval)
 	defer health.Stop()
+	// The credential is re-read on its own ticker rather than on the renew
+	// tick: the two answer to different clocks. Renewal is the control-plane's
+	// lease cadence; this one is how fast a key rolled on the node reaches a
+	// running mount, and coupling them would make a slower renew interval
+	// silently slow rotation down as well.
+	credential := time.NewTicker(s.Deps.Credentials.Interval())
+	defer credential.Stop()
 
 	ticks := 0
 	renewedAt := s.now()
@@ -649,9 +662,59 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 		case <-health.C:
 			s.writeHealth()
 
+		case <-credential.C:
+			if f := s.pollCredential(ctx); f != nil {
+				return f
+			}
+
 		case <-barrier.C:
 			s.runBarrier(ctx)
 		}
+	}
+}
+
+// pollCredential re-reads the object key and decides whether this worker can
+// still reach the store. It returns non-nil only when the worker must stop.
+//
+// It runs in the supervisor's own goroutine, which is what makes the
+// replicator restart safe: a barrier, a shutdown and this cannot overlap.
+func (s *Supervisor) pollCredential(ctx context.Context) *Fatal {
+	w := s.Deps.Credentials
+	if w == nil {
+		return nil
+	}
+	if w.Poll() {
+		s.reloadReplicatorCredentials(ctx)
+	}
+	if w.Verdict() != CredentialRejected {
+		return nil
+	}
+	// The store has refused this key for the whole grace and no new one has
+	// arrived. Stop the way an out-of-band fence stops — nothing that needs
+	// the store — but report it as the retryable object-store class, because
+	// the lease was never lost: the plugin should republish and the next
+	// worker will pick up whatever key the node holds by then.
+	s.log("credential_rejected_stop", "grace", CredentialRejectGrace.String())
+	if stopErr := s.shutdown(context.Background(), ReasonCredentialRejected); stopErr.Exit == CodeBarrierIncomplete {
+		return stopErr
+	}
+	return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true,
+		"object store refused this worker's credential for %s", CredentialRejectGrace)
+}
+
+// reloadReplicatorCredentials hands the new key to the replicator, if it is
+// the kind that needs handing one.
+func (s *Supervisor) reloadReplicatorCredentials(ctx context.Context) {
+	r, ok := s.Deps.Replicator.(ReplicatorReloader)
+	if !ok {
+		return
+	}
+	if err := r.ReloadCredentials(ctx); err != nil {
+		// Not fatal on its own: replication falling behind is visible in
+		// replica_lag_ms and recovers on the next successful sync, whereas
+		// stopping the mount over it would cost the Agent its session for a
+		// condition the next tick may fix.
+		s.log("credential_replicator_reload_failed", "error", err.Error())
 	}
 }
 
@@ -888,7 +951,11 @@ func (s *Supervisor) fenceAndStop(f *Fatal, reason string) *Fatal {
 //     references blocks the skipped barrier never uploaded (F-1 ruling,
 //     threat-model.md §7).
 func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
-	outOfBand := reason == ReasonFencedOutOfBand
+	// A rejected credential takes the same shape for a different reason: steps
+	// 3 and 5 are object-store writes and the store is what is refusing this
+	// process, so running them would spend the whole remaining lease failing
+	// and report data loss for a condition that is retryable (PLO-322).
+	outOfBand := reason == ReasonFencedOutOfBand || reason == ReasonCredentialRejected
 
 	budget := s.deadline.RemainingLease(s.now())
 	if budget < time.Second {
@@ -977,6 +1044,13 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// 7. release the writer lease, always.
 	s.releaseLease(reason)
 
+	if reason == ReasonCredentialRejected {
+		// Also not a clean stop: no `clean` marker, so the next generation
+		// repairs. The caller supplies the message; this exists so the shape
+		// and the exit code cannot drift apart.
+		return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true,
+			"object credential rejected; stopped without a barrier or a final sync")
+	}
 	if outOfBand {
 		// Not a clean stop and not a data-loss report: the epoch was taken
 		// away. No `clean` marker, so the next generation repairs.
@@ -1084,6 +1158,10 @@ func (s *Supervisor) writeHealth() {
 		h.ReplicaLagMs = s.now().Sub(s.lastBarrier.BarrierAt).Milliseconds()
 	}
 	s.mu.Unlock()
+	if w := s.Deps.Credentials; w != nil {
+		h.CredentialRefreshFailed = w.Verdict() != CredentialOK
+		h.CredentialGeneration = w.Generation()
+	}
 	if err := writeJSONAtomic(s.Paths.HealthPath(), h); err != nil {
 		s.log("health_write_failed", "error", err.Error())
 	}

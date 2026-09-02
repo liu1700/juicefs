@@ -121,6 +121,14 @@ test.plori.meta:
 test.plori.unit:
 	$(PLORI_CGO) go test -count=1 -timeout 20m \
 		-tags "$(PLORI_TAGS)" ./pkg/chunk/... ./pkg/vfs/... ./pkg/plori/...
+# PLO-322: the object-credential hygiene audit has to live in ./cmd, because the
+# surfaces it greps only exist there -- the meta.Format a volume is formatted
+# with, the SQLite database that Format is stored in (and therefore every LTX
+# frame made out of it), and the plori-mount flag set that becomes the worker's
+# argv. The rest of ./cmd's suite needs a Redis and a real object store, so this
+# names its tests rather than running the package.
+	$(PLORI_CGO) go test -count=1 -timeout 5m -tags "$(PLORI_TAGS)" ./cmd/ \
+		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath'
 
 # Upstream's own unit tests on the default build. Nothing in the Plori workflow
 # ran a default-build `go test`, which is why pkg/chunk/cached_store_test.go sat

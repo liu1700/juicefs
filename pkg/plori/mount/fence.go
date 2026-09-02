@@ -33,7 +33,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 )
@@ -83,12 +82,16 @@ type S3Fencer struct {
 }
 
 // NewS3Fencer builds a fencer from the MountSpec's object-store coordinates
-// and the credential the worker holds in its environment. The credential is
-// read from the process environment and never logged, never written to the
-// spec, and never persisted (mountspec.md §5).
-func NewS3Fencer(ctx context.Context, store ObjectStore, accessKey, secretKey string) (*S3Fencer, error) {
-	if accessKey == "" || secretKey == "" {
-		return nil, fmt.Errorf("%w: object credential is not present in the worker environment", ErrSpec)
+// and the process's credential provider.
+//
+// It takes the provider rather than a key pair so that the fencer and the data
+// path cannot end up on different keys: the provider is the one the worker
+// installed into pkg/object, and a rotation moves both at the same instant
+// (PLO-322). The credential is never logged, never written to the spec, and
+// never persisted (mountspec.md §5).
+func NewS3Fencer(ctx context.Context, store ObjectStore, provider aws.CredentialsProvider) (*S3Fencer, error) {
+	if provider == nil {
+		return nil, fmt.Errorf("%w: no object credential provider", ErrSpec)
 	}
 	region := store.Region
 	if region == "" {
@@ -96,7 +99,7 @@ func NewS3Fencer(ctx context.Context, store ObjectStore, accessKey, secretKey st
 	}
 	cfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(region),
-		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+		awsconfig.WithCredentialsProvider(provider),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("load aws config: %w", err)
