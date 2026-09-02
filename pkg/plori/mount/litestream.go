@@ -36,25 +36,49 @@ import (
 
 // Litestream drives the metadata replica as a CHILD PROCESS, not as a library.
 //
-// The library route was evaluated and rejected on evidence. The root
-// `github.com/benbjohnson/litestream` package imports `modernc.org/sqlite`
-// (db.go:26 and a blank import at litestream.go:15), and `modernc.org/sqlite`
-// is one of the DENIED_PREFIXES in hack/verify_plori_sbom.py:27. That denial
-// is substantive rather than bureaucratic: linking it would put a second,
-// independent SQLite implementation into the same binary as
-// mattn/go-sqlite3 — two engines with different pragma defaults and different
-// locking, both able to open the one file whose integrity the whole design
-// rests on. The module also pulls github.com/superfly/ltx,
-// github.com/psanford/sqlite3vfs and, through go-dateparser, a WASM runtime
-// (tetratelabs/wazero) into the trusted mount worker.
+// The library route is cheaper — a separate process costs about 36 MiB fixed
+// per mount, roughly 1.5 of the 8 slots on a 2 GiB node, against roughly
+// 0.7 MiB per database if the Go runtime were shared — and it was rejected
+// anyway, for a reason that is not about memory and not about the SBOM gate.
 //
-// The one thing the library was wanted for — DB.SyncAndWait (db.go:714-728) —
-// is reachable over the CLI: `litestream replicate` serves a control socket
-// and `litestream sync -wait` blocks on it (cmd/litestream/sync.go). And on a
-// single SIGTERM `replicate` runs Store.Close, which performs a final sync
-// before exiting (cmd/litestream/main.go:194-198, db.go:839). So exec loses
-// nothing and keeps the crash domains separate: a Litestream panic does not
-// take the FUSE mount down with it.
+// Litestream v0.5.17 opens the database it replicates with `modernc.org/sqlite`
+// (db.go:1049 `sql.Open("sqlite", dsn)`, plus sqlite.FileControl at db.go:1009
+// for checkpoint control). JuiceFS opens that same file with
+// `mattn/go-sqlite3`. Linking both into one binary would put TWO independent
+// SQLite library instances on ONE database file inside ONE process, and SQLite
+// does not support that: POSIX advisory locks are held per process, so closing
+// any descriptor on the file drops every lock the process holds on it, and each
+// library instance keeps its own inode/WAL-index registry, so neither can see
+// the other's locks or shared-memory state. Two SQLite builds in two processes
+// is the configuration the locking protocol is designed for — and it is what
+// the M0 harness already measured working. Two in one process is the
+// documented corruption hazard, on the one file the entire design treats as
+// the filesystem.
+//
+// `modernc.org/sqlite` being one of hack/verify_plori_sbom.py's DENIED_PREFIXES
+// is the same fact written down as a gate, not an independent objection: had
+// the hazard not existed, the gate change would have been small (admit
+// modernc.org/sqlite, github.com/superfly/ltx, github.com/psanford/sqlite3vfs,
+// github.com/benbjohnson/litestream and the go-dateparser/wazero chain it
+// pulls in, and note in the support policy that the profile now links a second
+// SQLite implementation). It is not worth making, because the sentence that
+// would have to go into the support policy is the reason not to.
+//
+// What the library was wanted for costs nothing over the CLI. DB.SyncAndWait
+// (db.go:714-728) is reachable as `litestream sync -wait`, which drives the
+// same call through the control socket (cmd/litestream/sync.go); a single
+// SIGTERM makes `replicate` run Store.Close and its final sync
+// (cmd/litestream/main.go:194-198, db.go:839); and restore takes a TXID or a
+// timestamp on the command line (cmd/litestream/restore.go:31-33,88-91). Exec
+// additionally keeps the crash domains apart: a Litestream panic does not take
+// the FUSE mount with it.
+//
+// The memory is still worth recovering. The route that does it without the
+// hazard is ONE node-level Litestream process watching many databases —
+// v0.5.17 supports it natively (DBConfig Dir/Pattern/Watch) at 36 MiB plus
+// ~0.7 MiB per database — and the open question there is whether a per-volume
+// replica prefix can be expressed under a single directory-watch config. That
+// belongs with PLO-366 and the plugin, not here.
 type Litestream struct {
 	Bin        string
 	ConfigPath string

@@ -42,6 +42,12 @@ func (p Paths) ReadyPath() string { return p.StateDir + "/ready" }
 // HealthPath is rewritten every renew tick.
 func (p Paths) HealthPath() string { return p.StateDir + "/health.json" }
 
+// CleanStopPath records that the previous generation completed its ordered
+// stop. It is written as the last act of a clean shutdown and removed at the
+// start of every run, so its absence is a reliable "the previous writer died
+// mid-flight" signal rather than a guess.
+func (p Paths) CleanStopPath() string { return p.StateDir + "/clean" }
+
 // DurablePointPath persists the pre-barrier wall clock the next generation
 // restores to. crash-consistency.md §5: neither LastSuccessfulBarrierUnixMs
 // (a completion time, cached_store.go:1302-1303) nor Fence (a per-process

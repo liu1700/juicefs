@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	rtdebug "runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -115,6 +116,7 @@ func ploriMount(c *cli.Context) error {
 	if err := ls.WriteConfig(spec); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
 	}
+	applyMemoryLimit(spec)
 
 	stop := make(chan os.Signal, 2)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
@@ -361,8 +363,12 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	p.v = vfs.NewVFS(p.vfsConf, p.m, p.store, p.reg, p.registry)
 	p.v.UpdateFormat = updateFormat(p.cli)
 	logger.Infof("JuiceFS version %s, plori-mount serving %s", version.Version(), p.identity.Name)
-	mountMain(p.v, p.cli)
-	return nil
+	// serveMount rather than mountMain: the FUSE loop runs IN THIS PROCESS
+	// (cmd.mount() would re-exec itself at mount_unix.go:1016, which is the
+	// second juicefs process in the M0 footprint measurement), and because
+	// JuiceFS's own child supervisor is therefore gone, a session that ends
+	// has to be reported to our caller rather than exiting as 1.
+	return serveMount(p.v, p.cli)
 }
 
 // AwaitMounted proves the filesystem is serving without issuing a syscall
@@ -501,9 +507,27 @@ var ploriDefaults = map[string]string{
 	"writeback":       "true",
 	"heartbeat":       "300s",
 	"backup-meta":     "0",
+	"buffer-size":     "32",
 	"no-usage-report": "true",
 	"metrics":         "",
 	"consul":          "",
+}
+
+// applyMemoryLimit caps the Go heap.
+//
+// JuiceFS page buffers are Go heap allocations (pkg/utils/alloc.go:30-31) and
+// nothing in cmd or pkg tunes the GC, so an unconstrained mount peaks far
+// above its steady state under a write burst. PLO-316 wave 2 measured 32.6 MiB
+// idle and 141 MiB at a git-clone peak with a 128 MiB limit and a 32 MiB
+// buffer, against 250 MiB unlimited, at no throughput cost.
+//
+// An operator-set GOMEMLIMIT wins: the Go runtime already honours the
+// environment variable, so this only supplies the default.
+func applyMemoryLimit(spec *pmount.MountSpec) {
+	if os.Getenv("GOMEMLIMIT") != "" {
+		return
+	}
+	rtdebug.SetMemoryLimit(int64(spec.MemoryLimitMB()) << 20)
 }
 
 // ploriMountContext builds the cli.Context the generic mount helpers read.

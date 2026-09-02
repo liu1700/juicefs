@@ -207,9 +207,23 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 			s.log("restore_anchor", "durable_at", anchor, "from_epoch", dp.FenceEpoch)
 		}
 	}
+	// A previous generation that did not write the clean marker died without
+	// finishing its stop, so the restored image is only durable up to its last
+	// barrier. crash-consistency.md §7 Rank 1 says the repair for that is a
+	// full fsck of the restored metadata against the objects; PLO-320 owes it
+	// (PLO-316 wave 2 measured 870 ms / 12 LIST / 34 MiB on 11k objects, so it
+	// is affordable unconditionally — never path-scoped, which is 15x worse).
+	// Until then the condition is reported, not repaired.
+	unclean := !fileExists(s.Paths.CleanStopPath())
+	_ = os.Remove(s.Paths.CleanStopPath())
+
 	err := s.Deps.Replicator.Restore(ctx, anchor)
 	switch {
 	case err == nil:
+		if unclean {
+			s.log("unclean_generation", "error", ErrCodeRestoredToBarrier,
+				"restored_to", anchor, "repair", "not_implemented_PLO-320")
+		}
 		return nil
 	case errors.Is(err, ErrReplicaEmpty):
 		return s.formatFirstBoot(ctx)
@@ -326,6 +340,11 @@ func checkCacheDirTenant(cacheDir, uuid string) error {
 	return nil
 }
 
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func dirIsEmpty(dir string) (bool, error) {
 	found := false
 	err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
@@ -370,14 +389,18 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 			return s.shutdown(context.Background(), "shutdown")
 
 		case err := <-serveErr:
-			// The FUSE session ended without us asking. Treat it as a fence
-			// trip: an unrecognised mount failure is fenced, not retryable
+			// The FUSE session ended without us asking. JuiceFS's own child
+			// supervisor is not in the picture — the loop runs in this
+			// process — so nothing else will notice, and the mount point is
+			// potentially half-attached. It is never a clean exit: a
+			// zero-status session end is still a mount that stopped serving,
+			// and an unrecognised mount failure is fenced, not retryable
 			// (parity-matrix §4a #3).
 			s.shutdown(context.Background(), "fuse_session_ended")
-			if err != nil {
-				return fatalf(CodeFenced, ErrCodeLeaseLost, false, "fuse session ended: %s", err)
+			if err == nil {
+				err = errors.New("session closed without an error")
 			}
-			return &Fatal{Exit: CodeOK, ErrCode: "", Err: errors.New("fuse session ended")}
+			return fatalf(CodeFenced, ErrCodeLeaseLost, false, "fuse session ended: %s", err)
 
 		case <-guard.C:
 			now := s.now()
@@ -600,6 +623,11 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	if incomplete != nil {
 		return fatalf(CodeBarrierIncomplete, ErrCodeBarrierIncomplete, false,
 			"stop did not complete inside the write-stop window: %s", incomplete)
+	}
+	// The marker is written last and only here, so its absence at the next
+	// start is exactly "the previous generation did not finish its stop".
+	if err := os.WriteFile(s.Paths.CleanStopPath(), []byte(s.now().UTC().Format(time.RFC3339Nano)+"\n"), 0o600); err != nil {
+		s.log("clean_marker_write_failed", "error", err.Error())
 	}
 	return &Fatal{Exit: CodeOK, Err: errors.New("clean stop")}
 }

@@ -149,13 +149,17 @@ type MountSpec struct {
 	// UsageReportEvery is how many renew ticks pass between /usage reports.
 	// Zero means DefaultUsageReportEvery.
 	UsageReportEvery int `json:"usage_report_every,omitempty"`
+	// MemoryLimitMiB caps the worker's Go heap. Zero means
+	// DefaultMemoryLimitMiB.
+	MemoryLimitMiB int `json:"memory_limit_mib,omitempty"`
 }
 
 // Defaults for the spec-driven knobs the control-plane does not issue yet.
 const (
 	// DefaultBarrierInterval is the periodic `juicefs durability` cadence.
-	// 60 s is the middle of the three periods PLO-316 is measuring
-	// (15/60/300 s stall cost); it is a placeholder, not a measurement.
+	// PLO-316 wave 2 measured 15/60/300 s and found zero write stall and zero
+	// extra PUTs at all three, so the period is chosen for how much work an
+	// unclean death can lose, not for what it costs: 60 s.
 	DefaultBarrierInterval = 60 * time.Second
 	// DefaultReplicaSyncInterval matches the M0 harness (one LTX object per
 	// second, wave-2 brief blocker 2).
@@ -163,6 +167,11 @@ const (
 	// DefaultUsageReportEvery reports usage every 15th renew: at a 20 s renew
 	// interval that is one /usage call per five minutes per mount.
 	DefaultUsageReportEvery = 15
+	// DefaultMemoryLimitMiB is the GOMEMLIMIT the worker sets when neither the
+	// spec nor the environment names one. PLO-316 wave 2 measured 32.6 MiB
+	// idle and 141 MiB at a git-clone peak at this limit, against 250 MiB
+	// unlimited, with no throughput cost.
+	DefaultMemoryLimitMiB = 128
 	// DefaultTrashDays is the crash-consistency D1 floor. A volume formatted
 	// with trash-days 0 cannot satisfy crash-consistency.md §7 Rank 1, so the
 	// worker never formats one and refuses to mount one (exit 70).
@@ -262,6 +271,9 @@ func (s *MountSpec) Validate() error {
 	if s.UsageReportEvery < 0 {
 		return fmt.Errorf("%w: usage_report_every must not be negative", ErrSpec)
 	}
+	if s.MemoryLimitMiB < 0 {
+		return fmt.Errorf("%w: memory_limit_mib must not be negative", ErrSpec)
+	}
 	if f := s.Format; f != nil {
 		if f.TrashDays < DefaultTrashDays {
 			return fmt.Errorf("%w: format_spec.trash_days %d is below the crash-consistency floor of %d",
@@ -336,6 +348,14 @@ func (s *MountSpec) replicaSyncInterval() time.Duration {
 		return s.ReplicaSyncInterval.D()
 	}
 	return DefaultReplicaSyncInterval
+}
+
+// MemoryLimitMB is the Go heap cap in MiB.
+func (s *MountSpec) MemoryLimitMB() int {
+	if s.MemoryLimitMiB > 0 {
+		return s.MemoryLimitMiB
+	}
+	return DefaultMemoryLimitMiB
 }
 
 func (s *MountSpec) usageReportEvery() int {
