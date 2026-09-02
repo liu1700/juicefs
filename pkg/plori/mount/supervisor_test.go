@@ -260,7 +260,7 @@ func (r *fakeReplicator) order() []string {
 	defer r.mu.Unlock()
 	return append([]string(nil), r.calls...)
 }
-func (r *fakeReplicator) Restore(_ context.Context, sourcePrefix string, _ time.Time) error {
+func (r *fakeReplicator) Restore(_ context.Context, sourcePrefix string, _ RestoreOptions) error {
 	r.record("restore")
 	r.mu.Lock()
 	r.restoredFrom = sourcePrefix

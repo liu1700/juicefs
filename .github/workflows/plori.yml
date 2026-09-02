@@ -238,6 +238,14 @@ jobs:
             "$S3_ENDPOINT/$S3_BUCKET" || true
           PLORI_BIN=./juicefs.plori LITESTREAM_BIN="$RUNNER_TEMP/litestream" \
             hack/plori-mount-e2e/run.sh
+          # PLO-396: the restore-anchor invariant is a property of the pinned
+          # binary and a real SQLite database, so it runs where both exist
+          # rather than in the unit gate, which has neither. It skips itself if
+          # the sqlite3 CLI is missing.
+          LITESTREAM_BIN="$RUNNER_TEMP/litestream" CGO_ENABLED=1 \
+            go test -count=1 -tags "$(make -s plori.tags)" \
+            -run TestRestoreByTXIDMatchesTheDurablePointWhereATimestampDoesNot \
+            ./pkg/plori/mount/
 
       - name: Clean up the plori-mount lifecycle test
         if: always()

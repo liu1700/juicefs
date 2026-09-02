@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -92,6 +93,13 @@ type Litestream struct {
 	// the child inherits this process's environment unchanged, which is the
 	// environment-variable path.
 	Env func() []string
+
+	// Log is the worker's structured logger. It carries the one decision this
+	// type makes on its own — falling back from an unreachable restore TXID to
+	// the timestamp of the same durable point — because a silent fallback
+	// would be indistinguishable from the anchor having worked. Nil is silent,
+	// which is what the tests that do not assert on it want.
+	Log func(event string, kv ...any)
 
 	cmd  *exec.Cmd
 	done chan error
@@ -213,17 +221,49 @@ func (l *Litestream) writeConfig(path string, spec *MountSpec, opts MountOptions
 	return os.WriteFile(path, data, 0o600)
 }
 
-// Restore materialises the metadata database. `timestamp` is the pre-barrier
-// durable point when one is known; the zero time restores the latest
-// transaction.
+// txidPattern is `ltx.TXID.String()`: a fixed-width 16-digit hex number.
+// `litestream restore -txid` rejects anything else outright
+// (`ltx@v0.5.2/ltx.go:130-140`), and a durable point is machine-written, so a
+// value that does not match is a broken contract rather than a stale anchor.
+var txidPattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+// errTxUnreachable is what the CLI prints when the restore plan cannot reach
+// the requested transaction: the litestream error is `ErrTxNotAvailable`
+// mapped to this sentence at cmd/litestream/restore.go:147. It is the one
+// failure the TXID path recovers from — see Restore.
+const errTxUnreachable = "no matching backup files available"
+
+// Restore materialises the metadata database at the point `opt` names.
 //
-// The empty-replica probe is deliberately never combined with a timestamp.
+// Precedence is TXID, then timestamp, then the replica's latest transaction,
+// and the two anchors are never passed together — v0.5.17 refuses that
+// combination ("cannot specify index & timestamp to restore",
+// `replica.go:612`), so preferring one means not sending the other.
+//
+// The empty-replica probe is deliberately never combined with an anchor.
 // `-if-replica-exists` turns "no transaction matches" into a silent success
-// (cmd/litestream/restore.go:143-149), and a timestamp older than everything
-// in the replica produces exactly that — so combining the two would let a
-// too-old restore point look like a brand-new volume and be answered with a
-// format, which is total data loss.
-func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, timestamp time.Time) error {
+// (cmd/litestream/restore.go:143-149), and an anchor older than everything in
+// the replica produces exactly that — so combining the two would let a too-old
+// restore point look like a brand-new volume and be answered with a format,
+// which is total data loss.
+//
+// One recovery, and only one: a TXID the restore plan cannot reach falls back
+// to the timestamp of the same durable point. That is not defensive
+// scaffolding, it is a mechanism that was reproduced — compaction merges the
+// L0 files a recorded TXID was the boundary of into one file that STRADDLES
+// it, `l0-retention` (30 m) then deletes the L0 originals, and from that
+// moment `-txid` on the swallowed value fails permanently while the data is
+// still there. Without the fallback, an Agent whose last durable point was
+// mid-run and whose Pod comes back an hour later would exit 67 forever.
+// Falling back cannot overshoot the durable point (a file is included iff it
+// was encoded before `T_before`, and encoding follows every commit it
+// carries), so the worst case is an older crash-consistent image, which is
+// exactly what the unclean-generation repair already handles. The retry is
+// safe to run in place because this failure happens while the restore PLAN is
+// being calculated, before any output exists — verified: the failing run
+// leaves no database behind, so the second attempt still meets litestream's
+// "output path must not exist" precondition.
+func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, opt RestoreOptions) error {
 	if _, err := os.Stat(l.DBPath); err == nil {
 		return fmt.Errorf("refusing to restore over an existing %s", l.DBPath)
 	}
@@ -232,19 +272,21 @@ func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, timestamp
 		// replicated for this volume.
 		return ErrReplicaEmpty
 	}
+	if opt.TXID != "" && !txidPattern.MatchString(opt.TXID) {
+		return fmt.Errorf("durable point carries an unparseable replica txid %q: want 16 hex digits", opt.TXID)
+	}
 	if err := l.writeRestoreConfig(l.spec, l.opts, sourcePrefix); err != nil {
 		return err
 	}
 	defer os.Remove(l.restoreConfigPath())
-	args := []string{"restore", "-config", l.restoreConfigPath(), "-o", l.DBPath, "-integrity-check", "full"}
-	if timestamp.IsZero() {
-		args = append(args, "-if-replica-exists")
-	} else {
-		args = append(args, "-timestamp", timestamp.UTC().Format(time.RFC3339))
+
+	err := l.restoreAt(ctx, opt.TXID, opt.Timestamp)
+	if err != nil && opt.TXID != "" && !opt.Timestamp.IsZero() && strings.Contains(err.Error(), errTxUnreachable) {
+		l.logf("restore_txid_unreachable", "txid", opt.TXID, "falling_back_to", opt.Timestamp.UTC().Format(time.RFC3339Nano))
+		err = l.restoreAt(ctx, "", opt.Timestamp)
 	}
-	args = append(args, l.DBPath)
-	if out, err := l.run(ctx, args...); err != nil {
-		return fmt.Errorf("litestream restore: %w: %s", err, lastLine(out))
+	if err != nil {
+		return err
 	}
 	if _, err := os.Stat(l.DBPath); err != nil {
 		if os.IsNotExist(err) {
@@ -253,6 +295,41 @@ func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, timestamp
 		return fmt.Errorf("stat restored database: %w", err)
 	}
 	return nil
+}
+
+// restoreAt runs one `litestream restore` with at most one anchor.
+func (l *Litestream) restoreAt(ctx context.Context, txid string, timestamp time.Time) error {
+	if out, err := l.run(ctx, restoreArgs(l.restoreConfigPath(), l.DBPath, l.DBPath, txid, timestamp)...); err != nil {
+		return fmt.Errorf("litestream restore: %w: %s", err, lastLine(out))
+	}
+	return nil
+}
+
+// restoreArgs is the argv of one restore. It is a function of its own so the
+// test that runs it against the REAL pinned binary builds the same command
+// line the worker does, rather than a hand-copied one.
+//
+// `dbPath` is the positional argument, which selects WHICH database in the
+// config is being restored; `outPath` is where the bytes land. The worker
+// passes the same path for both — it restores the volume's own database into
+// its own place — and only the test needs them to differ.
+func restoreArgs(configPath, dbPath, outPath, txid string, timestamp time.Time) []string {
+	args := []string{"restore", "-config", configPath, "-o", outPath, "-integrity-check", "full"}
+	switch {
+	case txid != "":
+		args = append(args, "-txid", txid)
+	case !timestamp.IsZero():
+		// RFC3339Nano, not RFC3339: `Format(time.RFC3339)` truncates to the
+		// second, and a truncated `T_before` excludes every LTX file encoded
+		// earlier in that same second. Measured (PLO-396): the truncated form
+		// restored one row where the full-precision form and the TXID both
+		// restored two. Litestream parses either — `time.Parse(time.RFC3339,
+		// …)` accepts the fractional seconds (cmd/litestream/restore.go:88).
+		args = append(args, "-timestamp", timestamp.UTC().Format(time.RFC3339Nano))
+	default:
+		args = append(args, "-if-replica-exists")
+	}
+	return append(args, dbPath)
 }
 
 // Start launches continuous replication and waits for the control socket.
@@ -288,8 +365,19 @@ func (l *Litestream) Start(ctx context.Context) error {
 	}
 }
 
+// syncResponse is v0.5.17's `POST /sync` body (`server.go:566-571`). Both ids
+// are JSON NUMBERS on the wire — decoding `txid` into a string is a decode
+// error, which is how this field spent its whole life empty: TxID returned
+// "json: cannot unmarshal number into Go struct field", the supervisor logged
+// `replica_txid_unavailable`, and every durable point went to the
+// control-plane with no transaction id at all (PLO-396).
 type syncResponse struct {
-	TXID string `json:"txid"`
+	// TXID is the LOCAL database's position after the sync.
+	TXID uint64 `json:"txid"`
+	// ReplicatedTXID is how far the replica has actually been pushed. It is
+	// the one of the two a restore can name: an anchor the object store has
+	// never seen is unreachable by definition.
+	ReplicatedTXID uint64 `json:"replicated_txid"`
 }
 
 // SyncAndWait forces a sync and blocks until it completes — the CLI half of
@@ -304,9 +392,15 @@ func (l *Litestream) SyncAndWait(ctx context.Context) error {
 }
 
 // TxID reports the replica's current transaction id for the durable-point
-// report. A failure here is not fatal: the durable point is still meaningful
-// without it, so the caller records an empty id rather than aborting a
-// successful barrier.
+// report, in the 16-hex-digit form `litestream restore -txid` parses. A
+// failure here is not fatal: the durable point is still meaningful without it,
+// so the caller records an empty id rather than aborting a successful barrier.
+//
+// The value is the REPLICATED position, not the local one. They are equal
+// after a `wait` sync, and where they are not, the difference is precisely the
+// transactions the object store does not hold — which no restore could ever
+// reach. Zero means nothing has been replicated yet, and that is reported as
+// no id rather than as transaction zero.
 func (l *Litestream) TxID(ctx context.Context) (string, error) {
 	body, err := l.control(ctx, "/sync", map[string]any{
 		"path":    l.DBPath,
@@ -320,7 +414,10 @@ func (l *Litestream) TxID(ctx context.Context) (string, error) {
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return "", fmt.Errorf("decode sync response: %w", err)
 	}
-	return resp.TXID, nil
+	if resp.ReplicatedTXID == 0 {
+		return "", nil
+	}
+	return fmt.Sprintf("%016x", resp.ReplicatedTXID), nil
 }
 
 func (l *Litestream) control(ctx context.Context, route string, body any) ([]byte, error) {
@@ -407,6 +504,12 @@ func (l *Litestream) Abort(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("litestream did not exit after SIGKILL: %w", ctx.Err())
+	}
+}
+
+func (l *Litestream) logf(event string, kv ...any) {
+	if l.Log != nil {
+		l.Log(event, kv...)
 	}
 }
 

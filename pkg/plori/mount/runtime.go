@@ -243,11 +243,48 @@ type ControlPlane interface {
 // sequential restore into a database nothing has opened yet, and is the
 // two-SQLite-instances-in-one-process hazard for continuous replication —
 // see the note at the top of litestream.go.
+// RestoreOptions names the point in the replica's history a restore stops at.
+// Both fields come from ONE durable point — never one from each, for the
+// reason restoreOrFormat spells out — and the more precise one wins.
+//
+// The two are not interchangeable, and the difference is a measured one rather
+// than a stylistic preference (PLO-396, against the pinned litestream v0.5.17
+// and superfly/ltx v0.5.2):
+//
+//   - A TXID names a transaction. `-txid` takes every LTX file whose MaxTXID is
+//     at or below it and refuses the restore outright if the plan cannot reach
+//     it exactly (`replica.go:1532`, `:1625`), so it either lands on the
+//     recorded point or fails loudly.
+//   - A timestamp names a FILE. An LTX file carries one timestamp, stamped when
+//     the file is encoded — after every transaction inside it committed
+//     (litestream `db.go:2141`) — and `-timestamp` takes a file iff
+//     `CreatedAt < T` (`replica.go:1673`). So the last transactions before
+//     `T_before` are the ones most likely to sit in a file encoded just after
+//     it, and a timestamp restore silently drops them.
+//
+// Measured: a transaction committed, `T_before` captured, the replica synced —
+// the exact shape of runBarrier — then restored both ways from the same
+// prefix. `-txid` returned both rows; `-timestamp T_before` returned one. The
+// same restore run twice at different sub-second offsets returned different
+// databases, because whether the file was encoded before or after `T_before`
+// is a race. The TXID restore is not a race.
+type RestoreOptions struct {
+	// TXID is the replica transaction id recorded with the durable point, in
+	// `ltx.TXID.String()` form: exactly 16 lowercase hex digits, which is what
+	// `litestream restore -txid` parses (`ltx@v0.5.2/ltx.go:130`). Empty when
+	// no durable point carries one.
+	TXID string
+	// Timestamp is the pre-barrier `T_before`. It is the fallback for a
+	// durable point recorded before the fork read a TXID at all, and the zero
+	// time means "restore the replica's latest transaction".
+	Timestamp time.Time
+}
+
 type Replicator interface {
-	// Restore materialises the metadata database from `sourcePrefix`. It
-	// reports ErrReplicaEmpty when that prefix holds no generation at all,
-	// which is the first-boot signal rather than a failure.
-	Restore(ctx context.Context, sourcePrefix string, timestamp time.Time) error
+	// Restore materialises the metadata database from `sourcePrefix` at the
+	// point `opt` names. It reports ErrReplicaEmpty when that prefix holds no
+	// generation at all, which is the first-boot signal rather than a failure.
+	Restore(ctx context.Context, sourcePrefix string, opt RestoreOptions) error
 	// Start begins continuous replication and returns once the control
 	// socket answers.
 	Start(ctx context.Context) error

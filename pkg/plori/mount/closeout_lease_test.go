@@ -330,7 +330,7 @@ func (r *countingReplicator) record(op string) {
 	r.mu.Unlock()
 }
 
-func (r *countingReplicator) Restore(_ context.Context, src string, _ time.Time) error {
+func (r *countingReplicator) Restore(_ context.Context, src string, _ RestoreOptions) error {
 	r.mu.Lock()
 	r.prior = src
 	r.mu.Unlock()
