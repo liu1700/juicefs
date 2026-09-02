@@ -57,6 +57,28 @@ type tinyS3 struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	traffic []string
+	// accept, when non-empty, is the ONLY access key id this store honours.
+	// Everything else answers 403 InvalidAccessKeyId, the way a real store
+	// answers a key that has been regenerated out from under its holder. A fake
+	// that accepts any signature cannot tell a rotation from a no-op, so the
+	// negative tests set this and the hygiene test leaves it empty.
+	accept string
+}
+
+func (s *tinyS3) onlyAccept(keyID string) {
+	s.mu.Lock()
+	s.accept = keyID
+	s.mu.Unlock()
+}
+
+func (s *tinyS3) refuses(auth string) bool {
+	s.mu.Lock()
+	want := s.accept
+	s.mu.Unlock()
+	if want == "" {
+		return false
+	}
+	return !strings.Contains(auth, "Credential="+want+"/")
 }
 
 func newTinyS3(t *testing.T) *tinyS3 {
@@ -74,6 +96,13 @@ func newTinyS3(t *testing.T) *tinyS3 {
 			}
 		}
 		s.traffic = append(s.traffic, string(body))
+		s.mu.Unlock()
+		if s.refuses(r.Header.Get("Authorization")) {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `<?xml version="1.0"?><Error><Code>InvalidAccessKeyId</Code><Message>The access key id you provided does not exist in our records.</Message></Error>`)
+			return
+		}
+		s.mu.Lock()
 		switch r.Method {
 		case http.MethodPut:
 			s.objects[key] = body
@@ -129,13 +158,21 @@ func (s *tinyS3) stored() string {
 	return b.String()
 }
 
+func writeHygieneCredential(t *testing.T, path, keyID, secret string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"access_key_id":%q,"secret_access_key":%q}`, keyID, secret)
+	if err := os.WriteFile(path+".tmp", []byte(body), 0o600); err != nil {
+		t.Fatalf("write credential: %v", err)
+	}
+	if err := os.Rename(path+".tmp", path); err != nil {
+		t.Fatalf("rename credential: %v", err)
+	}
+}
+
 func hygieneSource(t *testing.T) *creds.Source {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "object-key.json")
-	body := fmt.Sprintf(`{"access_key_id":%q,"secret_access_key":%q}`, hygieneKeyID, hygieneSecret)
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatalf("write credential: %v", err)
-	}
+	writeHygieneCredential(t, path, hygieneKeyID, hygieneSecret)
 	src, err := creds.FromFile(path)
 	if err != nil {
 		t.Fatalf("FromFile: %v", err)
@@ -312,6 +349,86 @@ func TestACredentialFileErrorNeverQuotesTheFile(t *testing.T) {
 		t.Fatal("a credential file that is not a credential document must be refused")
 	}
 	assertNoCredential(t, "the refusal message", err.Error())
+}
+
+// TestAStolenOldPairIsRefusedAndTheLiveWorkerIsNot is the negative test the
+// issue asks for, run against a store that actually CHECKS the key rather than
+// a `file://` fake that accepts anything.
+//
+// It is one scenario with two halves, because only together do they mean
+// anything: after the store moves to a new pair, a holder of the old pair —
+// which is what a stolen credential is, once a rotation has happened — is
+// refused, AND the live worker, which rotated, is not. A test that showed only
+// the first would also pass if rotation were broken.
+//
+// The other negative case the issue lists, replay from another Pod, is not
+// duplicated here: it is the writer lease and the conditional-PUT fence marker,
+// and it is already proved by PLO-323's
+// mount.TestASecondHolderAtTheSameEpochNeverMounts and
+// mount.TestTheMarkerReclaimFailsClosedOnEveryUnprovenCase. Credentials have no
+// part in it — on a store with one principal they cannot.
+func TestAStolenOldPairIsRefusedAndTheLiveWorkerIsNot(t *testing.T) {
+	store := newTinyS3(t)
+	store.onlyAccept(hygieneKeyID)
+
+	path := filepath.Join(t.TempDir(), "object-key.json")
+	writeHygieneCredential(t, path, hygieneKeyID, hygieneSecret)
+	source, err := creds.FromFile(path)
+	if err != nil {
+		t.Fatalf("FromFile: %v", err)
+	}
+	object.SetS3CredentialsProvider(source.Provider())
+	t.Cleanup(func() { object.SetS3CredentialsProvider(nil) })
+
+	// A client built the way the worker builds its own: through pkg/object, off
+	// the shared provider.
+	live, err := object.CreateStorage("s3", store.srv.URL+"/plorifs", credentialSentinel, credentialSentinel, "")
+	if err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+	ctx := context.Background()
+	if err := live.Put(ctx, "before", strings.NewReader("x")); err != nil {
+		t.Fatalf("the live worker cannot reach the store before the rotation: %v", err)
+	}
+
+	// The store's key is regenerated. On Vultr that is one call and the old
+	// pair is dead from that instant — there is no overlap window (PLO-351).
+	const stolenKeyID, stolenSecret = hygieneKeyID, hygieneSecret
+	const newKeyID, newSecret = "PLORIHYGIENEKEYID002", "plori-hygiene-secret-rotated-Wr7"
+	store.onlyAccept(newKeyID)
+
+	// Half one: the old pair, held by anyone who captured it, is refused.
+	stolenSource, err := creds.Static(stolenKeyID, stolenSecret)
+	if err != nil {
+		t.Fatalf("Static: %v", err)
+	}
+	object.SetS3CredentialsProvider(stolenSource.Provider())
+	stolen, err := object.CreateStorage("s3", store.srv.URL+"/plorifs", credentialSentinel, credentialSentinel, "")
+	if err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+	err = stolen.Put(ctx, "stolen", strings.NewReader("x"))
+	if err == nil {
+		t.Fatal("the store accepted a pair it has regenerated away from")
+	}
+	if !pmount.IsCredentialRejected(err) {
+		t.Fatalf("a regenerated-away pair must classify as a credential rejection, got %v", err)
+	}
+
+	// Half two: the worker that rotated keeps working, through the SAME client
+	// object it was already using — no remount, no reconstruction.
+	object.SetS3CredentialsProvider(source.Provider())
+	writeHygieneCredential(t, path, newKeyID, newSecret)
+	rotated, err := source.Reload()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !rotated {
+		t.Fatal("the new pair was not picked up")
+	}
+	if err := live.Put(ctx, "after", strings.NewReader("x")); err != nil {
+		t.Fatalf("the live worker did not follow the rotation: %v", err)
+	}
 }
 
 func assertNoCredential(t *testing.T, surface, content string) {
