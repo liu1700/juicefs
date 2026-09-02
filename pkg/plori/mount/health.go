@@ -48,7 +48,14 @@ type Health struct {
 	UsedBytes         int64     `json:"used_bytes"`
 	UsedInodes        int64     `json:"used_inodes"`
 	GrantEpochApplied int64     `json:"grant_epoch_applied"`
-	Fenced            bool      `json:"fenced"`
+	// QuotaExhausted is true from the moment the volume ceiling refuses an
+	// operation until a larger grant epoch is applied. It is what tells an
+	// operator (and PLO-325's metrics) the difference between an Agent that is
+	// idle and one that is stuck against a ceiling the account cannot raise —
+	// which, with a grant conversation that is otherwise invisible, is
+	// otherwise indistinguishable from a healthy mount.
+	QuotaExhausted bool `json:"quota_exhausted"`
+	Fenced         bool `json:"fenced"`
 }
 
 // DurablePoint is the persisted recovery anchor.

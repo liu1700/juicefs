@@ -277,6 +277,26 @@ func (m *baseMeta) syncVolumeStat(ctx Context, used, inodes int64) error {
 	return m.en.doSyncVolumeStat(ctx, used, inodes)
 }
 
+// volumeQuotaHook, when non-nil, is called every time checkQuota refuses an
+// operation because the VOLUME ceiling (Format.Capacity / Format.Inodes) is
+// full. It is deliberately not called for the user, group and directory quotas
+// beside it: those are a different ceiling with a different remedy, and they
+// answer EDQUOT rather than ENOSPC.
+//
+// The Plori distribution installs it (plori_quota.go) so `juicefs plori-mount`
+// can ask its control-plane to grow the grant instead of leaving the Agent
+// wedged at a ceiling the account could afford to raise (PLO-324). It is a
+// function variable for the same reason writeBarrier is one: pkg/meta must not
+// grow a dependency on the mount supervisor, and the default build must behave
+// exactly as upstream does.
+var volumeQuotaHook func()
+
+func volumeQuotaTripped() {
+	if volumeQuotaHook != nil {
+		volumeQuotaHook()
+	}
+}
+
 func (m *baseMeta) checkQuota(ctx Context, space, inodes int64, uid, gid uint32, parents ...Ino) syscall.Errno {
 	if space <= 0 && inodes <= 0 {
 		return 0
@@ -290,9 +310,11 @@ func (m *baseMeta) checkQuota(ctx Context, space, inodes int64, uid, gid uint32,
 
 	format := m.getFormat()
 	if space > 0 && format.Capacity > 0 && atomic.LoadInt64(&m.usedSpace)+atomic.LoadInt64(&m.newSpace)+space > int64(format.Capacity) {
+		volumeQuotaTripped()
 		return syscall.ENOSPC
 	}
 	if inodes > 0 && format.Inodes > 0 && atomic.LoadInt64(&m.usedInodes)+atomic.LoadInt64(&m.newInodes)+inodes > int64(format.Inodes) {
+		volumeQuotaTripped()
 		return syscall.ENOSPC
 	}
 	if !format.DirStats {

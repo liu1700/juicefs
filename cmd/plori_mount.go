@@ -491,22 +491,17 @@ func (p *ploriVolume) Usage(ctx context.Context) (pmount.Usage, error) {
 	return pmount.Usage{Bytes: int64(total - avail), Inodes: int64(iused)}, nil
 }
 
-// ApplyGrant writes the new ceiling. It reloads the Format from the engine
-// rather than persisting the in-memory one, because the in-memory one has been
-// through credentialPatch and persisting it would write the bucket-wide key
-// into the database Litestream replicates.
-func (p *ploriVolume) ApplyGrant(ctx context.Context, bytes, inodes int64) error {
-	stored, err := p.m.Load(false)
-	if err != nil {
-		return fmt.Errorf("reload format: %w", err)
-	}
-	next := *stored
-	next.Capacity = uint64(max64(bytes, 0))
-	next.Inodes = uint64(max64(inodes, 0))
-	next.AccessKey, next.SecretKey, next.SessionToken = "", "", ""
-	next.KeyEncrypted = false
-	return p.m.Init(&next, false)
+// ApplyGrant writes the new ceiling into the metadata engine this process
+// already holds. The mechanism, and why it needs neither a remount nor a second
+// metadata client, is meta.PloriApplyGrant.
+func (p *ploriVolume) ApplyGrant(_ context.Context, bytes, inodes int64) error {
+	return meta.PloriApplyGrant(p.m, bytes, inodes)
 }
+
+// QuotaTrips is the engine's count of operations the volume ceiling has
+// refused. The supervisor turns a movement in it into a Grow request on the
+// next lease renewal (PLO-324).
+func (p *ploriVolume) QuotaTrips() uint64 { return meta.PloriVolumeQuotaTrips() }
 
 func (p *ploriVolume) FenceWrites() { meta.PloriFenceWrites() }
 func (p *ploriVolume) Fenced() bool { return meta.PloriWritesFenced() }
