@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	godebug "runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -74,6 +75,7 @@ machine.`,
 			&cli.StringFlag{Name: "token-file", Required: true, Usage: "projected ServiceAccount token, re-read on every call"},
 			&cli.StringFlag{Name: "credential-file", EnvVars: []string{"PLORI_OBJECT_CREDENTIAL_FILE"}, Usage: "JSON object credential, re-read while the worker runs; without it the AWS_* environment is used and the key cannot rotate"},
 			&cli.StringFlag{Name: "litestream-bin", Value: "litestream", Usage: "path to the pinned litestream binary"},
+			&cli.StringFlag{Name: "replicator", Usage: "control socket of the node-level litestream; without it this worker execs its own litestream child"},
 			&cli.StringFlag{Name: "log-format", Value: "json", Usage: "log format (json)"},
 		},
 	}
@@ -143,8 +145,33 @@ func ploriMount(c *cli.Context) error {
 		// is reported and ignored rather than refused.
 		ploriLog("mount_options_ignored", "keys", strings.Join(opts.Ignored, ","))
 	}
-	if err := ls.WriteConfig(spec, opts); err != nil {
+	// --replicator picks the topology. With a socket the metadata replica is
+	// driven by the node-level litestream the plugin runs, and this worker
+	// execs nothing continuous — one process per node at 35.5 + 0.48·N MiB
+	// instead of one per mount at 36 (PLO-366). Without it, the per-mount
+	// child path stays exactly as it was, which is what keeps a worker built
+	// from this commit runnable against a plugin that has not been rolled yet.
+	var replicator pmount.Replicator = ls
+	if socket := c.String("replicator"); socket != "" {
+		node := &pmount.NodeReplicator{SocketPath: socket, DBPath: paths.MetaPath(), Restorer: ls}
+		if err := node.Configure(spec, opts); err != nil {
+			exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
+		}
+		replicator = node
+		ploriLog("replicator_node_level", "socket", socket)
+	} else if err := ls.WriteConfig(spec, opts); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
+	}
+
+	// One process now runs the FUSE loop, so the Go heap this bounds is the
+	// mount's whole heap. GOMEMLIMIT in the environment still arrives first
+	// and bounds the runtime from process start, which SetMemoryLimit cannot
+	// do for allocations made before main(); this applies the spec's value on
+	// top so that PLORI_MOUNT_OPTIONS, the operator escape hatch, actually
+	// moves the limit (PLO-366).
+	if opts.GoMemLimitBytes > 0 {
+		godebug.SetMemoryLimit(opts.GoMemLimitBytes)
+		ploriLog("gomemlimit_applied", "bytes", opts.GoMemLimitBytes)
 	}
 
 	stop := make(chan os.Signal, 2)
@@ -157,7 +184,7 @@ func ploriMount(c *cli.Context) error {
 		Deps: pmount.Deps{
 			FS:                   &ploriFS{paths: paths, opts: opts, credentials: credentials},
 			CP:                   pmount.NewClient(c.String("control-plane-url"), paths.TokenFile, 10*time.Second),
-			Replicator:           ls,
+			Replicator:           replicator,
 			Fencer:               fencer,
 			Credentials:          credentials,
 			ControlGateInstalled: vfs.InternalMsgGateInstalled,

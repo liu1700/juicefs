@@ -81,6 +81,14 @@ const (
 	ErrCodeVolumeTrashDisabled    = "E_VOLUME_TRASH_DISABLED"
 	ErrCodeCacheDirTenantMismatch = "E_CACHE_DIR_TENANT_MISMATCH"
 	ErrCodeControlWritable        = "E_CONTROL_FILE_AGENT_WRITABLE"
+	// ErrCodeReplicationFailed reports that the metadata replica stopped
+	// receiving this database. ADR B1 makes Litestream the metadata backup,
+	// so a mount that keeps serving writes with replication off is losing
+	// every transaction since the last successful sync — silently, because
+	// the filesystem itself is fine. It carries CodeBarrierIncomplete for the
+	// same reason a missed barrier does: the lease is released cleanly and
+	// the loss is REPORTED rather than hidden (PLO-411).
+	ErrCodeReplicationFailed = "E_REPLICATION_FAILED"
 	// ErrCodeRestoredToBarrier reports that an unclean generation was
 	// recovered to its pre-barrier durable point rather than to its last
 	// write (crash-consistency.md §7 Rank 1). PLO-335 decides whether this is

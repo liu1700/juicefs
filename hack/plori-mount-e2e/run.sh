@@ -146,6 +146,26 @@ await_ready "$WORK/state" || { cat "$WORK/worker1.log"; fail "worker never repor
 python3 -c "import json;d=json.load(open('$WORK/state/ready'));assert d['epoch']==1,d" \
   || fail "ready file does not name epoch 1"
 
+# PLO-366: the FUSE loop runs IN THIS PROCESS. Upstream `juicefs mount` always
+# re-execs itself (cmd/mount_unix.go launchMount), which is where the second
+# juicefs process in the M0 footprint measurement came from; plori-mount calls
+# serveMount directly. The proof is not "one process is running" — it is that
+# the process holding the /dev/fuse connection IS the supervisor, because that
+# is what makes a SIGKILL of the supervisor a dead mount rather than a
+# restartable child.
+fuse_fds=$(ls -l "/proc/$WORKER_PID/fd" 2>/dev/null | grep -c "/dev/fuse" || true)
+[ "${fuse_fds:-0}" -ge 1 ] || fail "the supervisor pid $WORKER_PID holds no /dev/fuse descriptor: the FUSE loop is in another process"
+# The only child a worker may have on this path is its litestream. A second
+# juicefs would be the re-exec this design removed.
+for child in $(pgrep -P "$WORKER_PID" 2>/dev/null || true); do
+  child_comm=$(cat "/proc/$child/comm" 2>/dev/null || echo "")
+  case "$child_comm" in
+    litestream) ;;
+    "") ;;
+    *) fail "the worker forked a $child_comm child (pid $child); the FUSE loop must not be re-execed" ;;
+  esac
+done
+
 echo "durable-bytes-from-generation-1" > "$WORK/mnt/probe"
 mkdir -p "$WORK/mnt/dir/nested"
 head -c 1048576 /dev/urandom > "$WORK/mnt/dir/nested/blob"
@@ -225,5 +245,47 @@ for k, v in line.items():
     assert 'secret' not in k.lower(), line
     assert '${AWS_SECRET_ACCESS_KEY}' not in str(v), 'terminal line leaked the object key'
 " || fail "the terminal stderr line is not a safe typed JSON object"
+
+echo "== restart supervision: a SIGKILLed worker leaves a DEAD mount, never a half-attached one =="
+# PLO-366. JuiceFS's own supervisor used to restart a killed FUSE child. There
+# is no child any more, so the guarantee has to come from the other side: the
+# mount point must become UNMISTAKABLY dead, so the plugin's liveness check
+# (`ready` gone / ENOTCONN / the -pgid probe) fires the abnormal-exit path
+# instead of leaving an Agent writing into a filesystem nobody is serving.
+write_spec 3 "$WORK/spec3.json" "$format_uuid"
+run_worker "$WORK/spec3.json" "$WORK/mnt" "$WORK/state" "$WORK/cache" "$WORK/worker3.log"
+await_ready "$WORK/state" || { cat "$WORK/worker3.log"; fail "worker never reported ready before the kill" ; }
+cat "$WORK/mnt/probe" > /dev/null || fail "the mount does not serve before the kill"
+killed_pid="$WORKER_PID"
+kill -9 "$killed_pid"
+set +e
+wait "$killed_pid" 2>/dev/null
+set -e
+WORKER_PID=""
+for _ in $(seq 1 100); do
+  kill -0 "$killed_pid" 2>/dev/null || break
+  sleep 0.1
+done
+kill -0 "$killed_pid" 2>/dev/null && fail "the worker survived SIGKILL"
+# Nothing restarted it, and nothing may: one process per mount means the mount
+# is gone with it.
+pgrep -P "$killed_pid" >/dev/null 2>&1 && fail "a child outlived the SIGKILLed worker"
+# The mount point is detectably dead rather than silently empty. ENOTCONN is
+# what the kernel answers once the FUSE server is gone, and it is what the
+# plugin keys on; a mount that answered normally here would be the "half
+# attached" state this issue exists to rule out.
+set +e
+probe_err=$(cat "$WORK/mnt/probe" 2>&1)
+probe_rc=$?
+set -e
+[ "$probe_rc" -ne 0 ] || fail "the mount point still served reads after its only process was killed"
+case "$probe_err" in
+  *"not connected"*|*"Transport endpoint"*|*"Socket not connected"*) ;;
+  *) fail "reading a dead mount gave $probe_err, want a transport-endpoint error the plugin can classify" ;;
+esac
+# And it is still a mountpoint, so the plugin's unpublish has something to
+# detach: a kill that also unmounted would hide the failure from the guard.
+mountpoint --quiet "$WORK/mnt" || fail "the kernel dropped the mount entry; the plugin would see success"
+fusermount3 -u "$WORK/mnt" 2>/dev/null || fusermount3 -uz "$WORK/mnt" 2>/dev/null || true
 
 echo "plori-mount end-to-end lifecycle verified"

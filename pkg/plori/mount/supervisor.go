@@ -91,6 +91,15 @@ type Supervisor struct {
 	leaseTTL time.Duration
 	// backlogCap is the staging cap currently pushed down to the chunk store.
 	backlogCap int64
+	// replFailedSince is when the replication probe first failed without a
+	// success since. Zero means replication is believed healthy. It is the
+	// only state PLO-411 needs: one instant answers both "is health.json's
+	// replication_failed true" and "has this outlasted a barrier period".
+	replFailedSince time.Time
+	// replRestarted records that the one repair attempt for the current
+	// failure has been made, so a replicator that cannot be revived is not
+	// restarted every health tick until the stop trips.
+	replRestarted bool
 }
 
 func (s *Supervisor) now() time.Time {
@@ -233,7 +242,9 @@ func (s *Supervisor) start(ctx context.Context) error {
 		if err := s.Deps.Replicator.SyncAndWait(ctx); err != nil {
 			return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true, "seed replica: %s", err)
 		}
-		s.reportDurablePoint(ctx, BarrierResult{DurableAt: s.now().UTC(), BarrierAt: s.now().UTC()})
+		// The seed sync just completed, so reading the position now IS reading
+		// it at T_before: nothing has been written since (PLO-416).
+		s.reportDurablePoint(ctx, BarrierResult{DurableAt: s.now().UTC(), BarrierAt: s.now().UTC()}, s.anchorTxID(ctx))
 	}
 	// The spec's grant is authoritative; the restored replica's Format carries
 	// whatever ceiling the PREVIOUS generation persisted, which the allocator
@@ -699,6 +710,15 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 			s.writeHealth()
 
 		case <-health.C:
+			// The replication check runs on the health tick and not on its
+			// own, because health.json is where its verdict is published and
+			// because this select is the supervisor's only goroutine: a
+			// check here cannot overlap a barrier, a credential reload or a
+			// stop, which is what makes the repair safe to attempt from it
+			// (PLO-411).
+			if f := s.checkReplication(ctx); f != nil {
+				return f
+			}
 			s.writeHealth()
 
 		case <-credential.C:
@@ -757,6 +777,75 @@ func (s *Supervisor) reloadReplicatorCredentials(ctx context.Context) {
 	}
 }
 
+// checkReplication asks the replicator whether it is still replicating this
+// worker's database, repairs it once, and stops the mount if it stays dead.
+//
+// The rule is one instant, not a state machine: replFailedSince is set by the
+// first failing probe and cleared by the first succeeding one. From it come
+// both the health field the plugin republishes and the stop, which trips when
+// replication has been off for longer than a barrier period — the same window
+// the barrier itself would have exposed the failure in, had anything on that
+// path checked. Before this existed nothing did: the replicator's exit was
+// read only by Stop and Abort, so a Litestream that died on its own left a
+// mount serving writes with no metadata replica and a green health file.
+//
+// Stopping is the right answer rather than an over-reaction. ADR B1 makes
+// Litestream the metadata backup: a mount replicating nothing is accumulating
+// exactly the loss the whole design exists to bound, and it is doing it
+// invisibly. The stop is ORDERED — barrier, unmount, lease released — so the
+// Agent loses its session and nothing else, and the exit is the same
+// data-loss-reported class a missed barrier gets (69), because that is what
+// it is.
+func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
+	sup, ok := s.Deps.Replicator.(ReplicationSupervisor)
+	if !ok {
+		return nil
+	}
+	err := sup.Probe(ctx)
+	if err == nil {
+		s.mu.Lock()
+		wasFailing := !s.replFailedSince.IsZero()
+		s.replFailedSince, s.replRestarted = time.Time{}, false
+		s.mu.Unlock()
+		if wasFailing {
+			s.log("replication_recovered")
+		}
+		return nil
+	}
+
+	now := s.now()
+	s.mu.Lock()
+	if s.replFailedSince.IsZero() {
+		s.replFailedSince = now
+	}
+	since, restarted := s.replFailedSince, s.replRestarted
+	s.mu.Unlock()
+
+	failedFor := now.Sub(since)
+	if failedFor >= s.barrierInterval() {
+		s.log("replication_failed_stop", "error", err.Error(), "failed_for", failedFor.String())
+		// Write the verdict out before the stop begins: the ordered stop can
+		// take the whole write-stop margin, and an operator reading
+		// health.json during it should see why.
+		s.writeHealth()
+		return s.shutdown(ctx, ReasonReplicationFailed)
+	}
+
+	s.log("replication_probe_failed", "error", err.Error(), "failed_for", failedFor.String())
+	if restarted {
+		return nil
+	}
+	s.mu.Lock()
+	s.replRestarted = true
+	s.mu.Unlock()
+	if rerr := sup.Restart(ctx); rerr != nil {
+		s.log("replication_restart_failed", "error", rerr.Error())
+		return nil
+	}
+	s.log("replication_restarted")
+	return nil
+}
+
 func (s *Supervisor) barrierInterval() time.Duration {
 	if s.Options.BarrierInterval > 0 {
 		return s.Options.BarrierInterval
@@ -777,6 +866,9 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 	// and reported. crash-consistency.md §5: the barrier's own completion
 	// time is not a safe restore point.
 	tBefore := s.now().UTC()
+	// The anchor's txid is read HERE, at T_before, and not after the barrier
+	// (PLO-416). See anchorTxID.
+	txid := s.anchorTxID(bctx)
 	// The periodic barrier IS a drain of the live backlog, so it is the one
 	// honest measurement of how long a drain takes on this node, under this
 	// workload, right now. Sampling anything else would be a model; this is an
@@ -792,14 +884,41 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 	if res.BarrierAt.IsZero() {
 		res.BarrierAt = s.now().UTC()
 	}
-	s.reportDurablePoint(ctx, res)
+	s.reportDurablePoint(ctx, res, txid)
 }
 
-func (s *Supervisor) reportDurablePoint(ctx context.Context, res BarrierResult) {
+// anchorTxID is the replica position that goes with T_before.
+//
+// It is read BEFORE the barrier runs, and that ordering is the whole point
+// (PLO-416). The durable point promises that a restore to it lands on a tree
+// whose every block exists in the object store. A txid read AFTER the barrier
+// breaks that promise: the mount is live throughout the barrier, so a
+// transaction committed while the barrier was running is in the post-barrier
+// replica position, and the blocks it references were staged after the
+// barrier began force-queueing — the barrier never waited on them (ADR B4).
+// Until fork #47 that anchor was unusable anyway (the txid failed to decode
+// and every restore fell back to the timestamp); now that restores prefer it,
+// a post-barrier txid is an anchor pointing at blocks that may not exist.
+//
+// Reading it here is safe in the one direction that matters. `sync -wait`
+// completes before the barrier starts, so everything it captured was
+// committed before the barrier began, and the barrier force-queues everything
+// staged at its start — which is exactly that set. The anchor can therefore
+// only be at or behind the true durable frontier, never ahead of it.
+//
+// A failure is not fatal: DurableAt alone is still a usable restore point
+// (the timestamp path), so the anchor degrades to what it was before #47
+// rather than aborting a barrier that is about to make real data durable.
+func (s *Supervisor) anchorTxID(ctx context.Context) string {
 	txid, err := s.Deps.Replicator.TxID(ctx)
 	if err != nil {
 		s.log("replica_txid_unavailable", "error", err.Error())
+		return ""
 	}
+	return txid
+}
+
+func (s *Supervisor) reportDurablePoint(ctx context.Context, res BarrierResult, txid string) {
 	dp := DurablePoint{
 		Volume:      s.Spec.StorageVolumeID,
 		FenceEpoch:  s.Spec.FenceEpoch,
@@ -941,6 +1060,13 @@ const (
 	// fence marker whose body is not ours, or stale_epoch/lease_held from a
 	// renew. The epoch was taken away, so the stop uploads nothing (F-1).
 	ReasonFencedOutOfBand = "fenced_out_of_band"
+	// ReasonReplicationFailed — the metadata replica stopped receiving this
+	// database and did not come back. The stop is fully ORDERED (barrier,
+	// unmount, final sync, lease released), because everything that makes a
+	// stop safe still works: it is only the continuous replication that is
+	// gone, and the barrier + final sync are the one chance left to make the
+	// current metadata durable (PLO-411).
+	ReasonReplicationFailed = "replication_failed"
 )
 
 // fenceAndStop is the lease-loss path. `reason` decides the shape of the stop:
@@ -1026,8 +1152,14 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// so there is no new durable point to name.
 	var res BarrierResult
 	var pendingBefore uint64
+	var anchorTxID string
 	if !outOfBand {
 		tBefore := s.now().UTC()
+		// Same ordering as the periodic barrier, and here it also fixes a
+		// second-order bug: step 5 stops the replicator, so a txid read in
+		// step 6 was always read from a replicator that had already exited
+		// (PLO-416).
+		anchorTxID = s.anchorTxID(ctx)
 		pendingBefore = s.vol.PendingBlocks()
 		startedAt := s.now()
 		var err error
@@ -1093,7 +1225,7 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// durable point exists, and a usage figure for a volume somebody else owns
 	// would overwrite the successor's.
 	if incomplete == nil && !outOfBand {
-		s.reportDurablePoint(context.WithoutCancel(ctx), res)
+		s.reportDurablePoint(context.WithoutCancel(ctx), res, anchorTxID)
 		s.reportUsage(context.WithoutCancel(ctx))
 	}
 
@@ -1122,6 +1254,17 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 		return fatalf(CodeBarrierIncomplete, ErrCodeBarrierIncomplete, false,
 			"stop did not complete inside the write-stop window (%s): %s",
 			s.shortfall(budget, pendingBefore), incomplete)
+	}
+	if reason == ReasonReplicationFailed {
+		// A clean, ordered stop that is still a data-loss report: the barrier
+		// and the final sync above are the last thing this generation could
+		// do, and whatever was written between the last successful sync and
+		// them reached the replica only if the final sync worked. Same exit
+		// class as a missed barrier for the same reason — the plugin's map
+		// already routes 69 to "unpublish and surface a typed event", which
+		// is the handling this needs (PLO-411).
+		return fatalf(CodeBarrierIncomplete, ErrCodeReplicationFailed, false,
+			"metadata replication stopped and did not recover within a barrier period; stopped after a final barrier and sync")
 	}
 	// The marker is written last and only here, so its absence at the next
 	// start is exactly "the previous generation did not finish its stop".
@@ -1323,6 +1466,7 @@ func (s *Supervisor) writeHealth() {
 		QuotaExhausted:    s.quotaExhausted,
 		Fenced:            s.fenced,
 		StagingBacklogCap: s.backlogCap,
+		ReplicationFailed: !s.replFailedSince.IsZero(),
 	}
 	h.ProjectedDrainSeconds = s.drain.Project(h.PendingBlocks).Seconds()
 	h.DrainRateBlocksPerSecond = s.drain.RatePerSecond()

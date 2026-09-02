@@ -421,6 +421,16 @@ func (l *Litestream) TxID(ctx context.Context) (string, error) {
 }
 
 func (l *Litestream) control(ctx context.Context, route string, body any) ([]byte, error) {
+	return litestreamControl(ctx, l.SocketPath, route, body)
+}
+
+// litestreamControl posts one request to a Litestream control socket.
+//
+// It is a free function because two replicators speak this protocol: the
+// per-mount child on its own socket in the state directory, and the
+// node-level replicator on the socket the plugin owns (PLO-366). The only
+// thing that differs is which socket, which is the argument.
+func litestreamControl(ctx context.Context, socketPath, route string, body any) ([]byte, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
@@ -430,8 +440,15 @@ func (l *Litestream) control(ctx context.Context, route string, body any) ([]byt
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
-				return d.DialContext(ctx, "unix", l.SocketPath)
+				return d.DialContext(ctx, "unix", socketPath)
 			},
+			// One connection per call. Control calls are minutes apart (a
+			// barrier, a health tick, a stop), so pooling saves nothing, and a
+			// pooled connection to a replicator that has since restarted is a
+			// request that fails for a reason unrelated to what it asked --
+			// which, on the node-level socket the plugin restarts under us, is
+			// the failure mode this whole path exists to detect correctly.
+			DisableKeepAlives: true,
 		},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://litestream"+route, strings.NewReader(string(payload)))
@@ -454,9 +471,24 @@ func (l *Litestream) control(ctx context.Context, route string, body any) ([]byt
 		}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("litestream control %s: status %d: %s", route, resp.StatusCode, strings.TrimSpace(string(data)))
+		return nil, &controlStatusError{Route: route, Status: resp.StatusCode, Body: strings.TrimSpace(string(data))}
 	}
 	return data, nil
+}
+
+// controlStatusError is a non-200 from a control socket. The status code is
+// kept rather than folded into prose because one of them is load-bearing: a
+// 404 from the node-level replicator means it does not know this database,
+// which is what a daemon restart looks like from a worker that is still
+// running, and it is repaired by re-registering rather than by giving up.
+type controlStatusError struct {
+	Route  string
+	Status int
+	Body   string
+}
+
+func (e *controlStatusError) Error() string {
+	return fmt.Sprintf("litestream control %s: status %d: %s", e.Route, e.Status, e.Body)
 }
 
 // Stop asks for a graceful shutdown — one SIGTERM, which makes `replicate`
@@ -511,6 +543,57 @@ func (l *Litestream) logf(event string, kv ...any) {
 	if l.Log != nil {
 		l.Log(event, kv...)
 	}
+}
+
+// Probe reports whether this child is still replicating (PLO-411).
+//
+// It answers two different deaths with one call. The cheap one is the process
+// itself: `done` is buffered and written by the reaper goroutine, so a
+// non-blocking read of it sees an exit that nothing else in this process was
+// watching — before PLO-411 that channel was read only by Stop and Abort, so
+// a Litestream that died on its own was noticed by nobody. The other is a
+// process that is alive but no longer serving, which only a round trip
+// finds; `/sync` without `wait` is the cheapest one Litestream has, because
+// it does the WAL-to-LTX step and leaves the upload to the replica monitor
+// (store.go:428-431).
+func (l *Litestream) Probe(ctx context.Context) error {
+	if l.cmd == nil || l.done == nil {
+		return errors.New("litestream is not running")
+	}
+	select {
+	case err := <-l.done:
+		l.done = nil
+		if err == nil {
+			return errors.New("litestream exited on its own with status 0")
+		}
+		return fmt.Errorf("litestream exited on its own: %w", err)
+	default:
+	}
+	probe, cancel := context.WithTimeout(ctx, ProbeTimeout)
+	defer cancel()
+	_, err := l.control(probe, "/sync", map[string]any{"path": l.DBPath, "wait": false})
+	return err
+}
+
+// Restart reaps whatever is left of the child and starts a new one.
+//
+// A restarted Litestream costs nothing that a crash would not already have
+// cost: its position is on disk in the state directory, not in the process,
+// so it compares local state against the replica and continues. The reap is
+// unconditional because starting a second replicator on one database is the
+// one outcome worse than a lagging replica.
+func (l *Litestream) Restart(ctx context.Context) error {
+	if l.cmd != nil && l.done != nil {
+		_ = l.cmd.Process.Kill()
+		select {
+		case <-l.done:
+		case <-ctx.Done():
+			return fmt.Errorf("previous litestream did not exit, so a new one was NOT started: %w", ctx.Err())
+		}
+		l.done = nil
+	}
+	l.cmd = nil
+	return l.Start(ctx)
 }
 
 func (l *Litestream) run(ctx context.Context, args ...string) (string, error) {
