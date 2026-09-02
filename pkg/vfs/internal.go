@@ -322,7 +322,27 @@ type chunkObj struct {
 	Size, Off, Len uint32
 }
 
+// internalMsgGate, when non-nil, is consulted before ANY .control command is
+// dispatched and may refuse it with an errno. It is nil in every upstream
+// build, so the switch below behaves exactly as before; a distribution that
+// exposes the mount to an untrusted uid installs one (see internal_plori.go).
+//
+// It exists because the per-command uid check in `case meta.RemoteDurability`
+// protects one command out of the set: the rest of .control is reachable by
+// whoever can open the file.
+var internalMsgGate func(ctx meta.Context, cmd uint32) syscall.Errno
+
+// InternalMsgGateInstalled reports whether a gate is present, so a caller that
+// requires one can refuse to start rather than discover its absence at runtime.
+func InternalMsgGateInstalled() bool { return internalMsgGate != nil }
+
 func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
+	if internalMsgGate != nil {
+		if eno := internalMsgGate(ctx, cmd); eno != 0 {
+			_, _ = out.Write([]byte{byte(eno & 0xff)})
+			return
+		}
+	}
 	switch cmd {
 	case meta.RemoteDurability:
 		if ctx.Uid() != 0 && ctx.Uid() != uint32(utils.GetCurrentUID()) {

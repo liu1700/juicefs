@@ -174,6 +174,8 @@ func Main(args []string) error {
 	if runtime.GOOS == "windows" {
 		app.Commands = append(app.Commands, cmdPrintSID())
 	}
+	// Distribution-specific commands. Empty in every upstream build.
+	app.Commands = append(app.Commands, extraCommands()...)
 
 	if calledViaMount(args) {
 		var err error
