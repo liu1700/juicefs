@@ -4,6 +4,7 @@
 package mount
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -178,5 +179,33 @@ func TestNoLocalDatabaseIsNotAVerdict(t *testing.T) {
 	}
 	if verdict != localDBAbsent {
 		t.Fatalf("verdict = %s, want %s", verdict, localDBAbsent)
+	}
+}
+
+// The same stale-state-dir family as PLO-422: `ready` and `health.json` outlive
+// the Pod on a host path, and a stale `ready` makes the plugin's readiness poll
+// return before this generation's mount exists. Found by the e2e's second mount
+// on one state directory, where `await_ready` returned instantly on generation
+// 1's file.
+func TestStartClearsThePreviousGenerationsLivenessFiles(t *testing.T) {
+	p := stateWithDatabase(t)
+	for _, stale := range []string{p.ReadyPath(), p.HealthPath()} {
+		if err := os.WriteFile(stale, []byte(`{"epoch":1}`), 0o600); err != nil {
+			t.Fatalf("stage %s: %v", stale, err)
+		}
+	}
+	sup := &Supervisor{
+		Spec:  testSpec(),
+		Paths: p,
+		Deps:  Deps{FS: &fakeFS{vol: healthyVolume()}, CP: &fakeCP{}, Replicator: &fakeReplicator{}, Fencer: &fakeFencer{err: ErrFenceMarkerHeld}},
+	}
+	// Startup gets as far as the fence claim and then refuses; by then the two
+	// files must already be gone, because everything after this point can be
+	// read by the plugin.
+	_ = sup.start(context.Background())
+	for _, stale := range []string{p.ReadyPath(), p.HealthPath()} {
+		if _, err := os.Stat(stale); !os.IsNotExist(err) {
+			t.Errorf("%s survived startup; the plugin would read the previous generation's liveness as this one's", stale)
+		}
 	}
 }

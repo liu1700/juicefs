@@ -171,6 +171,20 @@ func (s *Supervisor) start(ctx context.Context) error {
 	if err := os.MkdirAll(s.Paths.CacheDir, 0o700); err != nil {
 		return fatalf(CodeRefused, ErrCodeRestoreFailed, false, "create cache dir: %s", err)
 	}
+	// The previous generation's liveness files go NOW, before anything can be
+	// mistaken for this one's. The state directory is a host path that outlives
+	// the Pod, and `ready` means "this worker is serving the mount" — a stale
+	// one means the plugin's readiness poll returns before the mount exists,
+	// and a stale `health.json` means its staleness watchdog reads a file
+	// nobody is writing. In production the plugin removes both; on any other
+	// path (a crash-restart the plugin adopted, the e2e, an operator) nothing
+	// did, which is the same stale-state-dir family as PLO-422. The worker owns
+	// the files it writes, so it owns clearing them.
+	for _, stale := range []string{s.Paths.ReadyPath(), s.Paths.HealthPath()} {
+		if err := os.Remove(stale); err != nil && !os.IsNotExist(err) {
+			return fatalf(CodeRefused, ErrCodeRestoreFailed, false, "clear %s from the previous generation: %s", stale, err)
+		}
+	}
 
 	// The fence marker is the store-side proof of epoch ownership and must be
 	// claimed BEFORE the first LTX upload, so it goes first — before restore,
