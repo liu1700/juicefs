@@ -453,18 +453,30 @@ func (l *Litestream) ReloadCredentials(ctx context.Context) error {
 	stop, cancel := context.WithTimeout(ctx, 20*time.Second)
 	stopErr := l.Stop(stop)
 	cancel()
-	if stopErr != nil {
-		// Stop's own shutdown sync is signing with the same dead key, so a
-		// timeout here is the expected case rather than an anomaly. Kill it:
-		// leaving the old child alive would put two replicators on one
-		// database.
+	if l.done != nil {
+		// Stop returned without reaping — it could not even signal the child,
+		// which usually means the child had already exited on its own. Reap it
+		// if so; that is the whole of what is left to do.
+		select {
+		case <-l.done:
+			l.done = nil
+		default:
+		}
+	}
+	if l.done != nil {
+		// Still alive and Stop could not end it. Kill it: starting a second
+		// replicator on one database is the one outcome worse than a lagging
+		// replica. (Stop's own timeout branch already kills and reaps, so this
+		// path is narrow.)
 		abort, cancelAbort := context.WithTimeout(ctx, 10*time.Second)
 		abortErr := l.Abort(abort)
 		cancelAbort()
-		if abortErr != nil {
-			return fmt.Errorf("stop litestream for credential reload: %w (kill: %v)", stopErr, abortErr)
+		if l.done != nil {
+			return fmt.Errorf("could not stop litestream for a credential reload, so it was NOT restarted: %w (kill: %v)", stopErr, abortErr)
 		}
 	}
+	// Reached only with the previous child reaped, which is the invariant that
+	// keeps two SQLite writers off one database.
 	if err := l.Start(ctx); err != nil {
 		return fmt.Errorf("restart litestream after credential reload: %w (final sync: %v)", err, syncErr)
 	}
