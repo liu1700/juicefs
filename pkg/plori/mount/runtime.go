@@ -97,9 +97,28 @@ type RepairReport struct {
 }
 
 // Usage is the volume's consumption as the metadata engine sees it.
+//
+// TrashBytes/TrashInodes are the part of Bytes/Inodes that a deleted file is still
+// holding — a SUBSET of the total, never something to add to it. With `trash-days >= 1`
+// an unlink is a rename into `.trash`, so the bytes stay inside the counter the volume
+// ceiling is enforced against; the panel's own soft-delete into `/.plori-trash` is a
+// rename too. Both are measured together, because to a user "the trash" is one thing
+// and emptying it empties both (meta.PloriMeasureTrash).
+//
+// The breakdown is optional and the flags say why. A report may carry `used_bytes` with
+// no trash number at all, and the product then says nothing about the trash rather than
+// guessing at it.
 type Usage struct {
 	Bytes  int64
 	Inodes int64
+	// TrashKnown is false when the trash walk failed. The two numbers below are then
+	// meaningless and are not reported.
+	TrashKnown  bool
+	TrashBytes  int64
+	TrashInodes int64
+	// TrashPartial is true when the walk hit its entry budget: the numbers are a floor,
+	// not an amount, so nothing may present them as "this much would be freed".
+	TrashPartial bool
 }
 
 // FS is the JuiceFS half of the supervisor. cmd/plori_mount.go implements it;
