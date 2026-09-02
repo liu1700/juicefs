@@ -115,7 +115,13 @@ PY
 }
 
 run_worker() {
+  # The plugin removes `ready` and `health.json` before it starts a worker, and
+  # this harness has to as well. The worker clears them too, but it cannot do so
+  # before it exists: a readiness poll that races the spawn would otherwise see
+  # the PREVIOUS generation's file and call the mount up before this one has run
+  # a line (found by the PLO-422 sections below).
   local spec=$1 mnt=$2 state=$3 cache=$4 logfile=$5
+  rm -f "$state/ready" "$state/health.json"
   "$PLORI_BIN" plori-mount \
     --spec-file "$spec" \
     --mount-point "$mnt" \
