@@ -155,8 +155,16 @@ type ControlPlane interface {
 	AckGrant(ctx context.Context, volumeID string, epoch, grantEpoch int64) error
 }
 
-// Replicator is the metadata-replica half: Litestream, driven as a child
-// process (see litestream.go for why exec beats the library here).
+// Replicator is the metadata-replica half.
+//
+// PLO-320's `pkg/plori/restore` is the intended implementation: it owns
+// restore, verification, restore-time missing-block repair and the Litestream
+// retention/compaction settings. This interface is the seam it plugs into, and
+// litestream.go is the implementation until it lands. One caveat to reconcile
+// at merge: that package uses the Litestream LIBRARY, which is safe for a
+// sequential restore into a database nothing has opened yet, and is the
+// two-SQLite-instances-in-one-process hazard for continuous replication —
+// see the note at the top of litestream.go.
 type Replicator interface {
 	// Restore materialises the metadata database from `sourcePrefix`. It
 	// reports ErrReplicaEmpty when that prefix holds no generation at all,
