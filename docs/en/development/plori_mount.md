@@ -94,8 +94,14 @@ Pod event without leaking anything.
 2. Claim the epoch's fence marker with `If-None-Match: *`. This happens before
    the restore and before any LTX object is written, so a second writer that
    somehow reached the epoch fails its own first write. A 412 is exit 66.
-3. Restore the metadata replica with Litestream. An empty replica means "new
-   volume" only on migration generation 1, in state `formatted` or
+3. Find the generation to restore from and restore it with Litestream. The
+   metadata root is partitioned per writer epoch, so this epoch's own prefix is
+   empty by construction: the worker lists `agents-meta/<vid>/`, takes the
+   newest `g<N>/` below its own epoch that holds more than a fence marker, and
+   restores from that while replicating forward into its own. A prefix holding
+   only `fence` is a writer that claimed an epoch and died before replicating,
+   and is not a restorable generation. An empty result means "new volume" only
+   on migration generation 1, in state `formatted` or
    `allocating`, with no format UUID recorded by the control-plane. Anywhere
    else an empty replica means the replica was lost, and formatting there would
    replace a filesystem with an empty one.

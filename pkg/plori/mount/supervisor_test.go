@@ -162,10 +162,11 @@ func (c *fakeCP) AckGrant(context.Context, string, int64, int64) error {
 }
 
 type fakeReplicator struct {
-	mu         sync.Mutex
-	calls      []string
-	restoreErr error
-	syncErr    error
+	mu           sync.Mutex
+	calls        []string
+	restoreErr   error
+	syncErr      error
+	restoredFrom string
 }
 
 func (r *fakeReplicator) record(n string) { r.mu.Lock(); r.calls = append(r.calls, n); r.mu.Unlock() }
@@ -174,8 +175,11 @@ func (r *fakeReplicator) order() []string {
 	defer r.mu.Unlock()
 	return append([]string(nil), r.calls...)
 }
-func (r *fakeReplicator) Restore(context.Context, time.Time) error {
+func (r *fakeReplicator) Restore(_ context.Context, sourcePrefix string, _ time.Time) error {
 	r.record("restore")
+	r.mu.Lock()
+	r.restoredFrom = sourcePrefix
+	r.mu.Unlock()
 	return r.restoreErr
 }
 func (r *fakeReplicator) Start(context.Context) error       { r.record("start"); return nil }
@@ -185,9 +189,18 @@ func (r *fakeReplicator) TxID(context.Context) (string, error) {
 }
 func (r *fakeReplicator) Stop(context.Context) error { r.record("stop"); return nil }
 
-type fakeFencer struct{ err error }
+type fakeFencer struct {
+	err   error
+	prior string
+}
 
 func (f *fakeFencer) Claim(context.Context, string, []byte) error { return f.err }
+func (f *fakeFencer) PriorMetaPrefix(_ context.Context, root string, epoch int64) (string, error) {
+	if f.prior != "" {
+		return f.prior, nil
+	}
+	return "", nil
+}
 
 // ------------------------------------------------------------------ setup ---
 
@@ -517,4 +530,53 @@ func join(s []string) string {
 		out += v
 	}
 	return out + "]"
+}
+
+// The metadata root is partitioned per writer epoch, so this epoch's prefix is
+// empty by construction: restoring from it would look like a brand new volume
+// and be answered with a format. The source has to be the previous
+// generation's prefix. This is the failure the end-to-end run found.
+func TestRestoreReadsThePreviousGenerationsPrefix(t *testing.T) {
+	spec := testSpec()
+	spec.FenceEpoch = 4
+	spec.MetaPrefix = "agents-meta/550e8400-e29b-41d4-a716-446655440000/g4/"
+	spec.FenceMarkerKey = spec.MetaPrefix + "fence"
+	prior := "agents-meta/550e8400-e29b-41d4-a716-446655440000/g3/"
+
+	rep := &fakeReplicator{}
+	fs := &fakeFS{vol: healthyVolume()}
+	sup := newSup(t, spec, fs, &fakeCP{}, rep, &fakeFencer{prior: prior})
+	stop := make(chan os.Signal, 1)
+	stop <- syscall.SIGTERM
+	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
+		t.Fatalf("exit = %d: %v", got.Exit, got.Err)
+	}
+	if rep.restoredFrom != prior {
+		t.Errorf("restored from %q, want the previous generation %q", rep.restoredFrom, prior)
+	}
+	if fs.formatted {
+		t.Error("a volume with a previous generation must never be formatted")
+	}
+	if got, want := spec.MetaRoot(), "agents-meta/550e8400-e29b-41d4-a716-446655440000/"; got != want {
+		t.Errorf("MetaRoot() = %q, want %q", got, want)
+	}
+}
+
+func TestPriorPrefixCandidatesAreNewestFirstAndBelowTheEpoch(t *testing.T) {
+	root := "agents-meta/v1/"
+	got := priorPrefixCandidates([]string{
+		root + "g1/", root + "g10/", root + "g2/", root + "g11/", root + "gnope/", "elsewhere/g9/",
+	}, root, 11)
+	want := []string{root + "g10/", root + "g2/", root + "g1/"}
+	if len(got) != len(want) {
+		t.Fatalf("candidates = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("candidates = %v, want %v", got, want)
+		}
+	}
+	if len(priorPrefixCandidates([]string{root + "g1/"}, root, 1)) != 0 {
+		t.Error("a writer must never restore from its own or a later epoch")
+	}
 }

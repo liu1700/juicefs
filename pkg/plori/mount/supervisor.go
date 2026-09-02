@@ -221,7 +221,20 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	unclean := !fileExists(s.Paths.CleanStopPath())
 	_ = os.Remove(s.Paths.CleanStopPath())
 
-	err := s.Deps.Replicator.Restore(ctx, anchor)
+	// The metadata root is partitioned per writer epoch, so this epoch's own
+	// prefix is empty by construction and the bytes live under the previous
+	// one. The MountSpec names only the current prefix, so the source is
+	// discovered from the store; MetaRoot() is the parent both share.
+	source, err := s.Deps.Fencer.PriorMetaPrefix(ctx, s.Spec.MetaRoot(), s.Spec.FenceEpoch)
+	if err != nil {
+		return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true,
+			"find the metadata generation to restore from: %s", err)
+	}
+	if source != "" {
+		s.log("restore_source", "prefix", source)
+	}
+
+	err = s.Deps.Replicator.Restore(ctx, source, anchor)
 	switch {
 	case err == nil:
 		if unclean {

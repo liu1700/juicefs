@@ -87,6 +87,9 @@ type Litestream struct {
 
 	cmd  *exec.Cmd
 	done chan error
+
+	spec *MountSpec
+	opts MountOptions
 }
 
 // ErrReplicaEmpty means the metadata prefix holds no restorable generation.
@@ -151,6 +154,21 @@ const (
 // environment, which keeps the one bucket-wide key off disk (threat-model
 // F-11: a config file is one more place a debug dump can read it from).
 func (l *Litestream) WriteConfig(spec *MountSpec, opts MountOptions) error {
+	return l.writeConfig(l.ConfigPath, spec, opts, strings.TrimSuffix(spec.MetaPrefix, "/"))
+}
+
+// writeRestoreConfig points the same database at a DIFFERENT prefix, the one
+// the previous generation replicated into. Two files rather than one mutated
+// file, so the replicating child is never a moment away from writing into the
+// prefix it is only supposed to read.
+func (l *Litestream) writeRestoreConfig(spec *MountSpec, opts MountOptions, sourcePrefix string) error {
+	return l.writeConfig(l.restoreConfigPath(), spec, opts, strings.TrimSuffix(sourcePrefix, "/"))
+}
+
+func (l *Litestream) restoreConfigPath() string { return l.ConfigPath + ".restore" }
+
+func (l *Litestream) writeConfig(path string, spec *MountSpec, opts MountOptions, replicaPrefix string) error {
+	l.spec, l.opts = spec, opts
 	var cfg litestreamConfig
 	cfg.Socket.Enabled = true
 	cfg.Socket.Path = l.SocketPath
@@ -170,7 +188,7 @@ func (l *Litestream) WriteConfig(spec *MountSpec, opts MountOptions) error {
 		Replica: litestreamReplicaC{
 			Type:           "s3",
 			Bucket:         spec.ObjectStore.Bucket,
-			Path:           strings.TrimSuffix(spec.MetaPrefix, "/"),
+			Path:           replicaPrefix,
 			Endpoint:       spec.ObjectStore.Endpoint,
 			Region:         spec.ObjectStore.Region,
 			ForcePathStyle: true,
@@ -181,10 +199,10 @@ func (l *Litestream) WriteConfig(spec *MountSpec, opts MountOptions) error {
 	if err != nil {
 		return fmt.Errorf("render litestream config: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(l.ConfigPath), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create litestream config dir: %w", err)
 	}
-	return os.WriteFile(l.ConfigPath, data, 0o600)
+	return os.WriteFile(path, data, 0o600)
 }
 
 // Restore materialises the metadata database. `timestamp` is the pre-barrier
@@ -197,11 +215,20 @@ func (l *Litestream) WriteConfig(spec *MountSpec, opts MountOptions) error {
 // in the replica produces exactly that — so combining the two would let a
 // too-old restore point look like a brand-new volume and be answered with a
 // format, which is total data loss.
-func (l *Litestream) Restore(ctx context.Context, timestamp time.Time) error {
+func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, timestamp time.Time) error {
 	if _, err := os.Stat(l.DBPath); err == nil {
 		return fmt.Errorf("refusing to restore over an existing %s", l.DBPath)
 	}
-	args := []string{"restore", "-config", l.ConfigPath, "-o", l.DBPath, "-integrity-check", "full"}
+	if sourcePrefix == "" {
+		// No populated generation below this epoch: nothing has ever been
+		// replicated for this volume.
+		return ErrReplicaEmpty
+	}
+	if err := l.writeRestoreConfig(l.spec, l.opts, sourcePrefix); err != nil {
+		return err
+	}
+	defer os.Remove(l.restoreConfigPath())
+	args := []string{"restore", "-config", l.restoreConfigPath(), "-o", l.DBPath, "-integrity-check", "full"}
 	if timestamp.IsZero() {
 		args = append(args, "-if-replica-exists")
 	} else {

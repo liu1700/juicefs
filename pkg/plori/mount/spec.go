@@ -277,6 +277,18 @@ func validPrefix(name, prefix string) error {
 // it so it cannot drift.
 func (s *MountSpec) VolumeName() string { return strings.TrimSuffix(s.DataPrefix, "/") }
 
+// MetaRoot is the volume's whole metadata subtree, the parent every writer
+// generation's prefix hangs under. It is derived from the epoch-partitioned
+// prefix the control-plane issued rather than carried separately, so the two
+// cannot drift.
+func (s *MountSpec) MetaRoot() string {
+	trimmed := strings.TrimSuffix(s.MetaPrefix, "/")
+	if i := strings.LastIndex(trimmed, "/"); i >= 0 {
+		return trimmed[:i+1]
+	}
+	return trimmed
+}
+
 // EffectiveFormat is what a first-boot format uses. When the control-plane
 // omits `format_spec` (PLO-330 has not shipped it yet) the worker derives the
 // contract from the rest of the spec and the crash-consistency floor rather

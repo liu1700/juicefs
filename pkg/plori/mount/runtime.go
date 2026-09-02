@@ -158,10 +158,10 @@ type ControlPlane interface {
 // Replicator is the metadata-replica half: Litestream, driven as a child
 // process (see litestream.go for why exec beats the library here).
 type Replicator interface {
-	// Restore materialises the metadata database from the replica. It reports
-	// ErrReplicaEmpty when the prefix holds no generation at all, which is
-	// the first-boot signal rather than a failure.
-	Restore(ctx context.Context, timestamp time.Time) error
+	// Restore materialises the metadata database from `sourcePrefix`. It
+	// reports ErrReplicaEmpty when that prefix holds no generation at all,
+	// which is the first-boot signal rather than a failure.
+	Restore(ctx context.Context, sourcePrefix string, timestamp time.Time) error
 	// Start begins continuous replication and returns once the control
 	// socket answers.
 	Start(ctx context.Context) error
@@ -181,4 +181,10 @@ type Fencer interface {
 	// ErrFenceMarkerHeld when the store answers 412, which means another
 	// writer reached this epoch.
 	Claim(ctx context.Context, key string, body []byte) error
+	// PriorMetaPrefix returns the newest populated metadata prefix under root
+	// whose epoch is below the given one, or "" when there is none. The
+	// metadata root is partitioned per writer epoch, so a new epoch always
+	// starts with an empty prefix of its own and has to restore from the one
+	// before it.
+	PriorMetaPrefix(ctx context.Context, root string, epoch int64) (string, error)
 }
