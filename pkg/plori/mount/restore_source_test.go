@@ -163,6 +163,65 @@ func TestRestoreSourceFallsBackToTheListing(t *testing.T) {
 	}
 }
 
+// TestALocalDurablePointTheServerNeverHeardAboutWinsWhole covers the state
+// reportDurablePoint deliberately creates: the local file is written BEFORE the
+// report is posted, so a generation that barriers and then loses the network
+// leaves this node knowing a newer durable point than the control-plane does.
+//
+// Both halves must then come from the local point. Taking its anchor with the
+// server's prefix would restore the OLDER epoch's replica up to an instant the
+// newer epoch established, silently dropping everything the newer one wrote —
+// worse than either source used alone.
+func TestALocalDurablePointTheServerNeverHeardAboutWinsWhole(t *testing.T) {
+	spec := testSpec()
+	spec.FenceEpoch = 7
+	spec.MetaPrefix = testVolumeRoot + "g7/"
+	spec.FenceMarkerKey = spec.MetaPrefix + "fence"
+	// The server's last word is epoch 4.
+	spec.RestoreFromPrefix = testVolumeRoot + "g4/"
+	spec.DurablePoint = &DurablePointSpec{
+		DurableAt: time.Date(2026, 9, 2, 11, 0, 0, 0, time.UTC), FenceEpoch: 4,
+	}
+	if err := spec.Validate(); err != nil {
+		t.Fatalf("spec: %v", err)
+	}
+
+	rep := &restoreRecorder{}
+	fencer := &countingFencer{}
+	sup := newSup(t, spec, &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, fencer)
+	sup.Deps.Replicator = rep
+
+	// Epoch 6 ran here, barriered, and never got its report through.
+	local := time.Date(2026, 9, 2, 11, 45, 0, 0, time.UTC)
+	if err := os.MkdirAll(sup.Paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(sup.Paths.DurablePointPath(), DurablePoint{
+		Volume: spec.StorageVolumeID, FenceEpoch: 6, DurableAt: local,
+		BarrierAt: local.Add(time.Second), ReplicaTxID: "0000000000000077",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan os.Signal, 1)
+	stop <- syscall.SIGTERM
+	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
+		t.Fatalf("exit = %d: %v", got.Exit, got.Err)
+	}
+
+	prefix, anchor := rep.result()
+	if want := testVolumeRoot + "g6/"; prefix != want {
+		t.Errorf("restored from %q, want the local point's %q — the server's g4/ would drop epoch 6's writes",
+			prefix, want)
+	}
+	if !anchor.Equal(local) {
+		t.Errorf("restore anchor = %s, want the local point's %s", anchor, local)
+	}
+	if n := fencer.lists(); n != 0 {
+		t.Errorf("listed the metadata root %d times although a durable point was known", n)
+	}
+}
+
 // TestHalfARestoreInstructionIsRefused pins the fail-closed rule the two fields
 // exist under. PLO-373 declined to ship `durable_point` without
 // `restore_from_prefix` because half the instruction is worse than none; the

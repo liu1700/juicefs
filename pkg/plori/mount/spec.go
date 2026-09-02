@@ -329,16 +329,20 @@ func (s *MountSpec) validateRestoreInstruction() error {
 	// The prefix must name the epoch inside the point. Two spellings of one
 	// fact is a spelling too many; if they disagree the restore would read one
 	// epoch's replica and stop at another epoch's transaction.
-	if want := s.MetaRoot() + epochSegment(dp.FenceEpoch) + "/"; s.RestoreFromPrefix != want {
+	if want := s.MetaPrefixForEpoch(dp.FenceEpoch); s.RestoreFromPrefix != want {
 		return fmt.Errorf("%w: restore_from_prefix %q does not name durable_point.fence_epoch %d (expected %q)",
 			ErrSpec, s.RestoreFromPrefix, dp.FenceEpoch, want)
 	}
 	return nil
 }
 
-// epochSegment is the metadata prefix's per-epoch path segment, the same
-// spelling the control-plane composes (storagevol/prefix.go epochSegment).
-func epochSegment(epoch int64) string { return fmt.Sprintf("g%d", epoch) }
+// MetaPrefixForEpoch is where the writer holding `epoch` replicates this
+// volume's metadata: the same composition the control-plane performs
+// (storagevol/prefix.go MetaPrefix). One spelling, derived from MetaRoot so it
+// cannot drift from the prefix this writer was issued.
+func (s *MountSpec) MetaPrefixForEpoch(epoch int64) string {
+	return fmt.Sprintf("%sg%d/", s.MetaRoot(), epoch)
+}
 
 func validPrefix(name, prefix string) error {
 	if prefix == "" {
