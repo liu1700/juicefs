@@ -36,6 +36,40 @@ The plugin passes exactly `PATH`, `GOMEMLIMIT`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY` and optionally `PLORI_MOUNT_OPTIONS`. Missing object
 credentials are exit 68.
 
+## The MountSpec
+
+The spec file is the control-plane's `storagespec.MountSpec`, decoded verbatim
+with `DisallowUnknownFields`. The types live in `pkg/plori/mountspec`, which is
+the one package under `pkg/plori/` with **no** `plori` build tag: a wire
+contract is plain data, and the other end of it has to be able to decode it
+without inheriting the release profile. `pkg/plori/mount` re-exports the names
+(`MountSpec`, `LoadSpec`, …) as aliases, so the supervisor reads the same as
+before. The control-plane is the authority on that wire;
+`mountspec.MountSpec` is a copy of it, and the copy is checked by decoding
+the control-plane's own generated golden
+(`services/control-plane/internal/storagespec/testdata/*.golden.json`) in
+plori-runtime's `services/storage-worker`. Two ends built from prose drifted
+once already: the worker decoded `format_spec` with four fields while the server
+sent `format` with nine, so every real spec was refused with exit 64 and no test
+on either side could see it (PLO-395).
+
+Two fields drive the first boot:
+
+| field | meaning |
+|---|---|
+| `format` | everything `juicefs format` needs for this volume: `volume_id`, `bucket` (`<endpoint>/<bucket>`, no deeper), `data_prefix`, `meta_prefix` (the metadata ROOT, not this writer's epoch inside it), `trash_days`, `capacity_bytes`, `inodes`, `grant_epoch`, `expected_uuid` |
+| `may_format` | the authorisation to run `juicefs format`, true exactly when the volume has never been formatted |
+
+`may_format` is a field rather than an inference from an empty `expected_uuid`
+because an authorisation both sides infer from the absence of a value is one a
+future rename silently grants. Every other value in `format` is also spelled
+elsewhere in the spec, so the worker refuses (exit 64) a spec whose two
+spellings disagree — a `format.bucket` that is not the spec's own object store
+would format one bucket and replicate to another. Block size, compression and
+the storage driver are constants of the Plori profile (`FormatBlockSizeKB`,
+`FormatStorage`), not wire fields: a field the server never sends is one the two
+sides can disagree about for free.
+
 ## Mount options
 
 `mount_options` is a closed vocabulary, not a list of `juicefs` flags. The two
@@ -101,10 +135,10 @@ Pod event without leaking anything.
    restores from that while replicating forward into its own. A prefix holding
    only `fence` is a writer that claimed an epoch and died before replicating,
    and is not a restorable generation. An empty result means "new volume" only
-   on migration generation 1, in state `formatted` or
-   `allocating`, with no format UUID recorded by the control-plane. Anywhere
-   else an empty replica means the replica was lost, and formatting there would
-   replace a filesystem with an empty one.
+   on migration generation 1, in state `formatted` or `allocating`, and only
+   when the spec's `may_format` grants it. Anywhere else an empty replica means
+   the replica was lost, and formatting there would replace a filesystem with an
+   empty one.
 4. Run `PRAGMA integrity_check` on the restored database. Litestream's own
    restore-time check proves the LTX chain replays; this proves the page image
    it produced is intact.
