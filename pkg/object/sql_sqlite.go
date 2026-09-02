@@ -1,5 +1,5 @@
-//go:build !nosqlite
-// +build !nosqlite
+//go:build !nosqlite && !plori
+// +build !nosqlite,!plori
 
 /*
  * JuiceFS, Copyright 2022 Juicedata, Inc.
@@ -17,6 +17,12 @@
  * limitations under the License.
  */
 
+// The plori profile supports SQLite as a *metadata* engine (PLO-319) but keeps
+// remote object storage S3-only, so it must not also register SQLite as an
+// object store: that is a separate backend with its own surface, and the
+// audited support policy lists `s3` alone. The `!plori` tag removes only this
+// registration. `database/sql` still has the sqlite3 driver, because
+// pkg/meta/sql_sqlite.go imports it for the metadata engine.
 package object
 
 import (

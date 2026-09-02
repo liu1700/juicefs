@@ -35,7 +35,11 @@ func main() {
 	}
 
 	require("metadata", "redis", meta.IsSupported("redis"), true)
-	for _, name := range []string{"mysql", "postgres", "sqlite3", "tikv", "etcd", "badger", "memkv"} {
+	// A per-Agent volume keeps its metadata in a local SQLite file (PLO-319);
+	// the shared volume keeps using Redis. Both are supported; every other
+	// SQL and KV engine stays compiled out.
+	require("metadata", "sqlite3", meta.IsSupported("sqlite3"), true)
+	for _, name := range []string{"mysql", "postgres", "tikv", "etcd", "badger", "memkv"} {
 		require("metadata", name, meta.IsSupported(name), false)
 	}
 	require("object storage", "s3", object.IsSupported("s3"), true)
@@ -55,5 +59,5 @@ func main() {
 	if failed {
 		os.Exit(1)
 	}
-	fmt.Println("Plori build profile exposes only Redis metadata and S3 remote object storage (plus the local file backend that vfs.Backup and sync stage through)")
+	fmt.Println("Plori build profile exposes only Redis and SQLite metadata and S3 remote object storage (plus the local file backend that vfs.Backup and sync stage through)")
 }

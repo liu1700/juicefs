@@ -1,11 +1,12 @@
 {
   "schemaVersion": 1,
-  "profile": "redis-s3-fuse",
+  "profile": "redis-sqlite3-s3-fuse",
   "supportedInterfaces": [
     "fuse"
   ],
   "supportedMetadataEngines": [
-    "redis"
+    "redis",
+    "sqlite3"
   ],
   "supportedObjectStores": [
     "s3"

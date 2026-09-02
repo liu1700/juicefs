@@ -5,13 +5,36 @@ title: Plori 最小构建配置
 `plori` 配置是 Plori runtime 和 Orlop 专用的 JuiceFS 客户端。它只保留当前
 部署契约需要的能力：
 
-- 通过 `redis` 驱动使用兼容 Redis 的元数据服务；
+- 通过 `redis` 驱动使用兼容 Redis 的元数据服务（共享卷）；
+- 通过 `sqlite3` 驱动使用 SQLite 元数据，元数据是一个本地文件，用于按 Agent
+  独立的卷（PLO-319）；
 - 通过 `s3` 驱动使用 S3 或兼容 S3 的对象存储；
 - FUSE 客户端，以及格式化、挂载、卸载、状态检查、`durability` 远端持久化
   屏障和目录配额管理所需的运维命令。
 
-SQL 和 KV 元数据引擎、S3 gateway、WebDAV、本地和内存对象存储，以及非 S3
-对象存储均不会编入此产物。不要把它当作通用 Community Edition 发行版使用。
+MySQL、PostgreSQL 和 KV 元数据引擎、S3 gateway、WebDAV、本地和内存对象存储，
+以及非 S3 对象存储均不会编入此产物。不要把它当作通用 Community Edition
+发行版使用。
+
+SQLite 是此配置里唯一的 cgo 依赖，因此客户端以 `CGO_ENABLED=1` 构建并静态
+链接到 musl；传入 `STATIC=1` 时 `make` 会同时设置这两项。构建标签
+`sqlite_omit_load_extension` 会让 SQLite 以 `-DSQLITE_OMIT_LOAD_EXTENSION`
+编译，发布的二进制里既没有 `sqlite3_enable_load_extension`，也没有
+`load_extension()` SQL 函数，元数据文件无法用来加载共享库。
+
+## SQLite 配置契约
+
+打开 `sqlite3://` 元数据 URL 时使用 WAL 日志模式、`synchronous=NORMAL`、
+`cache=shared` 和 5 秒忙等待超时。这四项都只是 URL 未显式指定时由客户端补上的
+DSN 默认值，部署方仍可以逐项覆盖。`synchronous=NORMAL` 固定写在 DSN 上，而不是
+依赖驱动的 `SQLITE_DEFAULT_WAL_SYNCHRONOUS=1` 编译选项，这样换驱动或改编译选项
+时该取值仍然成立。
+
+客户端在打开数据库后会回读并打印生效的 `journal_mode`、`synchronous` 和
+`busy_timeout`，但不会打印 DSN——DSN 里带有数据库路径。
+
+WAL 模式不支持在网络文件系统上多进程访问。元数据库必须放在本地磁盘上，再从
+本地复制出去。
 
 Hadoop/Java SDK 和 Ranger 鉴权插件也不在本 fork 的安全支持边界内：它们不会
 进入容器构建上下文，也不会被构建、扫描或发布。不要从本 fork 构建或部署
@@ -30,12 +53,14 @@ make test.plori.security
 hack/verify-plori-binary.sh ./juicefs.plori
 ```
 
-如果运行时注册了 Redis 以外的元数据引擎或 S3 以外的远端对象存储，
+如果运行时注册了 Redis 和 SQLite 以外的元数据引擎，或 S3 以外的远端对象存储，
 `make test.plori.profile` 会失败。本地 `file` 后端是有意保留的：
 `vfs.Backup` 的每次 `--backup-meta` 元数据备份都要先经它落盘再上传，
 `juicefs sync` 的本地路径也依赖它（issue #27）。二进制验证脚本还会拒绝被裁剪后端家族的依赖。
-安全测试会验证受限的 Docker 构建上下文、`nohdfs` 构建标签、工作流命令、
-SBOM 拒绝清单和发布文件白名单。
+它同样会在 SQLite *缺失* 时失败：支持策略承诺提供 `sqlite3` 引擎，所以未启用
+cgo、缺少 `sqlite_omit_load_extension`、或重新加回 `nosqlite` 的构建会被拒绝，
+而不是当成一个合法的 Plori 版本发布。安全测试会验证受限的 Docker 构建上下文、
+构建标签与声明的元数据引擎是否一致、工作流命令、SBOM 拒绝清单和发布文件白名单。
 
 容器使用固定摘要的多架构基础镜像和固定版本的软件包：
 
@@ -67,8 +92,10 @@ hack/verify-plori-csi-image.sh juicefs-plori:dev
 - 记录源码版本、Go 版本、构建标签、镜像名、不可变镜像摘要和机器可读支持策略的
   `build-info.json`。
 
-流水线会验证 Redis + S3 格式化与挂载、FUSE I/O 和远端持久化屏障，并拒绝
-可达的 Go 漏洞以及镜像中已有修复的 HIGH/CRITICAL 漏洞。
+流水线会验证 Redis + S3 格式化与挂载、FUSE I/O 和远端持久化屏障，还会跑一遍
+完整的 SQLite 生命周期：格式化、挂载、目录配额、`fsck`、`durability`、
+`dump`/`load`，以及强杀进程后重新挂载并要求数据可恢复。它同时拒绝可达的 Go
+漏洞以及镜像中已有修复的 HIGH/CRITICAL 漏洞。
 
 临时 Go 漏洞豁免位于 `.github/security/plori-vuln-waivers.json`。每条豁免
 必须精确匹配一个产物和一个漏洞 ID，并包含到期日和原因。过期、重复、未使用

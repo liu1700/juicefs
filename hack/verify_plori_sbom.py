@@ -7,6 +7,7 @@ import sys
 REQUIRED = {
     "github.com/aws/aws-sdk-go-v2/service/s3",
     "github.com/juicedata/go-fuse/v2",
+    "github.com/mattn/go-sqlite3",
     "github.com/redis/go-redis/v9",
 }
 DENIED_PREFIXES = (
@@ -16,7 +17,6 @@ DENIED_PREFIXES = (
     "github.com/go-sql-driver/mysql",
     "github.com/google/btree",
     "github.com/jackc/pgx",
-    "github.com/mattn/go-sqlite3",
     "github.com/minio/minio-go",
     "github.com/pkg/sftp",
     "github.com/prometheus/prometheus",

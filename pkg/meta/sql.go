@@ -431,6 +431,38 @@ func setXormLogger(engine *xorm.Engine) {
 	}
 }
 
+// synchronousModeNames maps the integer PRAGMA synchronous reports back to the
+// names used in the DSN and in SQLite's documentation.
+var synchronousModeNames = map[string]string{
+	"0": "OFF",
+	"1": "NORMAL",
+	"2": "FULL",
+	"3": "EXTRA",
+}
+
+// logSQLitePragmas reports the settings that decide metadata durability and
+// lock contention. The values are read back from the database, so the log shows
+// what SQLite applied rather than what the DSN asked for. The DSN itself is
+// never logged: it carries the database path.
+func logSQLitePragmas(engine *xorm.Engine) {
+	read := func(name string) string {
+		rows, err := engine.QueryString("PRAGMA " + name)
+		if err != nil || len(rows) != 1 {
+			return "unknown"
+		}
+		for _, value := range rows[0] {
+			return value
+		}
+		return "unknown"
+	}
+	sync := read("synchronous")
+	if name, ok := synchronousModeNames[sync]; ok {
+		sync = name
+	}
+	logger.Infof("SQLite metadata: journal_mode=%s synchronous=%s busy_timeout=%sms",
+		strings.ToUpper(read("journal_mode")), sync, read("busy_timeout"))
+}
+
 func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 	var searchPath string
 
@@ -473,6 +505,15 @@ func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 		}
 		if !query.Has("_timeout") && !query.Has("_busy_timeout") {
 			query.Add("_timeout", "5000")
+		}
+		// WAL mode already implies synchronous=NORMAL with the default driver
+		// build (mattn/go-sqlite3 compiles -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1).
+		// Set it on the DSN so the value is a property of this code rather than
+		// of a compile flag in a dependency: NORMAL in WAL mode is durable
+		// across a process crash and only exposes the database to loss on a
+		// host power failure, which is the trade JuiceFS wants here.
+		if !query.Has("_sync") && !query.Has("_synchronous") {
+			query.Add("_synchronous", "NORMAL")
 		}
 	}
 
@@ -519,6 +560,9 @@ func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 	}
 	if time.Since(start) > time.Millisecond*5 {
 		logger.Warnf("The latency to database is too high: %s", time.Since(start))
+	}
+	if driver == "sqlite3" {
+		logSQLitePragmas(engine)
 	}
 	if searchPath != "" {
 		engine.SetSchema(searchPath)
