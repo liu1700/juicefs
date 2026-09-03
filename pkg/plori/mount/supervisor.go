@@ -77,15 +77,32 @@ type Supervisor struct {
 	grantApplied    int64
 	pendingAck      int64
 	quotaTrips      uint64
-	quotaExhausted  bool
-	growAsked       bool
 	restoredUnclean bool
 	// mounted is set the instant the `ready` file exists — the one moment this
 	// worker knows its restore is behind it and a filesystem is being served.
 	// It rides every renew from then on so the control-plane can free the
 	// restore-admission slot on the real signal rather than on the first renew,
 	// which the pre-restore marker reclaim also sends (PLO-418).
-	mounted       bool
+	mounted bool
+	// grantBytes/grantInodes are the ceiling currently in force — the numbers
+	// of the last grant this worker actually applied. They are what makes
+	// "the allocator answered with the ceiling we already had" distinguishable
+	// from "the allocator gave us room", which a grant EPOCH cannot say: the
+	// epoch moves either way.
+	grantBytes  int64
+	grantInodes int64
+	// ceilingRefused is true from the moment the volume ceiling refuses an
+	// operation until a LARGER ceiling is applied. It is one half of
+	// health.json's quota_exhausted.
+	ceilingRefused bool
+	// growDenied is true from the moment a grow this worker asked for produced
+	// no more room until a larger ceiling is applied. Three answers say it and
+	// they are one fact — the account is at its budget (over_budget on the
+	// renew), the allocator reissued the ceiling the volume already had, or a
+	// renew carrying the request came back with neither. It is the other half
+	// of quota_exhausted.
+	growDenied    bool
+	growAsked     bool
 	lastUsage     Usage
 	lastRenewOK   bool
 	fenced        bool
@@ -1350,11 +1367,28 @@ func (s *Supervisor) applyGrant(ctx context.Context, g GrantSpec) {
 	if g.Epoch > g.AckedEpoch {
 		s.pendingAck = g.Epoch
 	}
-	// A larger ceiling is the answer to whatever refused the last write, so the
-	// exhausted state and the outstanding request both close here. If the new
-	// ceiling is still too small the very next refusal reopens them.
-	s.quotaExhausted = false
+	// A LARGER ceiling is the answer to whatever refused the last write, so the
+	// refusal, the denial and the outstanding request all close here. If the
+	// new ceiling is still too small the very next refusal reopens them.
+	//
+	// A new epoch that is not larger is not that answer. The allocator caps a
+	// grow at `current + available` (storagequota Policy.growTo), so an account
+	// with nothing left answers a grow with the ceiling the volume already had
+	// — a new epoch carrying the same numbers. Reading that as "grown" is what
+	// kept quota_exhausted false on a volume that was 100 % full and had
+	// nowhere to go (PLO-468): the epoch moved every renew and wiped the state
+	// the flag is made of. It is recorded as a denial instead, and the request
+	// is re-armed the way growRefused re-arms it, because the way out of a full
+	// account is the user buying disk and nothing else will ask again.
+	grew := g.Bytes > s.grantBytes || g.Inodes > s.grantInodes
+	s.grantBytes, s.grantInodes = g.Bytes, g.Inodes
 	s.growAsked = false
+	if grew {
+		s.ceilingRefused = false
+		s.growDenied = false
+	} else {
+		s.growDenied = true
+	}
 	s.mu.Unlock()
 	s.log("grant_applied", "epoch", g.Epoch, "bytes", g.Bytes, "inodes", g.Inodes)
 }
@@ -1370,7 +1404,7 @@ func (s *Supervisor) noteQuotaTrips() {
 	defer s.mu.Unlock()
 	if n > s.quotaTrips {
 		s.quotaTrips = n
-		s.quotaExhausted = true
+		s.ceilingRefused = true
 	}
 }
 
@@ -1397,7 +1431,16 @@ func (s *Supervisor) renewRequest() RenewRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	req := RenewRequest{AckedGrantEpoch: s.pendingAck, Mounted: s.mounted}
-	if s.quotaExhausted && !s.growAsked {
+	// A request that is still outstanding when the next tick comes round has
+	// already been answered: the response arrives on the same call that carried
+	// it, and every answer that gave this volume room clears growAsked on its
+	// way through applyGrant or growRefused. So an outstanding request here is
+	// one the allocator answered with nothing — the third of quota_exhausted's
+	// three denials, and the only one that leaves no other trace.
+	if s.growAsked {
+		s.growDenied = true
+	}
+	if s.ceilingRefused && !s.growAsked {
 		req.Grow = true
 		s.growAsked = true
 	}
@@ -1418,6 +1461,7 @@ func (s *Supervisor) renewRequest() RenewRequest {
 func (s *Supervisor) growRefused() {
 	s.mu.Lock()
 	s.growAsked = false
+	s.growDenied = true
 	epoch := s.grantApplied
 	s.mu.Unlock()
 	s.log("grant_over_budget", "epoch", epoch)
@@ -1880,7 +1924,13 @@ func (s *Supervisor) writeHealth() {
 		UsedBytes:         s.lastUsage.Bytes,
 		UsedInodes:        s.lastUsage.Inodes,
 		GrantEpochApplied: s.grantApplied,
-		QuotaExhausted:    s.quotaExhausted,
+		// The whole predicate, in one place and evaluated from the state the
+		// mount already holds: this volume is against its ceiling AND there is
+		// no more room to be had. Either half alone is a normal, transient
+		// condition — a volume that trips once and is grown, or an account at
+		// its budget whose volumes are nowhere near full — and PLO-406
+		// republishes this as an alerting metric, so it has to mean "stuck".
+		QuotaExhausted:    s.ceilingRefused && s.growDenied,
 		Fenced:            s.fenced,
 		StagingBacklogCap: s.backlogCap,
 		ReplicationFailed: !s.replFailedSince.IsZero(),

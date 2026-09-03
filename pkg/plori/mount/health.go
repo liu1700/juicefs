@@ -65,8 +65,16 @@ type Health struct {
 	// above it are uploaded through rather than staged, which is what keeps
 	// ProjectedDrainSeconds inside the stop window.
 	StagingBacklogCap int64 `json:"staging_backlog_cap"`
-	// QuotaExhausted is true from the moment the volume ceiling refuses an
-	// operation until a larger grant epoch is applied. It is what tells an
+	// QuotaExhausted is true while the volume is against its ceiling AND no
+	// grow is possible: the ceiling has refused an operation, and the grow the
+	// worker asked for came back with no more room — the account at its budget
+	// (over_budget), the allocator reissuing the ceiling the volume already
+	// had, or a renew that answered with neither. It clears when a LARGER
+	// ceiling is applied.
+	//
+	// Both halves, because either alone is ordinary: a volume that trips once
+	// and is grown a second later is not stuck, and an account at its budget
+	// whose volumes are half empty is not either. This is what tells an
 	// operator (and PLO-325's metrics) the difference between an Agent that is
 	// idle and one that is stuck against a ceiling the account cannot raise —
 	// which, with a grant conversation that is otherwise invisible, is

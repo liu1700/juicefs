@@ -86,6 +86,21 @@ func readHealth(t *testing.T, sup *Supervisor) Health {
 	return h
 }
 
+// healthWhenWritten is readHealth for a POLLING assertion: health.json appears
+// at the end of the first renew, so a poll that started before it must be able
+// to say "not yet" instead of failing the test from inside the loop.
+func healthWhenWritten(sup *Supervisor) (Health, bool) {
+	data, err := os.ReadFile(sup.Paths.HealthPath())
+	if err != nil {
+		return Health{}, false
+	}
+	var h Health
+	if err := json.Unmarshal(data, &h); err != nil {
+		return Health{}, false
+	}
+	return h, true
+}
+
 func countGrows(reqs []RenewRequest) int {
 	n := 0
 	for _, r := range reqs {
@@ -232,11 +247,13 @@ func TestAQuotaTripAsksToGrowOncePerEpoch(t *testing.T) {
 // stuck after the user paid to unstick it.
 func TestAGrowTheAccountCannotFundIsAskedAgain(t *testing.T) {
 	vol := healthyVolume()
-	cp := &fakeCP{
-		grant:      GrantSpec{Bytes: 64 << 20, Inodes: 16384, Epoch: 2, AckedEpoch: 2},
-		overBudget: true,
-	}
-	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
+	// The spec's ceiling and the allocator's are the same number, because they
+	// are the same grant: "larger" below has to be larger than what this mount
+	// is actually enforcing, and the spec is what it started from.
+	spec := testSpec()
+	spec.Grant = GrantSpec{Bytes: 64 << 20, Inodes: 16384, Epoch: 2, AckedEpoch: 2}
+	cp := &fakeCP{grant: spec.Grant, overBudget: true}
+	sup := newSup(t, spec, &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
 
 	stop := make(chan os.Signal, 1)
 	done := make(chan *Fatal, 1)
@@ -306,4 +323,108 @@ func TestAFailedApplyIsNotAcknowledged(t *testing.T) {
 	if h := readHealth(t, sup); h.GrantEpochApplied != 0 {
 		t.Errorf("grant_epoch_applied = %d after only failed applies, want 0", h.GrantEpochApplied)
 	}
+}
+
+// TestAFullVolumeAtTheAccountBudgetReportsQuotaExhausted is the flag PLO-406
+// republishes as `plori_mount_quota_exhausted`, on the condition it exists for:
+// a volume that is full and an account that cannot fund one more increment.
+//
+// The second staging end-to-end found it false with `dd` answering ENOSPC and
+// `df` at 100 %, so the alert could not fire on the one state it is meant to
+// name. Both halves are asserted here, in order — an account at its budget with
+// nothing full is NOT exhausted, and the same account with a full volume is.
+func TestAFullVolumeAtTheAccountBudgetReportsQuotaExhausted(t *testing.T) {
+	vol := healthyVolume()
+	spec := testSpec()
+	spec.Grant = GrantSpec{Bytes: 64 << 20, Inodes: 16384, Epoch: 2, AckedEpoch: 2}
+	cp := &fakeCP{grant: spec.Grant, overBudget: true}
+	sup := newSup(t, spec, &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
+
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	t.Cleanup(func() { stop <- syscall.SIGTERM; <-done })
+
+	// An account at its budget, on its own, is a normal state: nothing here is
+	// full, so nothing is stuck.
+	waitFor(t, 10*time.Second, func() bool {
+		_, ok := healthWhenWritten(sup)
+		return ok && len(cp.renewRequests()) >= 2
+	}, "timed out waiting for two renews")
+	if h := readHealth(t, sup); h.QuotaExhausted {
+		t.Error("quota_exhausted is set on an account at its budget whose volume has refused nothing")
+	}
+
+	// Now the filesystem fills up and the ceiling starts refusing writes.
+	vol.quotaTrips.Add(1)
+	waitFor(t, 10*time.Second, func() bool {
+		h, ok := healthWhenWritten(sup)
+		return ok && h.QuotaExhausted
+	}, "health.json never reported quota_exhausted for a full volume on an account at its budget")
+}
+
+// TestAGrantThatIsNotLargerIsNotAWayOut is the mechanism behind the staging
+// finding, isolated.
+//
+// The allocator caps a grow at `current + available`, so an account with
+// nothing left answers the request with the ceiling the volume already had —
+// under a NEW epoch, because it re-issued the grant. Every renew therefore
+// carried what looked like a fresh grant, and clearing the exhausted state on
+// "a newer epoch" wiped the flag as fast as the refusals set it.
+//
+// The epoch is not the answer; the numbers are. And because a same-size answer
+// is not an answer, the request has to be asked again — the way out of a full
+// account is the user buying disk, and nothing else will ask on their behalf.
+func TestAGrantThatIsNotLargerIsNotAWayOut(t *testing.T) {
+	vol := healthyVolume()
+	spec := testSpec()
+	spec.Grant = GrantSpec{Bytes: 64 << 20, Inodes: 16384, Epoch: 2, AckedEpoch: 2}
+	// An allocator with nothing to give: every grow is answered with the same
+	// ceiling under the next epoch.
+	cp := &fakeCP{grant: spec.Grant, onGrow: func(g GrantSpec) GrantSpec {
+		g.Epoch++
+		return g
+	}}
+	sup := newSup(t, spec, &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
+
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	t.Cleanup(func() { stop <- syscall.SIGTERM; <-done })
+
+	waitFor(t, 10*time.Second, func() bool { return len(cp.renewRequests()) > 0 },
+		"timed out waiting for the first renew")
+	vol.quotaTrips.Add(1)
+	waitFor(t, 10*time.Second, func() bool {
+		h, ok := healthWhenWritten(sup)
+		return ok && h.QuotaExhausted
+	}, "health.json never reported quota_exhausted while the allocator kept re-issuing the same ceiling")
+
+	// And it stays reported across the epochs that keep arriving.
+	before := len(cp.renewRequests())
+	waitFor(t, 10*time.Second, func() bool { return len(cp.renewRequests()) >= before+4 },
+		"timed out waiting for four more renews")
+	h := readHealth(t, sup)
+	if !h.QuotaExhausted {
+		t.Error("quota_exhausted cleared on a re-issued ceiling that gave the volume no more room")
+	}
+	if h.GrantEpochApplied < 3 {
+		t.Errorf("grant_epoch_applied = %d; the fixture must have applied at least one re-issued epoch", h.GrantEpochApplied)
+	}
+	if got := countGrows(cp.renewRequests()); got < 2 {
+		t.Errorf("%d grow requests; a re-issued ceiling must leave the request outstanding, not satisfied", got)
+	}
+
+	// Buying disk is the way out, and it is the only thing that clears it.
+	cp.mu.Lock()
+	cp.onGrow = nil
+	// Next epoch after whatever the re-issuing allocator has reached by now —
+	// it moved the epoch on every grow, and reading it back under the same lock
+	// RenewLease takes is the only way to be sure this one is newer.
+	cp.grant = GrantSpec{Bytes: 256 << 20, Inodes: 65536, Epoch: cp.grant.Epoch + 1, AckedEpoch: 2}
+	cp.mu.Unlock()
+	waitFor(t, 10*time.Second, func() bool {
+		h, ok := healthWhenWritten(sup)
+		return ok && !h.QuotaExhausted
+	}, "quota_exhausted never cleared after a genuinely larger ceiling was applied")
 }
