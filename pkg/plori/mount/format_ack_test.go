@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
-	"syscall"
 	"testing"
 	"time"
 
@@ -40,8 +39,7 @@ import (
 // its first pass and the test does not depend on a sleep.
 func runToReady(t *testing.T, sup *Supervisor) *Fatal {
 	t.Helper()
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 	return sup.Run(context.Background(), stop)
 }
 
