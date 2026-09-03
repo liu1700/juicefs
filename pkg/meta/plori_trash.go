@@ -1,6 +1,3 @@
-//go:build plori
-// +build plori
-
 /*
  * JuiceFS, Copyright 2026 Juicedata, Inc.
  *
@@ -23,6 +20,36 @@ import (
 	"fmt"
 	"syscall"
 )
+
+// This file carries NO `plori` build tag, and that is deliberate: it is the one
+// trash-usage walk, and it has two callers on two different builds.
+//
+//   - The live mount, built with the release tag set, on its lease-renew tick
+//     (cmd/plori_mount.go, ploriVolume.Usage).
+//   - plori-runtime's services/storage-worker, which answers the same question
+//     for an Agent that is ASLEEP and therefore has no mount. That module links
+//     this fork as a library on a PLAIN build — no tags at all — so anything
+//     behind `//go:build plori` is invisible to it.
+//
+// It was tagged until PLO-429, and the cost was a second copy of the arithmetic
+// in the worker (services/storage-worker/internal/jfsvol/usage.go), which is
+// exactly the drift the trash-is-a-subset-of-used_bytes claim cannot survive:
+// the two ends would disagree about the same volume.
+//
+// Untagging is the fix rather than a sibling package under pkg/plori (the
+// mountspec pattern) because of what the walk is made of. mountspec is plain
+// wire data and imports nothing from this package; this walk is the metadata
+// engine's own accounting and needs align4K (utils.go) and recordStat's rules.
+// A package outside pkg/meta cannot reach align4K, so it would have to restate
+// it — the same duplication, one level down — and pkg/meta could not then alias
+// back into it without an import cycle. The counting rule belongs in the
+// package that owns the counter.
+//
+// Nothing here runs unless it is called, so a vanilla build carries the code and
+// no behaviour. The guard that keeps it reachable is plori_trash_test.go, which
+// is untagged for the same reason and is compiled on the default build by
+// `make test.plori.sqlite`; the cross-repo half is plori-runtime's
+// services/storage-worker/internal/mountwire trash-walk parity test.
 
 // PloriTrashDirName is Plori's OWN soft-delete namespace, a plain directory at the
 // volume root. The Files panel renames a deleted file into it under CAS and hands the
