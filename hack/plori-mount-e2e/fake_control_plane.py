@@ -75,16 +75,12 @@ class Handler(BaseHTTPRequestHandler):
                 "%s uuid=%s epoch=%s"
                 % (route, self.server.format_uuid, body.get("fence_epoch"))
             )
-            self._json(
-                200,
-                {
-                    "storage_volume_id": "e2e",
-                    "state": "active",
-                    "grant": GRANT,
-                    "used_bytes": 0,
-                    "used_inodes": 0,
-                },
-            )
+            # `state` is the whole answer since PLO-521: the ceiling and the
+            # counters this route used to echo were deleted on both sides
+            # (contract rev 3.12), because the ceiling arrives with the
+            # MountSpec and the counters describe a filesystem created one
+            # second ago.
+            self._json(200, {"state": "active"})
             return
 
         self._record(route)
@@ -103,11 +99,14 @@ class Handler(BaseHTTPRequestHandler):
                     "fence_epoch": body.get("fence_epoch", 0),
                     "lease_expires_at": now_plus(LEASE_TTL_SECONDS),
                     "grant": GRANT,
-                    "released": False,
                 },
             )
         elif route.endswith("/lease/release"):
-            self._json(200, {"storage_volume_id": "e2e", "released": True})
+            # No `released` since PLO-521 (contract rev 3.12): the worker posts
+            # this route with a nil decode target, so the flag was answered to
+            # nobody. The echo stays because it is what the real control-plane
+            # answers.
+            self._json(200, {"storage_volume_id": "e2e"})
         else:
             self._json(
                 200,
