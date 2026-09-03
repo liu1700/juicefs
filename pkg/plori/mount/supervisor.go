@@ -101,9 +101,12 @@ type Supervisor struct {
 	// renew), the allocator reissued the ceiling the volume already had, or a
 	// renew carrying the request came back with neither. It is the other half
 	// of quota_exhausted.
-	growDenied    bool
-	growAsked     bool
-	lastUsage     Usage
+	growDenied bool
+	growAsked  bool
+	lastUsage  Usage
+	// lastTrashAt is when the trash breakdown inside lastUsage was walked. It
+	// is what gives the one usage cache two ages (PLO-427).
+	lastTrashAt   time.Time
 	lastRenewOK   bool
 	fenced        bool
 	formattedHere bool
@@ -1502,23 +1505,52 @@ func (s *Supervisor) growRefused() {
 	s.log("grant_over_budget", "epoch", epoch)
 }
 
+// usageReportInterval is how often this mount reports usage: the report runs on
+// every DefaultUsageReportEvery-th renewal, so the interval is that constant
+// times the lease renew interval. It is also how stale the trash breakdown is
+// allowed to be, because the report is the only thing that reads one.
+func (s *Supervisor) usageReportInterval() time.Duration {
+	return time.Duration(DefaultUsageReportEvery) * s.Spec.LeaseRenewInterval.D()
+}
+
 // usage reads the volume's consumption and caches it in lastUsage. It is the
 // only caller of Volume.Usage in the worker: health.json publishes the cached
 // snapshot and the /usage report sends what this returns, so the file and the
 // report cannot carry different figures for the same mount.
+//
+// One cache, two ages. The totals are counters the metadata engine already
+// holds, so they are re-read on every call and health.json's used_bytes is
+// always this mount's true figure. The breakdown is a bounded walk of the trash
+// namespaces on this same single-threaded loop, so it is re-walked only once
+// per usageReportInterval — the cadence the report has always run at, and the
+// only consumer there is: health.json carries no trash fields at all.
+//
+// A reading that skips the walk returns TrashKnown false, which is the same
+// "nobody measured it" shape a failed walk produces and which the report
+// already sends as absent rather than zero. So a breakdown is only ever paired
+// with the totals measured in the same call, and nothing can offer to free more
+// than the volume holds.
 //
 // A failed reading keeps the last good snapshot rather than replacing it with a
 // zero. "Nobody could measure this volume" is not the same fact as "this volume
 // is empty", and health.json is what an operator reads to tell an idle Agent
 // from one stuck against a ceiling (PLO-406).
 func (s *Supervisor) usage(ctx context.Context) (Usage, bool) {
-	u, err := s.vol.Usage(ctx)
+	now := s.now()
+	s.mu.Lock()
+	walkTrash := s.lastTrashAt.IsZero() || now.Sub(s.lastTrashAt) >= s.usageReportInterval()
+	s.mu.Unlock()
+
+	u, err := s.vol.Usage(ctx, walkTrash)
 	if err != nil {
 		s.log("usage_read_failed", "error", err.Error())
 		return Usage{}, false
 	}
 	s.mu.Lock()
 	s.lastUsage = u
+	if walkTrash {
+		s.lastTrashAt = now
+	}
 	s.mu.Unlock()
 	return u, true
 }

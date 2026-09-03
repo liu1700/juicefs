@@ -48,6 +48,8 @@ type fakeVolume struct {
 	barrier     func(context.Context) (BarrierResult, error)
 	usage       Usage
 	usageErr    error
+	usageReads  int
+	trashWalks  int
 	fenced      bool
 	writeExpiry time.Time
 	calls       []string
@@ -126,10 +128,31 @@ func (f *fakeVolume) lastCap() int64 {
 	}
 	return c[len(c)-1]
 }
-func (f *fakeVolume) Usage(context.Context) (Usage, error) {
+
+// Usage counts its two halves separately, because the whole of PLO-427's
+// second half is that they run at different cadences: the totals on every
+// health tick, the trash walk on the report's interval.
+func (f *fakeVolume) Usage(_ context.Context, withTrash bool) (Usage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.usage, f.usageErr
+	f.usageReads++
+	u := f.usage
+	if !withTrash {
+		// What ploriVolume returns when the caller did not ask for the walk:
+		// totals only, and the "nobody measured it" shape for the rest.
+		u.TrashKnown, u.TrashBytes, u.TrashInodes, u.TrashPartial = false, 0, 0, false
+		return u, f.usageErr
+	}
+	f.trashWalks++
+	return u, f.usageErr
+}
+
+// usageReads is how many times the totals were read; trashWalks how many of
+// those also walked the trash.
+func (f *fakeVolume) usageCounts() (reads, walks int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.usageReads, f.trashWalks
 }
 
 // setUsage moves the volume under a running supervisor, which is what a writing

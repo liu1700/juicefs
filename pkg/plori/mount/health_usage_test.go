@@ -112,6 +112,81 @@ func TestHealthJSONAndTheUsageReportCarryTheSameFigure(t *testing.T) {
 	}, "health.json never carried the figure the control-plane was told")
 }
 
+// The two halves of a reading have two cadences. The totals are counters the
+// engine already holds, so every health tick re-reads them and health.json is
+// never stale; the trash breakdown is a bounded walk over up to 200,000 entries
+// on the supervisor's single loop, so it runs at the cadence of its only
+// consumer — the /usage report — and not at the cadence of the file that does
+// not carry it.
+//
+// The cost this bounds is real: the first shape of the PLO-427 fix refreshed
+// both halves on the health tick, which is a walk every 10 s on every mount of
+// a 100-Agent fleet, on the same loop as the one-second lease deadline guard.
+func TestTheTrashWalkKeepsTheReportsCadenceWhileTheTotalsFollowTheHealthTick(t *testing.T) {
+	vol := healthyVolume()
+	vol.setUsage(Usage{Bytes: 40 << 20, Inodes: 61, TrashKnown: true, TrashBytes: 8 << 20, TrashInodes: 12}, nil)
+	spec := testSpec()
+	// A frozen clock, so "how many walks" is a statement about the interval
+	// rather than about how fast the machine running the test is. The interval
+	// here is DefaultUsageReportEvery * 50ms = 750ms of mount time.
+	at := time.Now().UTC()
+	sup := newSup(t, spec, &fakeFS{vol: vol}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	sup.Deps.Now = func() time.Time { return at }
+	// The accessor is called directly: this is about the cadence rule, not
+	// about the run loop that calls it.
+	sup.vol = vol
+
+	// Six minutes of health ticks at the production interval, if the clock had
+	// moved: far more ticks than a 60 s window holds.
+	for i := 0; i < 36; i++ {
+		if _, ok := sup.usage(context.Background()); !ok {
+			t.Fatalf("usage reading %d failed", i)
+		}
+	}
+	reads, walks := vol.usageCounts()
+	if reads != 36 {
+		t.Errorf("the totals were read %d times over 36 ticks, want 36: health.json's used_bytes is only as fresh as this", reads)
+	}
+	if walks != 1 {
+		t.Errorf("the trash was walked %d times inside one report interval, want 1", walks)
+	}
+
+	// It is a cadence, not a one-shot: past the interval the next reading walks
+	// again, so the report never sends a breakdown older than its own period.
+	at = at.Add(sup.usageReportInterval())
+	if _, ok := sup.usage(context.Background()); !ok {
+		t.Fatal("the reading after the interval failed")
+	}
+	if _, walks = vol.usageCounts(); walks != 2 {
+		t.Errorf("the trash was walked %d times after a full report interval, want 2", walks)
+	}
+}
+
+// A reading that did not walk carries no breakdown rather than a stale one. The
+// numbers are a subset of the totals measured beside them, so pairing a fresh
+// total with an old walk is how a dashboard comes to offer more free space than
+// the volume holds. Absent is the shape the report already sends (PLO-407).
+func TestAReadingThatSkippedTheWalkCarriesNoBreakdownRatherThanAnOldOne(t *testing.T) {
+	vol := healthyVolume()
+	vol.setUsage(Usage{Bytes: 40 << 20, Inodes: 61, TrashKnown: true, TrashBytes: 8 << 20, TrashInodes: 12}, nil)
+	at := time.Now().UTC()
+	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	sup.Deps.Now = func() time.Time { return at }
+	sup.vol = vol
+
+	first, _ := sup.usage(context.Background())
+	if !first.TrashKnown || first.TrashBytes != 8<<20 {
+		t.Fatalf("the first reading walked but reported no trash: %+v", first)
+	}
+	second, _ := sup.usage(context.Background())
+	if second.Bytes != 40<<20 {
+		t.Errorf("totals = %d, want them re-read on every call", second.Bytes)
+	}
+	if second.TrashKnown || second.TrashBytes != 0 {
+		t.Errorf("a reading that skipped the walk carried a breakdown anyway: %+v", second)
+	}
+}
+
 // A volume nobody can measure keeps its last known figure. Zero is a real
 // answer — an Agent that has written nothing — so publishing it for a failed
 // reading would tell the plugin's gauge, and the operator reading it beside
