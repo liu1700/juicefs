@@ -45,6 +45,13 @@ type MountOptions struct {
 	Heartbeat       time.Duration
 	BarrierInterval time.Duration
 	LitestreamSync  time.Duration
+	// GoMemLimitBytes is the `gomemlimit=` value in bytes, 0 when the option
+	// is absent or unparseable. Before PLO-366 this key was consumed only by
+	// the plugin, which exports it as GOMEMLIMIT before exec; it is parsed
+	// here as well because the FUSE loop now runs in the worker process, so
+	// the value bounds THIS heap, and PLORI_MOUNT_OPTIONS — the operator
+	// escape hatch — has to be able to move it after the environment is set.
+	GoMemLimitBytes int64
 	// Ignored holds the keys this worker did not recognise, for one log line.
 	Ignored []string
 }
@@ -68,6 +75,15 @@ const (
 	// reduce PUTs (batching is monitor-interval's job) and 10 s multiplies
 	// replica lag 7.7x.
 	DefaultLitestreamSync = time.Second
+	// DefaultGoMemLimit is the per-mount soft heap ceiling, in bytes. 96 MiB
+	// is the ADR §4 B9 value: measured on the production node shape it buys
+	// the eighth concurrent `git clone` at 3.5 % faster wall time and zero
+	// OOMs, and the Go runtime caps GC CPU at ~50 % rather than thrashing
+	// when a heap will not fit under it (PLO-346, PLO-385). It is a soft
+	// bound by construction — it excludes C allocations and mmap, and this
+	// binary is CGO for SQLite — which is why the plugin also sets a cgroup
+	// memory.max beside it.
+	DefaultGoMemLimit = 96 << 20
 	// DefaultTrashDays is the crash-consistency floor. A volume formatted with
 	// trash-days 0 cannot satisfy the Rank 1 protocol, so the worker never
 	// formats one and refuses to mount one.
@@ -119,6 +135,7 @@ func ParseMountOptions(entries []string) MountOptions {
 		Heartbeat:       DefaultHeartbeat,
 		BarrierInterval: DefaultBarrierInterval,
 		LitestreamSync:  DefaultLitestreamSync,
+		GoMemLimitBytes: DefaultGoMemLimit,
 	}
 	for _, raw := range entries {
 		key, value, hasValue := strings.Cut(strings.TrimSpace(raw), "=")
@@ -149,13 +166,52 @@ func ParseMountOptions(entries []string) MountOptions {
 				opts.LitestreamSync = d
 			}
 		case "gomemlimit":
-			// The plugin exports this as GOMEMLIMIT and the Go runtime reads
-			// it. Setting it here as well would give one knob two owners.
+			// Parsed with the Go runtime's own grammar so the value the
+			// worker applies and the value GOMEMLIMIT means are the same
+			// number, not two readings of one string. An unparseable value
+			// leaves the default rather than removing the bound.
+			if n, ok := ParseGoSize(value); ok {
+				opts.GoMemLimitBytes = n
+			}
 		default:
 			opts.Ignored = append(opts.Ignored, key)
 		}
 	}
 	return opts
+}
+
+// ParseGoSize parses the size grammar GOMEMLIMIT uses: a decimal number with
+// an optional B/KiB/MiB/GiB/TiB suffix, powers of two, no decimal point
+// (go/src/runtime/extern.go, `godebug` memory limit parsing). It is exported
+// because the control-plane issues these strings and the plugin exports them,
+// so all three sides can agree on what one means.
+func ParseGoSize(value string) (int64, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	units := []struct {
+		suffix string
+		scale  int64
+	}{
+		{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1},
+	}
+	for _, u := range units {
+		if !strings.HasSuffix(value, u.suffix) {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSuffix(value, u.suffix), 10, 64)
+		if err != nil || n <= 0 {
+			return 0, false
+		}
+		return n * u.scale, true
+	}
+	// A bare number is bytes, which is what the runtime does with one.
+	n, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // parseSeconds accepts both a Go duration ("300s") and a bare number of

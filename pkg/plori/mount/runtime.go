@@ -97,9 +97,28 @@ type RepairReport struct {
 }
 
 // Usage is the volume's consumption as the metadata engine sees it.
+//
+// TrashBytes/TrashInodes are the part of Bytes/Inodes that a deleted file is still
+// holding — a SUBSET of the total, never something to add to it. With `trash-days >= 1`
+// an unlink is a rename into `.trash`, so the bytes stay inside the counter the volume
+// ceiling is enforced against; the panel's own soft-delete into `/.plori-trash` is a
+// rename too. Both are measured together, because to a user "the trash" is one thing
+// and emptying it empties both (meta.PloriMeasureTrash).
+//
+// The breakdown is optional and the flags say why. A report may carry `used_bytes` with
+// no trash number at all, and the product then says nothing about the trash rather than
+// guessing at it.
 type Usage struct {
 	Bytes  int64
 	Inodes int64
+	// TrashKnown is false when the trash walk failed. The two numbers below are then
+	// meaningless and are not reported.
+	TrashKnown  bool
+	TrashBytes  int64
+	TrashInodes int64
+	// TrashPartial is true when the walk hit its entry budget: the numbers are a floor,
+	// not an amount, so nothing may present them as "this much would be freed".
+	TrashPartial bool
 }
 
 // FS is the JuiceFS half of the supervisor. cmd/plori_mount.go implements it;
@@ -306,6 +325,33 @@ type Replicator interface {
 	// successor may restore from: the barrier it skipped means that history
 	// can reference blocks the store never received (PLO-323 F-1).
 	Abort(ctx context.Context) error
+}
+
+// ReplicationSupervisor is the half of a Replicator that answers "are you
+// still replicating?" and "put it back".
+//
+// It is a separate interface because it is the answer to a specific failure
+// (PLO-411) rather than part of the mount's lifecycle: before it existed, the
+// only thing that ever read a replicator's exit was Stop and Abort, so a
+// Litestream that died on its own — OOM, a bug, a bad credential rotation —
+// left the mount serving writes with no metadata replica and nothing noticed
+// until the next barrier, a minute later, if that path checked the error at
+// all. ADR B1 makes Litestream the metadata backup, so that window is
+// unreplicated writes with a green health file.
+//
+// Both implementations satisfy it, and the repair each one performs is the
+// repair its own failure needs: an exec'd child is restarted, a registration
+// with a node-level replicator is re-made.
+type ReplicationSupervisor interface {
+	// Probe reports whether this worker's database is being replicated right
+	// now. It must be cheap enough to run on every health tick and must not
+	// block on the object store, so it asks about the LOCAL replication
+	// machinery rather than about the replica's contents.
+	Probe(ctx context.Context) error
+	// Restart puts replication back after Probe failed. The supervisor calls
+	// it from its own goroutine, so it never overlaps a barrier or a stop,
+	// and never more than once per uninterrupted failure.
+	Restart(ctx context.Context) error
 }
 
 // Fencer claims the epoch's fence marker in the object store.

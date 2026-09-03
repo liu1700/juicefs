@@ -24,8 +24,36 @@ juicefs plori-mount \
   --cache-dir          /var/lib/plori-mount/<storage_volume_id>/cache \
   --control-plane-url  https://<control-plane>/ \
   --token-file         /var/lib/kubelet/pods/<pod-uid>/volumes/kubernetes.io~projected/<vol>/token \
-  [--litestream-bin    /usr/local/bin/litestream]
+  [--litestream-bin    /usr/local/bin/litestream] \
+  [--replicator        /var/lib/plori-mount/.replicator/litestream.sock]
 ```
+
+`--replicator` picks the replication topology (PLO-366).
+
+With it, the metadata replica is driven by the **node-level** `litestream
+replicate` the CSI plugin runs and supervises: this worker registers its own
+database over that control socket, with its own per-epoch replica prefix, and
+execs no continuous Litestream of its own. One process per node costs
+`35.5 + 0.48·N` MiB against 36 MiB per mount, which is the difference between
+six of eight slots being able to peak at once and all eight.
+
+Without it, the worker execs a `litestream replicate` child of its own — the
+original topology, kept working so a plugin and a worker image can roll
+independently.
+
+`litestream restore` is a one-shot process on both paths. It runs before the
+database exists, reads from a different prefix than the one this generation
+writes to, and is over in seconds, so its footprint is a cold-start cost rather
+than a steady-state one.
+
+One thing the shared daemon cannot do: stop replicating a database **without** a
+final sync. `POST /unregister` and `POST /stop` both reach `db.Close`, which
+syncs. The out-of-band fence path therefore unregisters on the shortest budget
+the API accepts rather than killing a process. What still holds is the rest of
+the protocol: no `clean` marker is written, so the next generation takes the
+unconditional `fsck` and the restore-time repair, and a successor with a
+recorded durable point restores **to** it and never sees anything pushed after
+the fence.
 
 The object credential comes from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
 in the worker's own environment. The MountSpec carries none, and a spec whose

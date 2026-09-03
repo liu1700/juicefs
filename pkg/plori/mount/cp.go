@@ -224,14 +224,28 @@ func (c *Client) ReleaseLease(ctx context.Context, volumeID string, epoch int64,
 	}, nil)
 }
 
+// ReportUsage posts the volume's consumption, with the trash breakdown when there is
+// one to post (contract rev 3.5).
+//
+// `trash_bytes`/`trash_inodes` are ABSENT, not zero, when the walk failed: zero is a
+// real answer — an Agent that has deleted nothing — and sending it for "we could not
+// look" would make the dashboard promise that emptying the trash frees nothing when the
+// truth is that nobody knows. `trash_partial` travels with them so a floor is never
+// stored as an amount.
 func (c *Client) ReportUsage(ctx context.Context, volumeID string, epoch int64, u Usage, at time.Time) error {
-	return c.post(ctx, mountspec.RouteUsage, map[string]any{
+	body := map[string]any{
 		"volume_id":   volumeID,
 		"fence_epoch": epoch,
 		"used_bytes":  u.Bytes,
 		"used_inodes": u.Inodes,
 		"observed_at": at,
-	}, nil)
+	}
+	if u.TrashKnown {
+		body["trash_bytes"] = u.TrashBytes
+		body["trash_inodes"] = u.TrashInodes
+		body["trash_partial"] = u.TrashPartial
+	}
+	return c.post(ctx, mountspec.RouteUsage, body, nil)
 }
 
 func (c *Client) ReportDurablePoint(ctx context.Context, volumeID string, epoch int64, r BarrierResult, replicaTxID string) error {

@@ -80,6 +80,13 @@ type Health struct {
 	// CredentialRejectGrace runs out, and this is the only signal an operator
 	// has that a rotation is halfway through (PLO-322).
 	CredentialRefreshFailed bool `json:"credential_refresh_failed"`
+	// ReplicationFailed is true from the moment this worker's replication
+	// probe fails until one succeeds again. It is the field PLO-411 exists
+	// for: a Litestream that dies on its own leaves the mount serving writes
+	// with no metadata replica, the filesystem stays perfectly healthy, and
+	// ReplicaLagMs keeps reporting the last good value forever. Nothing else
+	// in this document distinguishes "replicating" from "not replicating".
+	ReplicationFailed bool `json:"replication_failed"`
 	// CredentialGeneration counts the object keys this worker has run on,
 	// starting at 1. It is how a rotation drill answers "has the fleet picked
 	// the new key up yet" without anything having to name the key. A worker
