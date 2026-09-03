@@ -158,7 +158,7 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 
 // ---------------------------------------------------------------- startup ---
 
-func (s *Supervisor) start(ctx context.Context) error {
+func (s *Supervisor) start(ctx context.Context) (err error) {
 	s.deadline = NewDeadline(s.Spec.LeaseExpiresAt, s.Spec.WriteStopMargin.D(), s.now())
 	s.drain = NewDrainModel(DefaultDrainPerBlock)
 	// The spec does not carry the lease TTL, so seed it from what is left of
@@ -257,6 +257,16 @@ func (s *Supervisor) start(ctx context.Context) error {
 	if err := s.Deps.Replicator.Start(ctx); err != nil {
 		return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true, "start replication: %s", err)
 	}
+	// Past this line the process owns two things that outlive it if it merely
+	// exits: a replicator, and an open metadata database. Every remaining
+	// startup step can still fail, so the undo is registered ONCE — here, at
+	// the instant the first of them exists — rather than repeated at each of
+	// the steps that might need it (PLO-438).
+	defer func() {
+		if err != nil {
+			err = s.abandonStart(ctx, err)
+		}
+	}()
 	if s.formattedHere {
 		// A freshly formatted volume has no replica yet. Push one before the
 		// Agent can write, so a crash in the first second still restores to a
@@ -279,6 +289,77 @@ func (s *Supervisor) start(ctx context.Context) error {
 		s.applyGrant(ctx, g)
 	}
 	return nil
+}
+
+// abandonStartBudget bounds the teardown of a startup that failed. It is the
+// ten seconds releaseLease already allows itself, for the same reason: a
+// NodePublish is waiting on this process, and a teardown that hangs turns a
+// refused mount into a wedged one.
+const abandonStartBudget = 10 * time.Second
+
+// abandonStart undoes the part of a startup that outlives this process. It is
+// the ordered stop minus the barrier — replicator, then volume, then (in Run)
+// the lease — and it is the whole of the start-failure path's cleanup.
+//
+// Before PLO-438 a start that failed after the replicator was up left both of
+// them running: Run released the lease and the process exited. What that leaves
+// behind depends on the replication topology, and both shapes are faults.
+//
+//   - per-mount child: an orphan `litestream replicate` holding meta.db open.
+//     Since PLO-421 gave the child its own process group the plugin's group
+//     kill no longer reaches it, so nothing else ever collects it.
+//   - node daemon (`--replicator`): the registration outlives the worker and
+//     keeps syncing THIS epoch's metadata prefix while the lease is released
+//     and a successor restores — the PLO-323 F-1 "two writers, one prefix"
+//     shape, narrowed by the epoch partition but still history nothing
+//     anchors.
+//
+// The replicator goes first, and it is ABORTED rather than stopped. This
+// generation never served a filesystem, so there is nothing of the Agent's to
+// make durable, and a graceful stop's final sync would push the one thing there
+// is — a format or a restore this worker is in the middle of abandoning — into
+// the prefix its successor restores from. Abort is also the bounded call: Stop
+// waits for a shutdown sync, and the failure that most often gets here is the
+// object store refusing writes, so that wait would spend the entire budget
+// failing. PLO-434 records that the shared daemon has no detach-without-sync
+// route; the worker still asks for the shape it wants and the daemon does what
+// it can.
+//
+// The lease is deliberately NOT released here. Run owns that call, it makes it
+// for every start failure including the ones that happen before a replicator
+// exists, and releasing twice would report two different reasons for one
+// refusal.
+func (s *Supervisor) abandonStart(ctx context.Context, cause error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abandonStartBudget)
+	defer cancel()
+
+	var residue []string
+	if err := s.Deps.Replicator.Abort(ctx); err != nil {
+		s.log("start_teardown_replicator_failed", "error", err.Error())
+		residue = append(residue, "replication not stopped: "+err.Error())
+	}
+	if err := s.vol.Close(); err != nil {
+		s.log("start_teardown_close_failed", "error", err.Error())
+		residue = append(residue, "metadata not closed: "+err.Error())
+	}
+	s.log("start_abandoned", "volume", s.Spec.StorageVolumeID, "epoch", s.Spec.FenceEpoch,
+		"teardown_incomplete", len(residue) > 0)
+	if len(residue) == 0 {
+		return cause
+	}
+	// A teardown that did not complete is reported ON the refusal, not only in
+	// the log. The exit code still names the step that failed — the plugin's
+	// handling of this mount does not change because the cleanup was untidy —
+	// but the single stderr line the plugin republishes is the only thing an
+	// operator sees, and "something of mine is still running on this node" has
+	// to be in it.
+	f := Classify(cause)
+	return &Fatal{
+		Exit:      f.Exit,
+		ErrCode:   f.ErrCode,
+		Retryable: f.Retryable,
+		Err:       fmt.Errorf("%w (start teardown incomplete: %s)", f.Err, strings.Join(residue, "; ")),
+	}
 }
 
 // reclaimOwnMarker decides whether the 412 on the fence marker is this
