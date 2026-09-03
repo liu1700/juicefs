@@ -45,35 +45,36 @@ const evServeReturned = "volume.serve_returned"
 // ------------------------------------------------------------- the doubles ---
 
 // signallingReplicator fires the stop signal from INSIDE a startup step and
-// then keeps working for a moment, which is the only way to test "a TERM
-// arrived during the restore" without a sleep that races the supervisor.
+// stays in that step until the startup context is cancelled, which is how "a
+// TERM arrived during the restore" is tested without a sleep that races the
+// supervisor.
 type signallingReplicator struct {
 	*fakeReplicator
 	tl *timeline
 	// during names the step that fires the signal: "restore" or "sync".
 	during string
 	stop   chan os.Signal
-	// linger is how long the step keeps running after the signal, standing in
-	// for the rest of a restore that is already under way.
-	linger time.Duration
 
 	restored atomic.Bool
 	seeded   atomic.Bool
 }
 
-func (r *signallingReplicator) fire(step string) {
+func (r *signallingReplicator) fire(ctx context.Context, step string) {
 	if r.during != step {
 		return
 	}
 	r.stop <- syscall.SIGTERM
-	// The signal is delivered to Run's watcher goroutine, which closes the stop
-	// channel and cancels the startup context. Give it that moment; the step
-	// this stands for takes minutes.
-	time.Sleep(r.linger)
+	// Wait for the cancellation, never for a duration. This step stands in for
+	// the rest of a restore that is already under way, and the event that ends
+	// it is Run's watcher cancelling the startup context; a sleep here is only
+	// a guess at how long the scheduler takes to get there, and on a starved
+	// one the guess is wrong (PLO-479). serveVolume.AwaitMounted waits the
+	// same way, on the same event.
+	<-ctx.Done()
 }
 
 func (r *signallingReplicator) Restore(ctx context.Context, src string, opt RestoreOptions) error {
-	r.fire("restore")
+	r.fire(ctx, "restore")
 	r.restored.Store(true)
 	return r.fakeReplicator.Restore(ctx, src, opt)
 }
@@ -85,7 +86,7 @@ func (r *signallingReplicator) Start(ctx context.Context) error {
 
 func (r *signallingReplicator) SyncAndWait(ctx context.Context) error {
 	r.tl.add(evReplicatorSync)
-	r.fire("sync")
+	r.fire(ctx, "sync")
 	r.seeded.Store(true)
 	return r.fakeReplicator.SyncAndWait(ctx)
 }
@@ -176,7 +177,7 @@ func TestATermDuringTheRestoreAbortsTheStartupAndExitsZero(t *testing.T) {
 	stop := make(chan os.Signal, 2)
 	rep := &signallingReplicator{
 		fakeReplicator: &fakeReplicator{}, tl: tl,
-		during: "restore", stop: stop, linger: 30 * time.Millisecond,
+		during: "restore", stop: stop,
 	}
 	cp := &tracedCP{fakeCP: &fakeCP{}, tl: tl}
 	vol := &tracedVolume{fakeVolume: healthyVolume(), tl: tl}
@@ -216,7 +217,7 @@ func TestATermDuringTheSeedAbortsThroughTheOrderedTeardown(t *testing.T) {
 	stop := make(chan os.Signal, 2)
 	rep := &signallingReplicator{
 		fakeReplicator: &fakeReplicator{restoreErr: ErrReplicaEmpty}, tl: tl,
-		during: "sync", stop: stop, linger: 30 * time.Millisecond,
+		during: "sync", stop: stop,
 	}
 	cp := &tracedCP{fakeCP: &fakeCP{}, tl: tl}
 	vol := &tracedVolume{fakeVolume: healthyVolume(), tl: tl}
@@ -287,7 +288,7 @@ func TestACancelledRestoreLeavesNoDatabaseTheNextGenerationWouldAdopt(t *testing
 	stop := make(chan os.Signal, 2)
 	rep := &signallingReplicator{
 		fakeReplicator: &fakeReplicator{}, tl: tl,
-		during: "restore", stop: stop, linger: 30 * time.Millisecond,
+		during: "restore", stop: stop,
 	}
 	rep.fakeReplicator.restoreErr = nil
 	cut := &cuttingReplicator{signallingReplicator: rep, metaPath: metaPath}

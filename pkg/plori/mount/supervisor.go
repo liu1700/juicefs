@@ -160,16 +160,38 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 	startCtx, abortStart := context.WithCancel(ctx)
 	defer abortStart()
 	stopped := make(chan struct{})
-	watch := make(chan struct{})
-	defer close(watch)
-	go func() {
-		select {
-		case <-stop:
-			close(stopped)
-			abortStart()
-		case <-watch:
-		}
-	}()
+	onStop := func() {
+		close(stopped)
+		abortStart()
+	}
+	// A signal that is ALREADY waiting when Run is entered is read HERE, on
+	// this goroutine, before a single startup step can run. Leaving it to the
+	// watcher below would not do: `go` schedules the watcher, it does not run
+	// it, so start() can pass its first checkpoint and claim the fence marker
+	// and pay for a whole restore before the pending signal is ever read — the
+	// exact cost F-3 removed for signals that arrive later. The window is
+	// small but it is the one a kubelet TERM in the first milliseconds of a
+	// Pod, or a NodeUnpublish racing NodePublish, lands in (PLO-479).
+	select {
+	case <-stop:
+		onStop()
+	default:
+		// Nothing pending, so the signal can only arrive from now on, and a
+		// watcher is the only thing that can see it. Once `stopped` is closed
+		// there is nothing left for a second signal to do — the run is already
+		// heading for the teardown — so the watcher is started only on this
+		// side of the select, and a later signal is left in the buffer exactly
+		// as TestASecondSigtermDoesNotRunTheStopTwice describes.
+		watch := make(chan struct{})
+		defer close(watch)
+		go func() {
+			select {
+			case <-stop:
+				onStop()
+			case <-watch:
+			}
+		}()
+	}
 
 	if err := s.start(startCtx); err != nil {
 		f := preReady(startCtx, err)
