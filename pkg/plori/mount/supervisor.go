@@ -80,10 +80,16 @@ type Supervisor struct {
 	quotaExhausted  bool
 	growAsked       bool
 	restoredUnclean bool
-	lastUsage       Usage
-	lastRenewOK     bool
-	fenced          bool
-	formattedHere   bool
+	// mounted is set the instant the `ready` file exists — the one moment this
+	// worker knows its restore is behind it and a filesystem is being served.
+	// It rides every renew from then on so the control-plane can free the
+	// restore-admission slot on the real signal rather than on the first renew,
+	// which the pre-restore marker reclaim also sends (PLO-418).
+	mounted       bool
+	lastUsage     Usage
+	lastRenewOK   bool
+	fenced        bool
+	formattedHere bool
 	// leaseTTL is the full lease length as the control-plane last issued it,
 	// observed rather than configured: the worker is never told the TTL, but
 	// every renewal's answer is one measurement of it. It bounds how early the
@@ -199,6 +205,11 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 		s.shutdown(context.Background(), stopOr(f, "ready_file_failed"))
 		return f
 	}
+	// Ordered after the ready file rather than before it, so the flag is never
+	// true for a worker whose mount the plugin was not told about. From here
+	// every renew tells the control-plane the restore this mount was admitted
+	// for is over, and its slot may go to the next queued one (PLO-418).
+	s.markMounted()
 	s.log("ready", "volume", s.Spec.StorageVolumeID, "epoch", s.Spec.FenceEpoch)
 
 	return s.loop(ctx, stopped, serveErr)
@@ -1363,8 +1374,19 @@ func (s *Supervisor) noteQuotaTrips() {
 	}
 }
 
-// renewRequest is what this tick tells the control-plane about the grant: the
-// epoch it has applied since the last renew, and whether it needs more room.
+// markMounted records that this worker has published a serving filesystem. It
+// is the only writer of the flag and it never clears it: a mount that came up
+// and then stopped gives its slot back by releasing the lease, not by
+// un-saying that it mounted.
+func (s *Supervisor) markMounted() {
+	s.mu.Lock()
+	s.mounted = true
+	s.mu.Unlock()
+}
+
+// renewRequest is what this tick tells the control-plane beyond "I am here":
+// the grant epoch it has applied since the last renew, whether it needs more
+// room, and whether it is mounted yet.
 //
 // The Grow flag is raised at most once per grant epoch. The ceiling refuses
 // every write of a filesystem that is full — a `git clone` against a full
@@ -1374,7 +1396,7 @@ func (s *Supervisor) noteQuotaTrips() {
 func (s *Supervisor) renewRequest() RenewRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	req := RenewRequest{AckedGrantEpoch: s.pendingAck}
+	req := RenewRequest{AckedGrantEpoch: s.pendingAck, Mounted: s.mounted}
 	if s.quotaExhausted && !s.growAsked {
 		req.Grow = true
 		s.growAsked = true
