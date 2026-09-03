@@ -71,6 +71,14 @@ test.plori.backup:
 
 # The SQLite PRAGMA contract on the default build. test.plori.meta below runs
 # the same tests, and the rest of ./pkg/meta, under the release tag set.
+#
+# It is also ./pkg/meta's only DEFAULT-build compile gate, and PLO-429 made that
+# load-bearing: pkg/meta/plori_trash.go (the one trash-usage walk) and its test
+# carry no `plori` tag, because plori-runtime's services/storage-worker links
+# this fork on a plain build and needs PloriMeasureTrash there. `go test` builds
+# the whole package and its test files before -run selects anything, so putting
+# that tag back turns this target red instead of quietly removing a symbol the
+# other repo compiles against.
 test.plori.sqlite:
 	$(PLORI_CGO) go test -count=1 -v ./pkg/meta/ -run TestSQLitePragma
 

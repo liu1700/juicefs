@@ -1,6 +1,3 @@
-//go:build plori
-// +build plori
-
 /*
  * JuiceFS, Copyright 2026 Juicedata, Inc.
  *
@@ -38,6 +35,13 @@ import (
 //     already shows, never an addition to it.
 //
 // These tests check both by execution, against the SQLite engine the Plori profile ships.
+//
+// Like the file under test they carry no `plori` build tag (PLO-429). That is the guard,
+// not an oversight: `make test.plori.sqlite` compiles ./pkg/meta's DEFAULT-build test
+// package, so re-tagging plori_trash.go would break this file's compile in CI — before it
+// could silently take PloriMeasureTrash away from the plain build that plori-runtime's
+// storage-worker links. `make test.plori.meta` runs the bodies below under the release
+// tag set, which is where the numbers are actually asserted.
 
 // openTrashVolume is openQuotaVolume with the trash on. TrashDays 1 is the ADR B8
 // minimum: physical deletion has to lag metadata replication for the crash-consistency
