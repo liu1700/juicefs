@@ -608,7 +608,16 @@ func (s *Supervisor) reclaimOwnMarker(ctx context.Context) *Fatal {
 	// An empty request: this renew is an identity PROOF, not a grant
 	// conversation. Nothing has been applied yet — the volume is not even open
 	// — so there is no acknowledgement to carry and nothing to ask for.
-	if _, err := s.Deps.CP.RenewLease(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, RenewRequest{}); err != nil {
+	//
+	// The proof is the answer, not the status code, so the echo is checked
+	// here for the same reason it is checked in the run loop: a 200 that names
+	// another volume proves something about that volume, and nothing about
+	// this one (PLO-520).
+	resp, err := s.Deps.CP.RenewLease(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, RenewRequest{})
+	if err == nil {
+		err = resp.notOurs(s.Spec.StorageVolumeID, s.Spec.FenceEpoch)
+	}
+	if err != nil {
 		s.log("fence_marker_not_ours", "key", s.Spec.FenceMarkerKey, "error", err.Error())
 		return held
 	}
@@ -1106,6 +1115,15 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			before := s.now()
 			s.noteQuotaTrips()
 			resp, err := s.Deps.CP.RenewLease(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, s.renewRequest())
+			// The answer's fencing echo is checked before a single field of
+			// it is used, and a mismatch becomes the same typed refusal a
+			// stale_epoch is, so it takes the branch below rather than one of
+			// its own: an answer nobody can attribute must not extend the
+			// deadline, must not deliver a grant, and must not leave this
+			// worker writing (PLO-520).
+			if err == nil {
+				err = resp.notOurs(s.Spec.StorageVolumeID, s.Spec.FenceEpoch)
+			}
 			if err != nil {
 				var cpErr *CPError
 				if errors.As(err, &cpErr) && cpErr.Fenced() {
