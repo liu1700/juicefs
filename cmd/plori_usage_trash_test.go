@@ -95,7 +95,7 @@ func TestTheTrashIsNotWalkedOnceTheStopHasBegun(t *testing.T) {
 	p := trashTestVolume(m)
 
 	// While the mount is serving, the breakdown is measured.
-	u, err := p.Usage(context.Background())
+	u, err := p.Usage(context.Background(), true)
 	if err != nil {
 		t.Fatalf("Usage on a live mount: %s", err)
 	}
@@ -111,7 +111,7 @@ func TestTheTrashIsNotWalkedOnceTheStopHasBegun(t *testing.T) {
 	// Usage reads.
 	p.stopped = true
 
-	u, err = p.Usage(context.Background())
+	u, err = p.Usage(context.Background(), true)
 	if err != nil {
 		t.Fatalf("Usage after the stop began: %s", err)
 	}
@@ -127,6 +127,31 @@ func TestTheTrashIsNotWalkedOnceTheStopHasBegun(t *testing.T) {
 	}
 }
 
+// TestTheTrashIsNotWalkedWhenTheCallerDidNotAskForIt is the other reason the
+// walk is skipped. The supervisor reads the totals on every health tick and the
+// breakdown only on the report's cadence (PLO-427), because the totals are
+// counters this process already holds while the walk is real Readdir traffic on
+// the supervisor's single loop. A reading that skipped it says so the same way a
+// failed one does: TrashKnown false, and the totals intact.
+func TestTheTrashIsNotWalkedWhenTheCallerDidNotAskForIt(t *testing.T) {
+	m := &countingMeta{}
+	p := trashTestVolume(m)
+
+	u, err := p.Usage(context.Background(), false)
+	if err != nil {
+		t.Fatalf("Usage without the breakdown: %s", err)
+	}
+	if got := m.readdirs.Load(); got != 0 {
+		t.Errorf("the trash was walked %d times for a caller that did not ask", got)
+	}
+	if u.TrashKnown {
+		t.Error("a reading that skipped the walk claimed a breakdown")
+	}
+	if u.Bytes != 60<<20 || u.Inodes != 7 {
+		t.Errorf("used = %d bytes / %d inodes; skipping the walk must leave the totals intact", u.Bytes, u.Inodes)
+	}
+}
+
 // TestAFailedTrashWalkLogsOneLine is the other half of PLO-468's second
 // finding. A walk that fails is a sentence in a card that cannot be written,
 // not an incident: the usage report goes out intact, and the worker log gets
@@ -137,7 +162,7 @@ func TestAFailedTrashWalkLogsOneLine(t *testing.T) {
 	m := &countingMeta{readdirErrno: syscall.EIO}
 	p := trashTestVolume(m)
 
-	u, err := p.Usage(context.Background())
+	u, err := p.Usage(context.Background(), true)
 	if err != nil {
 		t.Fatalf("a failed trash walk failed the whole usage report: %s", err)
 	}

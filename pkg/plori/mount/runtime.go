@@ -184,8 +184,18 @@ type Volume interface {
 	// the lease (PLO-383). A cap of 0 is unlimited, which is what a volume
 	// gets if the profile constant is ever set to 0.
 	SetStagingBacklogCap(blocks int64)
-	// Usage reports current consumption.
-	Usage(ctx context.Context) (Usage, error)
+	// Usage reports current consumption. `withTrash` asks for the breakdown as
+	// well, and it is a parameter rather than always-on because the two halves
+	// cost different things: the totals are counters the metadata engine
+	// already holds, while the breakdown is a bounded walk of the trash
+	// namespaces. The supervisor reads the totals on every health tick and the
+	// breakdown on the report's own cadence (Supervisor.usage).
+	//
+	// With `withTrash` false the returned Usage carries TrashKnown false — the
+	// same "nobody measured it" shape a failed walk produces, which the report
+	// already sends as absent rather than zero. A breakdown is therefore only
+	// ever paired with the totals measured in the same call.
+	Usage(ctx context.Context, withTrash bool) (Usage, error)
 	// ApplyGrant writes a new quota ceiling into the metadata. It must load a
 	// fresh Format from the engine rather than persisting the in-memory one,
 	// which carries the injected credential.

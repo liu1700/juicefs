@@ -674,7 +674,7 @@ func (p *ploriVolume) SetStagingBacklogCap(blocks int64) {
 // meta.Background() is a uid-0 context, which is what reading `.trash` requires; the
 // supervisor's ctx is not passed down because StatFS and the walk take a meta.Context,
 // and cancelling half a walk would report a floor as if it were the total.
-func (p *ploriVolume) Usage(ctx context.Context) (pmount.Usage, error) {
+func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, error) {
 	var total, avail, iused, iavail uint64
 	if st := p.m.StatFS(meta.Background(), meta.RootInode, &total, &avail, &iused, &iavail); st != 0 {
 		return pmount.Usage{}, st
@@ -693,6 +693,14 @@ func (p *ploriVolume) Usage(ctx context.Context) (pmount.Usage, error) {
 	// final report keeps its used_bytes and simply carries no breakdown, and
 	// absent is not zero all the way to the control plane.
 	if p.stopped {
+		return u, nil
+	}
+	// Not on every reading either. The totals above are counters this process
+	// already holds; the walk below is real Readdir traffic over up to
+	// PloriDefaultTrashWalkCap entries, on the supervisor's single loop. Only
+	// the caller knows whether this reading is the one that reports a
+	// breakdown, so only the caller decides (PLO-427).
+	if !withTrash {
 		return u, nil
 	}
 	t, err := meta.PloriMeasureTrash(p.m, meta.Background(), 0)
