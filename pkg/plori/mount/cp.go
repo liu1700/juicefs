@@ -30,6 +30,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/plori/mountspec"
 )
 
 // Refusal codes from docs/design/per-agent-juicefs/mountspec.md §3. A caller
@@ -46,6 +48,11 @@ const (
 	CPCodeRateLimited          = "rate_limited"
 	CPCodeNotConfigured        = "not_configured"
 	CPCodeInternal             = "internal"
+	// CPCodeFormatMismatch answers /format-ack when the volume already carries a
+	// DIFFERENT Format.UUID. Two filesystems on one object prefix is ADR D2's
+	// data loss, so it is terminal on sight: a worker that retried it would be
+	// asking to be told a second time that it is serving the wrong volume.
+	CPCodeFormatMismatch = "format_mismatch"
 )
 
 // CPError is a typed refusal from the control-plane.
@@ -66,6 +73,15 @@ func (e *CPError) Error() string {
 // either is how a fenced writer keeps writing.
 func (e *CPError) Fenced() bool {
 	return e.Code == CPCodeStaleEpoch || e.Code == CPCodeLeaseHeld || e.Code == CPCodeIdentityMismatch
+}
+
+// Retryable reports whether presenting the same request again could get a
+// different answer. Exactly two refusals can: the control-plane did not produce
+// one (5xx — a replica rolling, a database failing over), and it asked the
+// caller to slow down. Every other status is its considered answer about this
+// volume, and asking again only gets it a second time.
+func (e *CPError) Retryable() bool {
+	return e.Status >= http.StatusInternalServerError || e.Code == CPCodeRateLimited
 }
 
 // RenewRequest is what the worker tells the control-plane on a renew beyond
@@ -101,8 +117,14 @@ type LeaseResponse struct {
 	OverBudget bool `json:"over_budget"`
 }
 
-// Client speaks the four follow-up routes of /v1/internal/storage. It never
-// calls /mount-spec: by the time the worker runs, the plugin has already
+// ClientRoutes is every route this Client speaks, declared once in the untagged
+// wire package so the control-plane's own published surface can be compared
+// against it from a module that cannot compile behind the `plori` tag.
+var ClientRoutes = mountspec.ClientRoutes
+
+// Client speaks the five follow-up routes of /v1/internal/storage — renew,
+// release, usage, durable-point and format-ack (mountspec.ClientRoutes). It
+// never calls /mount-spec: by the time the worker runs, the plugin has already
 // spent that call and the resulting spec is in --spec-file.
 type Client struct {
 	BaseURL   string
@@ -185,7 +207,7 @@ func (c *Client) post(ctx context.Context, route string, body, out any) error {
 
 func (c *Client) RenewLease(ctx context.Context, volumeID string, epoch int64, req RenewRequest) (LeaseResponse, error) {
 	var out LeaseResponse
-	err := c.post(ctx, "/v1/internal/storage/lease/renew", map[string]any{
+	err := c.post(ctx, mountspec.RouteLeaseRenew, map[string]any{
 		"volume_id":         volumeID,
 		"fence_epoch":       epoch,
 		"acked_grant_epoch": req.AckedGrantEpoch,
@@ -195,7 +217,7 @@ func (c *Client) RenewLease(ctx context.Context, volumeID string, epoch int64, r
 }
 
 func (c *Client) ReleaseLease(ctx context.Context, volumeID string, epoch int64, reason string) error {
-	return c.post(ctx, "/v1/internal/storage/lease/release", map[string]any{
+	return c.post(ctx, mountspec.RouteLeaseRelease, map[string]any{
 		"volume_id":   volumeID,
 		"fence_epoch": epoch,
 		"reason":      reason,
@@ -203,7 +225,7 @@ func (c *Client) ReleaseLease(ctx context.Context, volumeID string, epoch int64,
 }
 
 func (c *Client) ReportUsage(ctx context.Context, volumeID string, epoch int64, u Usage, at time.Time) error {
-	return c.post(ctx, "/v1/internal/storage/usage", map[string]any{
+	return c.post(ctx, mountspec.RouteUsage, map[string]any{
 		"volume_id":   volumeID,
 		"fence_epoch": epoch,
 		"used_bytes":  u.Bytes,
@@ -213,11 +235,42 @@ func (c *Client) ReportUsage(ctx context.Context, volumeID string, epoch int64, 
 }
 
 func (c *Client) ReportDurablePoint(ctx context.Context, volumeID string, epoch int64, r BarrierResult, replicaTxID string) error {
-	return c.post(ctx, "/v1/internal/storage/durable-point", map[string]any{
+	return c.post(ctx, mountspec.RouteDurablePoint, map[string]any{
 		"volume_id":    volumeID,
 		"fence_epoch":  epoch,
 		"durable_at":   r.DurableAt,
 		"barrier_at":   r.BarrierAt,
 		"replica_txid": replicaTxID,
 	}, nil)
+}
+
+// VolumeStateResponse is what /format-ack answers with: where the control-plane
+// put the volume, and the ceiling it carries once it is there.
+type VolumeStateResponse struct {
+	StorageVolumeID string    `json:"storage_volume_id"`
+	State           string    `json:"state"`
+	Grant           GrantSpec `json:"grant"`
+	UsedBytes       int64     `json:"used_bytes"`
+	UsedInodes      int64     `json:"used_inodes"`
+}
+
+// AckFormat reports the Format.UUID this volume's filesystem carries. It is the
+// other half of the FormatSpec the MountSpec delivered: the control-plane
+// authorises the format, this worker executes it, and this call is what tells
+// the control-plane which filesystem now exists — the transition that moves a
+// generation-1 volume `allocating -> formatted -> active` and, with it, the one
+// that makes the Agent's own storage the storage the Files panel reads
+// (PLO-373, PLO-420).
+//
+// It is idempotent on the same UUID (a replayed ack answers 200 with the state
+// the volume has since reached) and terminal on a different one
+// (409 format_mismatch).
+func (c *Client) AckFormat(ctx context.Context, volumeID string, epoch int64, formatUUID string) (VolumeStateResponse, error) {
+	var out VolumeStateResponse
+	err := c.post(ctx, mountspec.RouteFormatAck, map[string]any{
+		"volume_id":   volumeID,
+		"fence_epoch": epoch,
+		"format_uuid": formatUUID,
+	}, &out)
+	return out, err
 }

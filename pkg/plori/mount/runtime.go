@@ -231,6 +231,11 @@ type ControlPlane interface {
 	ReleaseLease(ctx context.Context, volumeID string, epoch int64, reason string) error
 	ReportUsage(ctx context.Context, volumeID string, epoch int64, u Usage, at time.Time) error
 	ReportDurablePoint(ctx context.Context, volumeID string, epoch int64, r BarrierResult, replicaTxID string) error
+	// AckFormat tells the control-plane which filesystem this volume is. It is
+	// the only call on this interface that is made once and never again: the
+	// control-plane holds no Format.UUID until it lands, and holds it for the
+	// life of the volume afterwards (PLO-420).
+	AckFormat(ctx context.Context, volumeID string, epoch int64, formatUUID string) (VolumeStateResponse, error)
 }
 
 // Replicator is the metadata-replica half.

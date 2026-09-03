@@ -146,6 +146,24 @@ await_ready "$WORK/state" || { cat "$WORK/worker1.log"; fail "worker never repor
 python3 -c "import json;d=json.load(open('$WORK/state/ready'));assert d['epoch']==1,d" \
   || fail "ready file does not name epoch 1"
 
+# The volume the control-plane knows about has to be the volume the Agent is
+# about to be handed. /format-ack is what makes those the same thing: it records
+# the Format.UUID and moves a generation-1 volume to `active`. Without it the
+# volume stays `allocating`, the Files router finds no active generation and
+# serves the Agent out of the other storage plane while this mount is its
+# filesystem — one Agent, two filesystems (PLO-420).
+acked_uuid=$(sed -n 's|^/v1/internal/storage/format-ack uuid=\([^ ]*\) epoch=.*|\1|p' "$JOURNAL" | head -1)
+[ -n "$acked_uuid" ] || { cat "$WORK/worker1.log"; fail "the first boot formatted but never acknowledged the format"; }
+grep -q '^/v1/internal/storage/format-ack uuid=.* epoch=1$' "$JOURNAL" \
+  || fail "the format was acknowledged under the wrong epoch: $(grep format-ack "$JOURNAL")"
+
+# The worker reported the filesystem it is actually serving, not something it
+# made up: `juicefs status` reads the UUID out of the metadata the mount opened.
+meta_uuid=$("$PLORI_BIN" status "sqlite3://$WORK/state/meta.db" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['Setting']['UUID'])")
+[ "$acked_uuid" = "$meta_uuid" ] \
+  || fail "acknowledged uuid $acked_uuid is not the mounted filesystem's $meta_uuid"
+
 echo "durable-bytes-from-generation-1" > "$WORK/mnt/probe"
 mkdir -p "$WORK/mnt/dir/nested"
 head -c 1048576 /dev/urandom > "$WORK/mnt/dir/nested/blob"
@@ -176,12 +194,22 @@ grep -q '/v1/internal/storage/usage' "$JOURNAL" || fail "usage was never reporte
 grep -q 'UNAUTHORIZED' "$JOURNAL" && fail "the worker presented a token the control-plane rejected"
 [ -f "$WORK/state/clean" ] || fail "the clean-stop marker was not written"
 
-format_uuid=$(python3 -c "import json;print(json.load(open('$WORK/state/durable-point.json'))['volume'])" >/dev/null 2>&1; \
-  "$PLORI_BIN" status "sqlite3://$WORK/state/meta.db" | python3 -c "import json,sys;print(json.load(sys.stdin)['Setting']['UUID'])")
-[ -n "$format_uuid" ] || fail "could not read the format UUID back"
-
 echo "== generation 2: restore into a fresh state dir under a new epoch =="
+# The second publish is built out of what the CONTROL PLANE learned, exactly as
+# the real one is: the acknowledged UUID becomes `expected_uuid`, and with it
+# `may_format` turns false for the rest of the volume's life. Reading the UUID
+# out of the local metadata here instead would let a missing ack pass unnoticed,
+# which is how PLO-420 survived every gate it had.
+format_uuid=$acked_uuid
 write_spec 2 "$WORK/spec2.json" "$format_uuid"
+python3 -c "
+import json
+s = json.load(open('$WORK/spec2.json'))
+assert s['may_format'] is False, s
+assert s['format']['expected_uuid'] == '$format_uuid', s
+assert s['format_uuid'] == '$format_uuid', s
+" || fail "the second publish still authorises a format"
+acks_before_second_boot=$(grep -c 'format-ack' "$JOURNAL")
 run_worker "$WORK/spec2.json" "$WORK/mnt2" "$WORK/state2" "$WORK/cache2" "$WORK/worker2.log"
 await_ready "$WORK/state2" || { cat "$WORK/worker2.log"; fail "restored worker never reported ready"; }
 
@@ -197,6 +225,10 @@ wait "$WORKER_PID"; worker_exit=$?
 set -e
 WORKER_PID=""
 [ "$worker_exit" -eq 0 ] || { cat "$WORK/worker2.log"; fail "restored worker exited $worker_exit, want 0"; }
+
+# A volume the control-plane already has a UUID for is never acknowledged again.
+[ "$(grep -c 'format-ack' "$JOURNAL")" -eq "$acks_before_second_boot" ] \
+  || fail "the second boot acknowledged a format the control-plane had already recorded"
 
 echo "== refusals =="
 # An unknown credential_source must be refused with exit 64, not fallen back on.
