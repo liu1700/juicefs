@@ -8,6 +8,7 @@ on:
       - ".github/workflows/plori.yml"
       - "cmd/**"
       - "hack/plori-profile/**"
+      - "hack/plori-mount-e2e/**"
       - "hack/check-govulncheck.py"
       - "hack/check_govulncheck_test.py"
       - "hack/install-plori-scanners.sh"
