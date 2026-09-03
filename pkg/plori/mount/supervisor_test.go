@@ -194,6 +194,10 @@ type fakeCP struct {
 	onGrow   func(GrantSpec) GrantSpec
 	renews   []RenewRequest
 	released string
+	// durableTxID is the anchor the worker last reported, kept so a test can
+	// assert that the local durable-point file and the control-plane were told
+	// the same instant (PLO-416).
+	durableTxID string
 }
 
 func (c *fakeCP) record(name string) { c.mu.Lock(); c.calls = append(c.calls, name); c.mu.Unlock() }
@@ -241,7 +245,10 @@ func (c *fakeCP) ReportUsage(context.Context, string, int64, Usage, time.Time) e
 	c.record("usage")
 	return nil
 }
-func (c *fakeCP) ReportDurablePoint(context.Context, string, int64, BarrierResult, string) error {
+func (c *fakeCP) ReportDurablePoint(_ context.Context, _ string, _ int64, _ BarrierResult, txid string) error {
+	c.mu.Lock()
+	c.durableTxID = txid
+	c.mu.Unlock()
 	c.record("durable_point")
 	return nil
 }
