@@ -353,7 +353,7 @@ func (c *fakeCP) AckFormat(_ context.Context, volumeID string, epoch int64, uuid
 	if err != nil {
 		return VolumeStateResponse{}, err
 	}
-	return VolumeStateResponse{StorageVolumeID: volumeID, State: VolumeStateActive}, nil
+	return VolumeStateResponse{State: VolumeStateActive}, nil
 }
 
 // formatAcks is every /format-ack the worker made, in order.

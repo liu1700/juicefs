@@ -128,13 +128,26 @@ type RenewRequest struct {
 	Grow bool `json:"grow,omitempty"`
 }
 
-// LeaseResponse is the answer to renew and release.
+// LeaseResponse is the answer to renew. The control-plane answers release with
+// the same body, but ReleaseLease posts it with a nil decode target, so this
+// struct describes exactly one readable answer.
+//
+// There is deliberately no `released` field, and that is the whole finding of
+// PLO-521 (2): the control-plane sets `released: true` only on /lease/release,
+// which is the LAST call a stopping worker makes — the mount is unmounted, the
+// replicator is down and the process is on its way to an exit code that is
+// already decided. There is no step left that could act on `released: false`,
+// so reading it could only produce a second log line saying what
+// `lease_release_failed` already says, and a decoded-and-ignored field is one a
+// future reader trusts (that is how /usage and /durable-point ended up claiming
+// a grant channel nobody read, PLO-478). A release the control-plane did not
+// honour is its problem to clean up: the lease has a TTL, and the successor
+// fences on the epoch, not on this flag.
 type LeaseResponse struct {
 	StorageVolumeID string    `json:"storage_volume_id"`
 	FenceEpoch      int64     `json:"fence_epoch"`
 	LeaseExpiresAt  time.Time `json:"lease_expires_at"`
 	Grant           GrantSpec `json:"grant"`
-	Released        bool      `json:"released"`
 	// OverBudget answers a Grow the account could not fund: the grant epoch is
 	// unchanged, the worker keeps the ceiling it has, and the user sees the
 	// quota-full surface (PLO-337). It is deliberately not an error — a renew
@@ -345,13 +358,35 @@ func (c *Client) ReportDurablePoint(ctx context.Context, volumeID string, epoch 
 }
 
 // VolumeStateResponse is what /format-ack answers with: where the control-plane
-// put the volume, and the ceiling it carries once it is there.
+// put the volume. One field, because one field is what this worker reads —
+// `state` names the transition the ack produced (`formatted`, or `active` once
+// generation 1 self-activates) and reaches the `format_acked` log line, which is
+// how an operator tells "the control-plane recorded my filesystem" from "the
+// control-plane answered 200 and left the volume allocating".
+//
+// The ceiling and the counters this answer used to carry are PLO-521 (1) and
+// (3), and both are deleted rather than consumed:
+//
+//   - the grant. A freshly formatted volume is NOT waiting for a ceiling: the
+//     MountSpec that authorised the format carried one, and Supervisor.start
+//     applies it before the mount serves anything (`s.applyGrant(ctx, g)` at the
+//     end of start, which Run calls before ackFormat). For this answer's grant to
+//     differ, the allocator would have to have moved the ceiling inside one boot
+//     (~3.5 s in staging), and it can only have moved it UP — a decrease is never
+//     issued to a volume a writer holds (storagequota ErrGrantHeldByWriter), and
+//     this writer has held the lease since the spec was issued. An increase that
+//     late lands on the next renew, at most one renew interval (20 s) behind, on
+//     a volume created seconds ago and therefore empty. Against that: this answer
+//     carries NO fence_epoch, so applying a ceiling from it would mean applying
+//     an unattributable body — the exact hole PLO-520 closed on the renew — which
+//     would need a new control-plane field and a second copy of notOurs first.
+//     PLO-478 already ruled that /lease/renew is the ONE grant channel; this is
+//     the same ruling, so it gets the same answer.
+//   - used_bytes / used_inodes / storage_volume_id. The counters belong to a
+//     volume this worker has just created, so they are zero by construction, and
+//     the id is one this same call put on the request. Nothing to learn.
 type VolumeStateResponse struct {
-	StorageVolumeID string    `json:"storage_volume_id"`
-	State           string    `json:"state"`
-	Grant           GrantSpec `json:"grant"`
-	UsedBytes       int64     `json:"used_bytes"`
-	UsedInodes      int64     `json:"used_inodes"`
+	State string `json:"state"`
 }
 
 // AckFormat reports the Format.UUID this volume's filesystem carries. It is the

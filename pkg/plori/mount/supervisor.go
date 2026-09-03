@@ -252,7 +252,20 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 	// every renew tells the control-plane the restore this mount was admitted
 	// for is over, and its slot may go to the next queued one (PLO-418).
 	s.markMounted()
-	s.log("ready", "volume", s.Spec.StorageVolumeID, "epoch", s.Spec.FenceEpoch)
+	// spec_age is MountSpec.IssuedAt put to the use its own doc comment claims
+	// for it ("for the worker's log", PLO-521 (4)): the gap between the moment
+	// the control-plane built this authority and the moment a mount started
+	// serving under it. Only this line can measure that gap — the control-plane
+	// sees one end and the worker the other — and it is the number that
+	// separates "the mount was slow" from "the spec was already stale when the
+	// plugin handed it over" on a boot that took a suspicious amount of time
+	// (a re-published volume, a node that stalled between NodeStage and
+	// NodePublish, a plugin that retried). IssuedAt travels too so the line
+	// joins to the control-plane's own issuance record; the age is spelled out
+	// rather than left to be subtracted from two timestamps in two clocks.
+	s.log("ready", "volume", s.Spec.StorageVolumeID, "epoch", s.Spec.FenceEpoch,
+		"spec_issued_at", s.Spec.IssuedAt.UTC().Format(time.RFC3339Nano),
+		"spec_age", s.now().UTC().Sub(s.Spec.IssuedAt.UTC()).Round(time.Millisecond).String())
 
 	return s.loop(ctx, stopped, serveErr)
 }
