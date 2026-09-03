@@ -227,9 +227,13 @@ type fakeCP struct {
 	overBudget bool
 	// onGrow is the allocator: it answers a RenewRequest carrying Grow with
 	// whatever the account can fund. nil means an allocator that never moves.
-	onGrow   func(GrantSpec) GrantSpec
-	renews   []RenewRequest
-	released string
+	onGrow func(GrantSpec) GrantSpec
+	// renewEcho rewrites the fencing echo the renew answer carries. nil is the
+	// honest control-plane: it echoes back the volume and epoch the request
+	// presented, which is the only answer the worker will accept (PLO-520).
+	renewEcho func(volumeID string, epoch int64) (string, int64)
+	renews    []RenewRequest
+	released  string
 	// ackErr is what /format-ack answers with; nil is a control-plane that
 	// records the UUID. acks is every attempt, so a test can assert both what
 	// was reported and how many times it was tried.
@@ -260,7 +264,14 @@ func (c *fakeCP) order() []string {
 	defer c.mu.Unlock()
 	return append([]string(nil), c.calls...)
 }
-func (c *fakeCP) RenewLease(_ context.Context, _ string, _ int64, req RenewRequest) (LeaseResponse, error) {
+
+// The echo is not decoration: since PLO-520 the worker refuses a renew answer
+// whose storage_volume_id / fence_epoch are not the ones it presented, so a
+// double that answered without them would fence every mount it serves. Echoing
+// the arguments is also what the real control-plane does — issuer.go answers
+// vol.ID and the renewed lease's epoch, having refused any other epoch before
+// it got there.
+func (c *fakeCP) RenewLease(_ context.Context, volumeID string, epoch int64, req RenewRequest) (LeaseResponse, error) {
 	c.record("renew")
 	c.mu.Lock()
 	c.renews = append(c.renews, req)
@@ -279,7 +290,17 @@ func (c *fakeCP) RenewLease(_ context.Context, _ string, _ int64, req RenewReque
 	if c.expiry != nil {
 		exp = c.expiry()
 	}
-	return LeaseResponse{LeaseExpiresAt: exp, Grant: grant, OverBudget: overBudget}, nil
+	echoVolume, echoEpoch := volumeID, epoch
+	if c.renewEcho != nil {
+		echoVolume, echoEpoch = c.renewEcho(volumeID, epoch)
+	}
+	return LeaseResponse{
+		StorageVolumeID: echoVolume,
+		FenceEpoch:      echoEpoch,
+		LeaseExpiresAt:  exp,
+		Grant:           grant,
+		OverBudget:      overBudget,
+	}, nil
 }
 
 // renewRequests is every RenewRequest the worker sent, in order.
@@ -956,6 +977,22 @@ func TestTheMarkerReclaimFailsClosedOnEveryUnprovenCase(t *testing.T) {
 		"the control-plane cannot be reached to prove it": {
 			fencer: &fakeFencer{err: ErrFenceMarkerHeld, marker: ours},
 			cp:     &fakeCP{renewErr: context.DeadlineExceeded},
+		},
+		// A 200 is only a proof if it is a proof about THIS volume. The reclaim
+		// asks the control-plane "am I the live holder of this epoch", and an
+		// answer that names another volume answers a question nobody asked
+		// (PLO-520).
+		"the control-plane answered about another volume": {
+			fencer: &fakeFencer{err: ErrFenceMarkerHeld, marker: ours},
+			cp: &fakeCP{renewEcho: func(_ string, epoch int64) (string, int64) {
+				return "99999999-9999-9999-9999-999999999999", epoch
+			}},
+		},
+		"the control-plane answered about another epoch": {
+			fencer: &fakeFencer{err: ErrFenceMarkerHeld, marker: ours},
+			cp: &fakeCP{renewEcho: func(volumeID string, epoch int64) (string, int64) {
+				return volumeID, epoch + 1
+			}},
 		},
 	}
 	for name, tc := range tests {

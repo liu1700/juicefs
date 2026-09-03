@@ -55,6 +55,13 @@ const (
 	CPCodeFormatMismatch = "format_mismatch"
 )
 
+// CPCodeAnswerNotOurs is the one refusal code on this wire the control-plane
+// never sends: this client manufactures it for a 200 whose fencing echo names
+// a volume or an epoch other than the ones the request presented. It sits
+// outside the block above for exactly that reason — mountspec.md §3 lists what
+// the server may answer, and this is not one of them.
+const CPCodeAnswerNotOurs = "answer_not_ours"
+
 // CPError is a typed refusal from the control-plane.
 type CPError struct {
 	Status int
@@ -67,12 +74,15 @@ func (e *CPError) Error() string {
 }
 
 // Fenced reports whether this refusal means the worker has lost the epoch.
-// Both members are terminal: mountspec.md says stale_epoch means "the
+// Every member is terminal: mountspec.md says stale_epoch means "the
 // presented epoch was moved past or never issued", and lease_held on a renew
-// means someone else holds the volume. Neither is retryable, and retrying
-// either is how a fenced writer keeps writing.
+// means someone else holds the volume. None of them is retryable, and retrying
+// one is how a fenced writer keeps writing. answer_not_ours joins them
+// because an answer this worker cannot attribute is not weaker evidence than
+// a refusal, it is the same evidence with no name on it (LeaseResponse.notOurs).
 func (e *CPError) Fenced() bool {
-	return e.Code == CPCodeStaleEpoch || e.Code == CPCodeLeaseHeld || e.Code == CPCodeIdentityMismatch
+	return e.Code == CPCodeStaleEpoch || e.Code == CPCodeLeaseHeld ||
+		e.Code == CPCodeIdentityMismatch || e.Code == CPCodeAnswerNotOurs
 }
 
 // Retryable reports whether presenting the same request again could get a
@@ -131,6 +141,56 @@ type LeaseResponse struct {
 	// that failed because the account is full would fence a mount over a
 	// billing state.
 	OverBudget bool `json:"over_budget"`
+}
+
+// notOurs is the fencing echo check: it returns a refusal when this answer is
+// not addressed to the request that got it, and nil when it is. Every caller
+// runs it BEFORE reading anything else out of the body, because the deadline
+// and the grant are taken from the same body as the echo, and applying either
+// one first is the bug this exists to prevent (PLO-520, contract rev 3.10).
+//
+// The comparison is exact, byte for byte. An honest renew answer echoes
+// precisely what the request presented: the control-plane refuses any other
+// epoch with stale_epoch before it can answer 200, and both sides render the
+// volume id from the same uuid.UUID, so there is no case-folding or
+// normalisation for a mismatch to hide behind.
+//
+// It is TERMINAL — the caller treats it exactly like stale_epoch — and the
+// argument is invariant 1 plus the shape of the stop:
+//
+//   - a mismatch is not evidence about one body, it is evidence about the
+//     channel. Something between this worker and the control-plane does not
+//     preserve request-to-answer identity, so the NEXT answer is equally
+//     unattributable, including one that happens to echo our own values: a
+//     channel that can hand us another volume's body can hand us our own
+//     volume's body from before the epoch moved. Dropping one answer and
+//     retrying assumes the fault was a single bad body; nothing in the
+//     evidence says that.
+//   - dropping it and letting the write-stop margin catch the real case ends
+//     in the WRONG stop. An expired deadline is ReasonFenced: an ordered stop
+//     with a bounded flush and a final replica sync. If the epoch really did
+//     move, that sync pushes this writer's remaining history into the prefix
+//     its successor restores from — F-1's data loss, the exact thing
+//     ReasonFencedOutOfBand exists to prevent. Refusing on sight is the only
+//     route to the stop shape that uploads nothing.
+//   - the asymmetry settles it. Stopping a healthy mount costs the Agent a
+//     restart, and a paused Agent task is acceptable; continuing to write
+//     while the epoch may belong to somebody else costs acknowledged data,
+//     which is not.
+func (r LeaseResponse) notOurs(volumeID string, epoch int64) error {
+	if r.StorageVolumeID == volumeID && r.FenceEpoch == epoch {
+		return nil
+	}
+	// Status 200 rather than a synthetic error status: this is what the
+	// control-plane really answered, and it keeps Retryable() false for the
+	// right reason — a 200 is its considered answer, so asking again only
+	// gets it a second time.
+	return &CPError{
+		Status: http.StatusOK,
+		Code:   CPCodeAnswerNotOurs,
+		Msg: fmt.Sprintf("answer names volume %q epoch %d, this worker presented volume %q epoch %d",
+			r.StorageVolumeID, r.FenceEpoch, volumeID, epoch),
+	}
 }
 
 // ClientRoutes is every route this Client speaks, declared once in the untagged

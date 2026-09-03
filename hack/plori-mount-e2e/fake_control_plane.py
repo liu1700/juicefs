@@ -89,11 +89,18 @@ class Handler(BaseHTTPRequestHandler):
 
         self._record(route)
         if route.endswith("/lease/renew"):
+            # The fencing echo is what the request presented, which is what the
+            # real control-plane answers: it refuses any other epoch before it
+            # can reach a 200. Since PLO-520 the worker compares it and fences
+            # itself on a mismatch, so a hard-coded echo here would fail every
+            # generation but the first (the harness mounts generation 2 under a
+            # new epoch, and VOLUME_ID carries a timestamp).
+            body = json.loads(payload or b"{}")
             self._json(
                 200,
                 {
-                    "storage_volume_id": "e2e",
-                    "fence_epoch": 1,
+                    "storage_volume_id": body.get("volume_id", ""),
+                    "fence_epoch": body.get("fence_epoch", 0),
                     "lease_expires_at": now_plus(LEASE_TTL_SECONDS),
                     "grant": GRANT,
                     "released": False,
