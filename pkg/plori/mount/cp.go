@@ -85,10 +85,26 @@ func (e *CPError) Retryable() bool {
 }
 
 // RenewRequest is what the worker tells the control-plane on a renew beyond
-// "I am still here". Both fields are about the grant, and both ride the renew
+// "I am still here". The grant fields and the mounted flag all ride the renew
 // because renewal is the only regular round trip a live mount makes: one call,
 // one authorisation, one place where a fenced writer stops being heard.
 type RenewRequest struct {
+	// Mounted says this worker has a serving filesystem: the mount is up, the
+	// format is acked and the `ready` file is written. It is the signal the
+	// control-plane frees the restore-admission slot on (PLO-418).
+	//
+	// It exists because "the first renew" is not the same instant as "the
+	// restore is over". The same-holder marker reclaim renews DURING startup,
+	// before restoring anything (Supervisor.reclaimOwnMarker, PLO-323 F-6), so
+	// on the crash-and-replay path a slot keyed on the first renew frees while
+	// this worker is still pulling LTX and the control-plane admits the next
+	// queued restore over the top of it.
+	//
+	// Every renew after `ready` carries it, not just the first: the flag is a
+	// state of this worker, not an event, and a control-plane that lost the
+	// renew carrying the edge would otherwise hold the slot for a lease TTL.
+	// Freeing an already-free slot is a no-op on the control-plane side.
+	Mounted bool `json:"mounted,omitempty"`
 	// AckedGrantEpoch is the grant epoch this worker has applied locally, or 0
 	// when there is nothing new to acknowledge. The allocator counts an
 	// un-acknowledged grant as reserved but not enforced, so this is what lets
@@ -207,12 +223,22 @@ func (c *Client) post(ctx context.Context, route string, body, out any) error {
 
 func (c *Client) RenewLease(ctx context.Context, volumeID string, epoch int64, req RenewRequest) (LeaseResponse, error) {
 	var out LeaseResponse
-	err := c.post(ctx, mountspec.RouteLeaseRenew, map[string]any{
+	body := map[string]any{
 		"volume_id":         volumeID,
 		"fence_epoch":       epoch,
 		"acked_grant_epoch": req.AckedGrantEpoch,
 		"grow":              req.Grow,
-	}, &out)
+	}
+	// Sent only when true, matching the `omitempty` on the struct: a pre-ready
+	// renew — the marker reclaim — must be indistinguishable on the wire from
+	// the renew of a worker built before this field existed, because the
+	// control-plane reads both the same way (absent = not yet mounted, keep the
+	// slot). Sending `"mounted": false` would be the same decision spelled at
+	// twice the width, and every absent-means-false reader would have to agree.
+	if req.Mounted {
+		body["mounted"] = true
+	}
+	err := c.post(ctx, mountspec.RouteLeaseRenew, body, &out)
 	return out, err
 }
 
