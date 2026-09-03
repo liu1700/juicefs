@@ -3081,7 +3081,7 @@ func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
 	if !m.toTrash(parent) {
 		return 0
 	}
-	name := time.Now().UTC().Format("2006-01-02-15")
+	name := TrashBucketName(time.Now())
 	m.Lock()
 	defer m.Unlock()
 	if name == m.subTrash.name {
@@ -3114,12 +3114,7 @@ func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
 }
 
 func (m *baseMeta) trashEntry(parent, inode Ino, name string) string {
-	s := fmt.Sprintf("%d-%d-%s", parent, inode, name)
-	if len(s) > MaxName {
-		s = s[:MaxName]
-		logger.Warnf("File name is too long as a trash entry, truncating it: %s -> %s", name, s)
-	}
-	return s
+	return TrashEntryName(parent, inode, name)
 }
 
 func (m *baseMeta) cleanupTrash(ctx Context) {
@@ -3242,7 +3237,7 @@ func (m *baseMeta) CleanupTrashBefore(ctx Context, edge time.Time, increProgress
 			return errno(ctx.Err())
 		}
 		e := entries[0]
-		ts, err := time.Parse("2006-01-02-15", string(e.Name))
+		ts, err := time.Parse(trashBucketLayout, string(e.Name))
 		if err != nil {
 			logger.Warnf("bad entry as a subTrash: %s", e.Name)
 			entries = entries[1:]
@@ -3273,7 +3268,7 @@ func (m *baseMeta) scanTrashFiles(ctx Context, scan trashFileScan) error {
 	}
 	var subEntries []*Entry
 	for _, entry := range entries {
-		ts, err := time.Parse("2006-01-02-15", string(entry.Name))
+		ts, err := time.Parse(trashBucketLayout, string(entry.Name))
 		if err != nil {
 			logger.Warnf("bad entry as a subTrash: %s", entry.Name)
 			continue
