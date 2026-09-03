@@ -478,6 +478,12 @@ type ploriVolume struct {
 	identity  pmount.FormatIdentity
 	v         *vfs.VFS
 	sessioned bool
+	// stopped is the supervisor's stop, as the volume sees it. Close is the one
+	// call the supervisor makes on every shape of stop and never otherwise, so
+	// it is where that state arrives; Usage is the only thing that touches the
+	// metadata engine afterwards, and the only thing that reads it. Both run on
+	// the supervisor's own goroutine, so a plain bool is the whole of it.
+	stopped bool
 }
 
 func (p *ploriVolume) Identity() pmount.FormatIdentity { return p.identity }
@@ -674,6 +680,21 @@ func (p *ploriVolume) Usage(ctx context.Context) (pmount.Usage, error) {
 		return pmount.Usage{}, st
 	}
 	u := pmount.Usage{Bytes: int64(total - avail), Inodes: int64(iused)}
+	// Not once the stop has begun. The ordered stop detaches the mount and
+	// closes the metadata session (shutdown step 4) BEFORE it posts the final
+	// usage (step 6), and the two halves of this call do not survive that
+	// equally: StatFS answers from counters this process holds in memory, while
+	// the trash walk is a real Readdir against a session that is gone. It
+	// returns EIO, and the error it returns is not a syscall.Errno, so
+	// pkg/meta's errno() logs it with a full Go stack trace (utils.go) — which
+	// is what a staging shutdown printed into the worker log (PLO-468).
+	//
+	// Skipping is the same fail-closed answer a failed walk already gives: the
+	// final report keeps its used_bytes and simply carries no breakdown, and
+	// absent is not zero all the way to the control plane.
+	if p.stopped {
+		return u, nil
+	}
 	t, err := meta.PloriMeasureTrash(p.m, meta.Background(), 0)
 	if err != nil {
 		logger.Warnf("plori: measuring the trash of %s failed, reporting usage without the breakdown: %s", p.identity.Name, err)
@@ -725,7 +746,12 @@ func (p *ploriVolume) Unmount(ctx context.Context) error {
 	return doUmount(p.paths.MountPoint, true)
 }
 
+// Close ends the metadata session and shuts the engine and the object client
+// down. It is the last thing every stop does to the volume, so it is also where
+// the volume learns that the supervisor is stopping: `stopped` is what keeps
+// Usage from walking the trash through a session that no longer exists.
 func (p *ploriVolume) Close() error {
+	p.stopped = true
 	var err error
 	if p.sessioned {
 		err = p.m.CloseSession()

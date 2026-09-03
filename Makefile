@@ -128,7 +128,7 @@ test.plori.unit:
 # argv. The rest of ./cmd's suite needs a Redis and a real object store, so this
 # names its tests rather than running the package.
 	$(PLORI_CGO) go test -count=1 -timeout 5m -tags "$(PLORI_TAGS)" ./cmd/ \
-		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath'
+		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath|TestTheTrashIsNotWalked|TestAFailedTrashWalk'
 
 # Upstream's own unit tests on the default build. Nothing in the Plori workflow
 # ran a default-build `go test`, which is why pkg/chunk/cached_store_test.go sat
