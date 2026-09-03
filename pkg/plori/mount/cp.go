@@ -76,8 +76,8 @@ func (e *CPError) Error() string {
 // Fenced reports whether this refusal means the worker has lost the epoch.
 // Every member is terminal: mountspec.md says stale_epoch means "the
 // presented epoch was moved past or never issued", and lease_held on a renew
-// means someone else holds the volume. Neither is retryable, and retrying
-// either is how a fenced writer keeps writing. answer_not_ours joins them
+// means someone else holds the volume. None of them is retryable, and retrying
+// one is how a fenced writer keeps writing. answer_not_ours joins them
 // because an answer this worker cannot attribute is not weaker evidence than
 // a refusal, it is the same evidence with no name on it (LeaseResponse.notOurs).
 func (e *CPError) Fenced() bool {
