@@ -1024,6 +1024,12 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	// this call the chunk store is unlimited, which is upstream's behaviour and
 	// the state PLO-346 measured 1,008 staged blocks in.
 	s.retuneBacklog()
+	// Read the volume's usage before anything can publish health.json. Until
+	// PLO-427 the number in that file came only from the /usage report — every
+	// fifteenth renewal, five minutes at the production interval — so a mount
+	// published `used_bytes: 0` until the first report landed, which is how a
+	// whole staging run read zero for a volume holding 34 files.
+	s.usage(ctx)
 
 	renew := time.NewTicker(s.Spec.LeaseRenewInterval.D())
 	defer renew.Stop()
@@ -1142,6 +1148,13 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			if f := s.checkReplication(ctx); f != nil {
 				return f
 			}
+			// The usage snapshot is refreshed on the tick that publishes it,
+			// for the same reason the replication check runs here. This ticker
+			// exists because a long renew interval must not make a healthy
+			// mount look stale, and the figures inside the file are no
+			// different: sampling used_bytes at the /usage report's cadence is
+			// what left it at 0 for a whole staging run (PLO-427).
+			s.usage(ctx)
 			s.writeHealth()
 
 		case <-credential.C:
@@ -1489,15 +1502,32 @@ func (s *Supervisor) growRefused() {
 	s.log("grant_over_budget", "epoch", epoch)
 }
 
-func (s *Supervisor) reportUsage(ctx context.Context) {
+// usage reads the volume's consumption and caches it in lastUsage. It is the
+// only caller of Volume.Usage in the worker: health.json publishes the cached
+// snapshot and the /usage report sends what this returns, so the file and the
+// report cannot carry different figures for the same mount.
+//
+// A failed reading keeps the last good snapshot rather than replacing it with a
+// zero. "Nobody could measure this volume" is not the same fact as "this volume
+// is empty", and health.json is what an operator reads to tell an idle Agent
+// from one stuck against a ceiling (PLO-406).
+func (s *Supervisor) usage(ctx context.Context) (Usage, bool) {
 	u, err := s.vol.Usage(ctx)
 	if err != nil {
 		s.log("usage_read_failed", "error", err.Error())
-		return
+		return Usage{}, false
 	}
 	s.mu.Lock()
 	s.lastUsage = u
 	s.mu.Unlock()
+	return u, true
+}
+
+func (s *Supervisor) reportUsage(ctx context.Context) {
+	u, ok := s.usage(ctx)
+	if !ok {
+		return
+	}
 	if err := s.Deps.CP.ReportUsage(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, u, s.now().UTC()); err != nil {
 		s.log("usage_report_failed", "error", err.Error())
 	}

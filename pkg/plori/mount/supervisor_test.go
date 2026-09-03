@@ -47,6 +47,7 @@ type fakeVolume struct {
 	repaired    int
 	barrier     func(context.Context) (BarrierResult, error)
 	usage       Usage
+	usageErr    error
 	fenced      bool
 	writeExpiry time.Time
 	calls       []string
@@ -125,7 +126,19 @@ func (f *fakeVolume) lastCap() int64 {
 	}
 	return c[len(c)-1]
 }
-func (f *fakeVolume) Usage(context.Context) (Usage, error) { return f.usage, nil }
+func (f *fakeVolume) Usage(context.Context) (Usage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.usage, f.usageErr
+}
+
+// setUsage moves the volume under a running supervisor, which is what a writing
+// Agent does.
+func (f *fakeVolume) setUsage(u Usage, err error) {
+	f.mu.Lock()
+	f.usage, f.usageErr = u, err
+	f.mu.Unlock()
+}
 func (f *fakeVolume) ApplyGrant(_ context.Context, bytes, inodes int64) error {
 	f.record("apply_grant")
 	f.mu.Lock()
@@ -204,6 +217,8 @@ type fakeCP struct {
 	// assert that the local durable-point file and the control-plane were told
 	// the same instant (PLO-416).
 	durableTxID string
+	// usages is every usage figure the worker reported, in order.
+	usages []Usage
 }
 
 // formatAck is one observed /format-ack call. readyExists is the point of it:
@@ -257,9 +272,20 @@ func (c *fakeCP) ReleaseLease(_ context.Context, _ string, _ int64, reason strin
 	c.mu.Unlock()
 	return nil
 }
-func (c *fakeCP) ReportUsage(context.Context, string, int64, Usage, time.Time) error {
-	c.record("usage")
+func (c *fakeCP) ReportUsage(_ context.Context, _ string, _ int64, u Usage, _ time.Time) error {
+	c.mu.Lock()
+	c.calls = append(c.calls, "usage")
+	c.usages = append(c.usages, u)
+	c.mu.Unlock()
 	return nil
+}
+
+// reportedUsages is every figure the worker posted to /usage, in order. It is
+// what health.json is checked against: the two must never disagree (PLO-427).
+func (c *fakeCP) reportedUsages() []Usage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]Usage(nil), c.usages...)
 }
 func (c *fakeCP) ReportDurablePoint(_ context.Context, _ string, _ int64, _ BarrierResult, txid string) error {
 	c.mu.Lock()
