@@ -133,7 +133,7 @@ code never gets reused for a different meaning.
 |---|---|---|
 | 0 | clean stop after SIGTERM: fenced, barrier, unmount, final sync, lease released | normal |
 | 64 | spec invalid, unsupported `credential_source`, or an unknown field the worker must not ignore | fail publish, no retry |
-| 65 | identity mismatch (Format Name/UUID against the spec, or against the `juicefs_uuid` object) | fail publish, no retry; the control-plane is told via `/lease/release reason=identity_mismatch` |
+| 65 | identity mismatch (Format Name/UUID against the spec or the `juicefs_uuid` object, or the control-plane refused the format acknowledgement) | fail publish, no retry; the control-plane is told via `/lease/release reason=identity_mismatch` |
 | 66 | lease lost — renew returned `stale_epoch`/`lease_held`, the deadline passed, the fence marker was already held, or the FUSE session ended on its own | unpublish; the abnormal-exit guard cancels the run |
 | 67 | restore failed: replica missing, corrupt, or failed its integrity check | fail publish; retryable only if the error JSON says so |
 | 68 | object store unreachable or credential rejected at startup | fail publish, retryable |
@@ -180,8 +180,19 @@ Pod event without leaking anything.
    the previous writer's row does not expire for 25 minutes, and until it does
    it holds POSIX locks and sustained inodes on behalf of a writer the lease
    has already replaced.
-8. Start replication, mount FUSE in this process, and write `<state-dir>/ready`
-   once the mount is in the process's mount table and the root inode answers.
+8. Start replication and mount FUSE in this process.
+9. If the spec says `may_format`, `POST /format-ack` with the `Format.UUID` the
+   identity match just proved. That call is what records the UUID and moves a
+   generation-1 volume to `active`; until it lands the control-plane still
+   believes the volume is being allocated and routes the Agent's Files panel to
+   the other storage plane, while this mount is its filesystem (PLO-420). The
+   trigger is `may_format` rather than "this process formatted", because a
+   worker that formatted, seeded its replica and died before acking comes back
+   to a replica that restores and never formats again. A refused ack refuses the
+   mount: exit 65, or 66 when the refusal is a fence.
+10. Write `<state-dir>/ready` once the mount is in the process's mount table and
+    the root inode answers. Everything above has to be true before this file
+    exists, because the plugin publishes the volume the moment it appears.
 
 ## The writer lease
 

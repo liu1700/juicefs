@@ -160,6 +160,29 @@ await_ready "$WORK/state" || { cat "$WORK/worker1.log"; fail "worker never repor
 python3 -c "import json;d=json.load(open('$WORK/state/ready'));assert d['epoch']==1,d" \
   || fail "ready file does not name epoch 1"
 
+# The volume the control-plane knows about has to be the volume the Agent is
+# about to be handed. /format-ack is what makes those the same thing: it records
+# the Format.UUID and moves a generation-1 volume to `active`. Without it the
+# volume stays `allocating`, the Files router finds no active generation and
+# serves the Agent out of the other storage plane while this mount is its
+# filesystem — one Agent, two filesystems (PLO-420).
+acked_uuid=$(sed -n 's|^/v1/internal/storage/format-ack uuid=\([^ ]*\) epoch=.*|\1|p' "$JOURNAL" | head -1)
+[ -n "$acked_uuid" ] || { cat "$WORK/worker1.log"; fail "the first boot formatted but never acknowledged the format"; }
+grep -q '^/v1/internal/storage/format-ack uuid=.* epoch=1$' "$JOURNAL" \
+  || fail "the format was acknowledged under the wrong epoch: $(grep format-ack "$JOURNAL")"
+
+# The worker reported the filesystem it is actually serving, not something it
+# made up: `juicefs status` reads the UUID out of the metadata the mount opened.
+meta_uuid=$("$PLORI_BIN" status "sqlite3://$WORK/state/meta.db" \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['Setting']['UUID'])")
+[ "$acked_uuid" = "$meta_uuid" ] \
+  || fail "acknowledged uuid $acked_uuid is not the mounted filesystem's $meta_uuid"
+
+# Every later publish in this run is built from what the control-plane learned,
+# so nothing after this point may acknowledge a format again.
+acks_after_first_boot=$(grep -c 'format-ack' "$JOURNAL")
+[ "$acks_after_first_boot" -eq 1 ] || fail "the first boot acknowledged the format $acks_after_first_boot times"
+
 # PLO-366: the FUSE loop runs IN THIS PROCESS. Upstream `juicefs mount` always
 # re-execs itself (cmd/mount_unix.go launchMount), which is where the second
 # juicefs process in the M0 footprint measurement came from; plori-mount calls
@@ -217,9 +240,12 @@ grep -q '/v1/internal/storage/usage' "$JOURNAL" || fail "usage was never reporte
 grep -q 'UNAUTHORIZED' "$JOURNAL" && fail "the worker presented a token the control-plane rejected"
 [ -f "$WORK/state/clean" ] || fail "the clean-stop marker was not written"
 
-format_uuid=$(python3 -c "import json;print(json.load(open('$WORK/state/durable-point.json'))['volume'])" >/dev/null 2>&1; \
-  "$PLORI_BIN" status "sqlite3://$WORK/state/meta.db" | python3 -c "import json,sys;print(json.load(sys.stdin)['Setting']['UUID'])")
-[ -n "$format_uuid" ] || fail "could not read the format UUID back"
+# Every publish from here on is the one the control-plane would issue: it carries
+# the UUID it learned from the acknowledgement, so `may_format` is false and
+# `expected_uuid` is set. Reading the UUID out of the local metadata instead
+# would let a missing ack pass unnoticed, which is how PLO-420 survived every
+# gate it had.
+format_uuid=$acked_uuid
 
 echo "== remount on the same node after a clean stop (PLO-422) =="
 # The state directory is a hostPath: on the second mount of an Agent on a node
@@ -276,6 +302,13 @@ WORKER_PID=""
 
 echo "== generation 2: restore into a fresh state dir under a new epoch =="
 write_spec 2 "$WORK/spec2.json" "$format_uuid"
+python3 -c "
+import json
+s = json.load(open('$WORK/spec2.json'))
+assert s['may_format'] is False, s
+assert s['format']['expected_uuid'] == '$format_uuid', s
+assert s['format_uuid'] == '$format_uuid', s
+" || fail "the second publish still authorises a format"
 run_worker "$WORK/spec2.json" "$WORK/mnt2" "$WORK/state2" "$WORK/cache2" "$WORK/worker2.log"
 await_ready "$WORK/state2" || { cat "$WORK/worker2.log"; fail "restored worker never reported ready"; }
 
@@ -291,6 +324,11 @@ wait "$WORKER_PID"; worker_exit=$?
 set -e
 WORKER_PID=""
 [ "$worker_exit" -eq 0 ] || { cat "$WORK/worker2.log"; fail "restored worker exited $worker_exit, want 0"; }
+
+# A volume the control-plane already has a UUID for is never acknowledged again —
+# not by generation 2 and not by any of the same-node remounts above.
+[ "$(grep -c 'format-ack' "$JOURNAL")" -eq "$acks_after_first_boot" ] \
+  || fail "a publish carrying expected_uuid acknowledged the format again"
 
 echo "== refusals =="
 # An unknown credential_source must be refused with exit 64, not fallen back on.

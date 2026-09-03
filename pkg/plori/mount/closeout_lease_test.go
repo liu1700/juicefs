@@ -274,6 +274,12 @@ func (a *leaseAuthority) ReportDurablePoint(context.Context, string, int64, Barr
 	return nil
 }
 
+// AckFormat is never reached by these tests: every spec they run carries a
+// recorded Format.UUID, so `may_format` is false and the ack does not fire.
+func (a *leaseAuthority) AckFormat(context.Context, string, int64, string) (VolumeStateResponse, error) {
+	return VolumeStateResponse{State: VolumeStateActive}, nil
+}
+
 // releasedWith reports whether any worker on this epoch handed the lease back
 // with the given reason.
 func (a *leaseAuthority) releasedWith(epoch int64, reason string) bool {

@@ -194,10 +194,26 @@ type fakeCP struct {
 	onGrow   func(GrantSpec) GrantSpec
 	renews   []RenewRequest
 	released string
+	// ackErr is what /format-ack answers with; nil is a control-plane that
+	// records the UUID. acks is every attempt, so a test can assert both what
+	// was reported and how many times it was tried.
+	ackErr    error
+	acks      []formatAck
+	readyPath string
 	// durableTxID is the anchor the worker last reported, kept so a test can
 	// assert that the local durable-point file and the control-plane were told
 	// the same instant (PLO-416).
 	durableTxID string
+}
+
+// formatAck is one observed /format-ack call. readyExists is the point of it:
+// the plugin publishes the volume when the ready file appears, so an ack that
+// arrives after it is an ack the Agent did not wait for.
+type formatAck struct {
+	volume      string
+	epoch       int64
+	uuid        string
+	readyExists bool
 }
 
 func (c *fakeCP) record(name string) { c.mu.Lock(); c.calls = append(c.calls, name); c.mu.Unlock() }
@@ -251,6 +267,30 @@ func (c *fakeCP) ReportDurablePoint(_ context.Context, _ string, _ int64, _ Barr
 	c.mu.Unlock()
 	c.record("durable_point")
 	return nil
+}
+
+func (c *fakeCP) AckFormat(_ context.Context, volumeID string, epoch int64, uuid string) (VolumeStateResponse, error) {
+	ready := false
+	if c.readyPath != "" {
+		_, err := os.Stat(c.readyPath)
+		ready = err == nil
+	}
+	c.mu.Lock()
+	c.calls = append(c.calls, "format_ack")
+	c.acks = append(c.acks, formatAck{volume: volumeID, epoch: epoch, uuid: uuid, readyExists: ready})
+	err := c.ackErr
+	c.mu.Unlock()
+	if err != nil {
+		return VolumeStateResponse{}, err
+	}
+	return VolumeStateResponse{StorageVolumeID: volumeID, State: VolumeStateActive}, nil
+}
+
+// formatAcks is every /format-ack the worker made, in order.
+func (c *fakeCP) formatAcks() []formatAck {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]formatAck(nil), c.acks...)
 }
 
 type fakeReplicator struct {
@@ -339,7 +379,7 @@ func bootstrapSpec() *MountSpec {
 func newSup(t *testing.T, spec *MountSpec, fs *fakeFS, cp *fakeCP, rep *fakeReplicator, fencer Fencer) *Supervisor {
 	t.Helper()
 	dir := t.TempDir()
-	return &Supervisor{
+	sup := &Supervisor{
 		Spec:    spec,
 		Paths:   Paths{StateDir: filepath.Join(dir, "state"), CacheDir: filepath.Join(dir, "cache"), MountPoint: filepath.Join(dir, "mnt")},
 		Options: MountOptions{BarrierInterval: 30 * time.Millisecond},
@@ -348,6 +388,10 @@ func newSup(t *testing.T, spec *MountSpec, fs *fakeFS, cp *fakeCP, rep *fakeRepl
 			ControlGateInstalled: func() bool { return true },
 		},
 	}
+	if cp != nil {
+		cp.readyPath = sup.Paths.ReadyPath()
+	}
+	return sup
 }
 
 func healthyVolume() *fakeVolume {

@@ -133,6 +133,15 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 		s.shutdown(context.Background(), "mount_failed")
 		return f
 	}
+	// The control-plane learns what this filesystem is before the plugin is
+	// allowed to publish it. The ready file below is the plugin's signal to
+	// return a successful NodePublish, so everything that has to be true of
+	// this volume before an Agent touches it has to be true above this line
+	// (PLO-420).
+	if f := s.ackFormat(ctx); f != nil {
+		s.shutdown(context.Background(), reasonFor(f))
+		return f
+	}
 	if err := writeJSONAtomic(s.Paths.ReadyPath(), Ready{
 		Epoch:     s.Spec.FenceEpoch,
 		MountedAt: s.now().UTC(),
@@ -486,6 +495,101 @@ func (s *Supervisor) formatFirstBoot(ctx context.Context) error {
 	s.formattedHere = true
 	s.log("formatted", "volume", s.Spec.StorageVolumeID, "trash_days", s.Spec.Format.TrashDays)
 	return nil
+}
+
+// ackFormatAttempts bounds the retry of an ack the control-plane did not answer
+// — a transport failure or a 5xx. Four attempts at a quarter of a second sit
+// inside any NodePublish budget and are far more than a rolling control-plane
+// replica needs; past them the mount is refused, because the alternative is to
+// serve a volume the control-plane does not recognise.
+const (
+	ackFormatAttempts = 4
+	ackFormatBackoff  = 250 * time.Millisecond
+)
+
+// ackFormat tells the control-plane which filesystem this volume is, and it is
+// the step that makes the volume real. /format-ack is what records the
+// Format.UUID and moves a generation-1 volume `allocating -> formatted ->
+// active` (PLO-373). Until it lands the control-plane still believes the volume
+// is being allocated: storageroute.Decide sees no active generation, routes the
+// Files panel to Orlop, and the Agent's panel and the Agent's own filesystem
+// are two different filesystems — which is what the first cluster-level
+// staging run observed, with the mount healthy and the volume `allocating` for
+// its whole life (PLO-420).
+//
+// The trigger is `may_format`, not "this process formatted". On a first boot
+// they are the same thing; after a crash they are not. A worker that formatted,
+// seeded its replica and died before acking comes back to a replica that
+// RESTORES, never formats again, and under a "formatted here" rule would never
+// ack either — the volume would stay `allocating` for the rest of its life,
+// which is the bug, merely narrower. `may_format` is the control-plane's own
+// statement that it holds no Format.UUID for this volume (mountspec.Validate
+// ties it to an empty ExpectedUUID), so acking on it closes both windows with
+// one rule, at the layer that owns the question.
+//
+// The UUID is the one the three-way identity match has just proved: the
+// restored Format, the spec and the `juicefs_uuid` object under the data prefix
+// all name it. Reporting anything else would be reporting a filesystem this
+// mount is not serving.
+//
+// Placement is the other half of the same argument. It runs AFTER the replica
+// has been seeded and the mount is serving, and BEFORE the ready file: the
+// control-plane must not be told a filesystem exists before its metadata
+// replica does, and the Agent must not be handed a volume the control-plane
+// does not yet recognise. A crash in between therefore leaves the volume
+// `allocating` with `may_format` still true — formattable again, which is
+// harmless while nothing has been written and unreachable once anything has,
+// because by then the replica restores instead.
+func (s *Supervisor) ackFormat(ctx context.Context) *Fatal {
+	if !s.Spec.MayFormat {
+		return nil
+	}
+	uuid := s.vol.Identity().UUID
+	var last error
+retry:
+	for attempt := 1; attempt <= ackFormatAttempts; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				last = ctx.Err()
+				break retry
+			case <-time.After(ackFormatBackoff):
+			}
+		}
+		res, err := s.Deps.CP.AckFormat(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, uuid)
+		if err == nil {
+			s.log("format_acked", "volume", s.Spec.StorageVolumeID, "epoch", s.Spec.FenceEpoch,
+				"format_uuid", uuid, "state", res.State, "attempt", attempt)
+			return nil
+		}
+		last = err
+		var cpErr *CPError
+		if errors.As(err, &cpErr) {
+			// The epoch was taken away rather than the ack rejected. That is a
+			// fence, and it is reported as one everywhere else in this worker:
+			// exit 66, no barrier, no final sync, because a fenced writer must
+			// not push its remaining history into a prefix a successor restores.
+			if cpErr.Fenced() {
+				return fatalf(CodeFenced, ErrCodeFencedOutOfBand, false,
+					"the control-plane fenced this writer while it acknowledged the format of volume %s: %s",
+					s.Spec.StorageVolumeID, cpErr)
+			}
+			// Anything else typed is the control-plane's considered answer and
+			// will not change on a retry: a different UUID on this prefix, a
+			// rejected token, a malformed body. Only a 5xx or a rate limit is
+			// worth asking again.
+			if !cpErr.Retryable() {
+				break retry
+			}
+		}
+	}
+	// 65 rather than a retryable code, whatever the refusal was: the invariant
+	// that broke is the one exit 65 names. The control-plane does not know what
+	// filesystem this volume is, and a mount that serves it anyway is the split
+	// this call exists to prevent.
+	return fatalf(CodeIdentityMismatch, ErrCodeIdentityMismatch, false,
+		"the control-plane did not record the format of volume %s (uuid %s): %s",
+		s.Spec.StorageVolumeID, uuid, last)
 }
 
 // identityMatches is ADR D2's three-way match. All three legs are required:

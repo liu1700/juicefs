@@ -51,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(length)
+        payload = self.rfile.read(length)
         route = self.path
 
         with open(TOKEN_FILE, encoding="utf-8") as fh:
@@ -59,6 +59,32 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Authorization") != expected:
             self._record(route + " UNAUTHORIZED")
             self._json(401, {"code": "token_invalid", "error": "bad bearer token"})
+            return
+
+        if route.endswith("/format-ack"):
+            # The one route whose BODY the harness asserts on. /format-ack is
+            # what tells the control-plane which filesystem a freshly formatted
+            # volume is; a worker that mounts without making this call leaves
+            # the volume `allocating` forever, and the Files router serves the
+            # Agent out of the other storage plane (PLO-420). Recording the
+            # uuid is what lets run.sh build the SECOND publish out of what the
+            # control-plane learned rather than out of the local metadata.
+            body = json.loads(payload or b"{}")
+            self.server.format_uuid = body.get("format_uuid", "")
+            self._record(
+                "%s uuid=%s epoch=%s"
+                % (route, self.server.format_uuid, body.get("fence_epoch"))
+            )
+            self._json(
+                200,
+                {
+                    "storage_volume_id": "e2e",
+                    "state": "active",
+                    "grant": GRANT,
+                    "used_bytes": 0,
+                    "used_inodes": 0,
+                },
+            )
             return
 
         self._record(route)
@@ -89,4 +115,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    # The Format.UUID the worker acknowledged, held the way the real control
+    # plane holds it: on the server, learned from the worker, not from the
+    # metadata database the harness could read for itself.
+    server.format_uuid = ""
+    server.serve_forever()
