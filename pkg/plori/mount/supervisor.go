@@ -118,19 +118,66 @@ func (s *Supervisor) log(event string, kv ...any) {
 // Run is the whole lifecycle: start, serve, stop. It returns a *Fatal whose
 // Exit is what the process exits with.
 func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
-	if err := s.start(ctx); err != nil {
-		f := Classify(err)
+	// The stop signal means two different things depending on when it lands,
+	// and ONE watcher turns it into both so there is a single cancellation
+	// path rather than two that can race:
+	//
+	//   - before the mount is up it ABORTS the startup. Every pre-ready step
+	//     runs under startCtx, so the fence-marker claim, the restore, the
+	//     seed and the wait for the mount all observe it. Before PLO-393 F-3
+	//     the whole of start() ran to completion first and the signal was only
+	//     read once the mount was serving, so a TERM during a large restore
+	//     spent the kubelet's grace period restoring and was answered with
+	//     SIGKILL — which costs the NEXT generation an unconditional repair.
+	//   - once the mount is up it is the ordered stop, and the run loop selects
+	//     on `stopped` exactly where it used to select on the signal itself.
+	//
+	// Cancelling startCtx after the ready file is written is harmless: nothing
+	// past that line reads it.
+	startCtx, abortStart := context.WithCancel(ctx)
+	defer abortStart()
+	stopped := make(chan struct{})
+	watch := make(chan struct{})
+	defer close(watch)
+	go func() {
+		select {
+		case <-stop:
+			close(stopped)
+			abortStart()
+		case <-watch:
+		}
+	}()
+
+	if err := s.start(startCtx); err != nil {
+		f := preReady(startCtx, err)
 		// A refusal after the lease was already taken must hand the lease
 		// back, or the Agent waits a full TTL for a mount that never was.
 		s.releaseLease(reasonFor(f))
 		return f
 	}
+	// The FUSE session gets a context of its own, a child of ctx rather than of
+	// startCtx: it has to outlive the startup, and the mount-failure path below
+	// has to be able to end it and collect its result (PLO-444).
+	serveCtx, endServe := context.WithCancel(ctx)
+	defer endServe()
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- s.vol.Serve(ctx) }()
+	go func() { serveErr <- s.vol.Serve(serveCtx) }()
 
-	if err := s.vol.AwaitMounted(ctx); err != nil {
+	if err := s.vol.AwaitMounted(startCtx); err != nil {
+		// The session is both the likeliest cause of a mount that never
+		// appeared and the only thing that knows why, so it is ended and
+		// JOINED here. Before PLO-444 nothing did either: `shutdown` ran
+		// Barrier/Unmount/Close against a volume whose Serve was still
+		// initialising — a double-close race inside the vfs — and whatever
+		// Serve eventually returned was dropped on the floor, leaving the
+		// operator with "mount never came up" and no cause.
+		endServe()
 		f := fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, true, "mount did not become ready: %s", err)
-		s.shutdown(context.Background(), "mount_failed")
+		if served := s.joinServe(serveErr); served != nil {
+			f.Err = fmt.Errorf("%s (fuse session: %s)", f.Err, served)
+		}
+		f = preReady(startCtx, f)
+		s.shutdown(context.Background(), stopOr(f, "mount_failed"))
 		return f
 	}
 	// The control-plane learns what this filesystem is before the plugin is
@@ -138,7 +185,8 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 	// return a successful NodePublish, so everything that has to be true of
 	// this volume before an Agent touches it has to be true above this line
 	// (PLO-420).
-	if f := s.ackFormat(ctx); f != nil {
+	if f := s.ackFormat(startCtx); f != nil {
+		f = preReady(startCtx, f)
 		s.shutdown(context.Background(), reasonFor(f))
 		return f
 	}
@@ -147,13 +195,77 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 		MountedAt: s.now().UTC(),
 		Volume:    s.Spec.StorageVolumeID,
 	}); err != nil {
-		f := fatalf(CodeRefused, ErrCodeRestoreFailed, false, "write ready file: %s", err)
-		s.shutdown(context.Background(), "ready_file_failed")
+		f := preReady(startCtx, fatalf(CodeRefused, ErrCodeRestoreFailed, false, "write ready file: %s", err))
+		s.shutdown(context.Background(), stopOr(f, "ready_file_failed"))
 		return f
 	}
 	s.log("ready", "volume", s.Spec.StorageVolumeID, "epoch", s.Spec.FenceEpoch)
 
-	return s.loop(ctx, stop, serveErr)
+	return s.loop(ctx, stopped, serveErr)
+}
+
+// preReady is the whole rule for "the stop signal ended this startup". Any
+// pre-ready failure that happened once the startup context was cancelled IS
+// the stop: the worker was told to go away before it had a mount to hand over,
+// nothing was published, and the lease is going back. That is exit 0 with its
+// own identifier, not a mount refusal the plugin should retry.
+//
+// One rule at one place, rather than a cancellation test inside every step,
+// because the steps fail in their own vocabulary — a fence claim cancelled
+// mid-flight is "object store unreachable", a cancelled restore is "restore
+// failed" — and re-deriving "but was it really the stop" from each of those is
+// the duplicated classification this avoids. The checkpoints inside start() are
+// the other half: they decide WHEN to give up, this decides what that is called.
+func preReady(ctx context.Context, err error) *Fatal {
+	f := Classify(err)
+	// CodeOK is already a checkpoint's own abort; re-wrapping it would say the
+	// same thing twice.
+	if ctx.Err() == nil || f.Exit == CodeOK {
+		return f
+	}
+	return &Fatal{
+		Exit:    CodeOK,
+		ErrCode: ErrCodeStoppedBeforeMount,
+		Err:     fmt.Errorf("stopped before the mount came up: %w", f.Err),
+	}
+}
+
+// stoppedBeforeMount is what a startup step returns once it has been asked to
+// stop. `during` names the step, so the one stderr line the plugin republishes
+// says how far the startup got — the difference between a mount that was
+// cancelled before it touched the object store and one cancelled after a
+// half-hour restore.
+func stoppedBeforeMount(during string) *Fatal {
+	return &Fatal{
+		Exit:    CodeOK,
+		ErrCode: ErrCodeStoppedBeforeMount,
+		Err:     fmt.Errorf("stopped before the mount came up, during %s", during),
+	}
+}
+
+// stopOr names the stop when the stop is what ended this startup, and the
+// failing step otherwise. The two pre-ready teardowns keep their own reasons:
+// the control-plane's lease history is the only place an operator can see why a
+// mount never happened, and "mount_failed" and "stopped_before_mount" are
+// different facts about the volume.
+func stopOr(f *Fatal, step string) string {
+	if f.Exit == CodeOK {
+		return ReasonStoppedBeforeMount
+	}
+	return step
+}
+
+// joinServe waits for the FUSE session goroutine to return, bounded by the same
+// budget every other startup teardown gets. A session that will not come back
+// inside it is reported rather than waited on: a NodePublish is blocked on this
+// process, and the plugin's own kill deadline is what runs out next.
+func (s *Supervisor) joinServe(serveErr <-chan error) error {
+	select {
+	case err := <-serveErr:
+		return err
+	case <-time.After(abandonStartBudget):
+		return fmt.Errorf("the fuse session did not return within %s; the teardown below ran alongside it", abandonStartBudget)
+	}
 }
 
 // ---------------------------------------------------------------- startup ---
@@ -195,6 +307,18 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 		}
 	}
 
+	// Four cancellation checkpoints follow, one in front of each step that can
+	// run for minutes. The steps themselves take ctx and the ones that reach
+	// the network do observe it, but a restore or an fsck that has just
+	// finished must not be followed by the next one, and a worker that has been
+	// asked to stop must not come all the way up in order to tear itself down
+	// (PLO-393 F-3). Each returns exit 0: nothing failed, the process was told
+	// to go away, and the deferred teardown below plus Run's lease release put
+	// back everything that exists by then.
+	if ctx.Err() != nil {
+		return stoppedBeforeMount("the fence-marker claim")
+	}
+
 	// The fence marker is the store-side proof of epoch ownership and must be
 	// claimed BEFORE the first LTX upload, so it goes first — before restore,
 	// before anything is written under meta_prefix.
@@ -220,6 +344,12 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 
 	if err := s.restoreOrFormat(ctx); err != nil {
 		return err
+	}
+	// The long one. A restore is bounded by the size of the replica, not by
+	// anything this process controls, and it is the step the kubelet's grace
+	// period actually expires inside.
+	if ctx.Err() != nil {
+		return stoppedBeforeMount("the metadata restore")
 	}
 
 	vol, err := s.Deps.FS.Open(ctx, s.Spec)
@@ -254,6 +384,15 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 		return err
 	}
 
+	// Everything between the restore and here — opening the database, the
+	// integrity check, the identity match, the refusals, the session purge and
+	// the post-crash repair — can take as long as the metadata is large. Giving
+	// up now is also the cheapest instant there is: no replicator exists yet, so
+	// the abort costs a lease release and nothing else.
+	if ctx.Err() != nil {
+		return stoppedBeforeMount("the post-restore checks")
+	}
+
 	if err := s.Deps.Replicator.Start(ctx); err != nil {
 		return fatalf(CodeObjectStore, ErrCodeObjectStoreUnreachable, true, "start replication: %s", err)
 	}
@@ -279,6 +418,12 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 		// it at T_before: nothing has been written since (PLO-416).
 		s.reportDurablePoint(ctx, BarrierResult{DurableAt: s.now().UTC(), BarrierAt: s.now().UTC()}, s.anchorTxID(ctx))
 	}
+	// The seed pushes a whole first replica, so it is the last step long enough
+	// to be worth interrupting. Past this line the deferred teardown above is
+	// what puts the replicator and the database back.
+	if ctx.Err() != nil {
+		return stoppedBeforeMount("the replica seed")
+	}
 	// The spec's grant is authoritative; the restored replica's Format carries
 	// whatever ceiling the PREVIOUS generation persisted, which the allocator
 	// may have moved while this volume had no writer. Applying it before the
@@ -291,10 +436,11 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 	return nil
 }
 
-// abandonStartBudget bounds the teardown of a startup that failed. It is the
-// ten seconds releaseLease already allows itself, for the same reason: a
-// NodePublish is waiting on this process, and a teardown that hangs turns a
-// refused mount into a wedged one.
+// abandonStartBudget bounds the teardown of a startup that failed — both the
+// replicator/volume undo below and the wait for the FUSE session to return
+// (joinServe). It is the ten seconds releaseLease already allows itself, for
+// the same reason: a NodePublish is waiting on this process, and a teardown
+// that hangs turns a refused mount into a wedged one.
 const abandonStartBudget = 10 * time.Second
 
 // abandonStart undoes the part of a startup that outlives this process. It is
@@ -814,7 +960,10 @@ func dirIsEmpty(dir string) (bool, error) {
 
 // -------------------------------------------------------------- run loop ---
 
-func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <-chan error) *Fatal {
+// loop serves the mount. `stopped` is closed by Run's single signal watcher —
+// the same close that aborts a startup still in flight — so the run loop and
+// the startup answer to one cancellation rather than two.
+func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr <-chan error) *Fatal {
 	// Arm the metadata engine's own deadline before the first Agent write can
 	// reach it. From here the engine re-checks it on every gated operation, so
 	// a process that is frozen past its expiry and thawed cannot commit — the
@@ -853,7 +1002,7 @@ func (s *Supervisor) loop(ctx context.Context, stop <-chan os.Signal, serveErr <
 	renewedAt := s.now()
 	for {
 		select {
-		case <-stop:
+		case <-stopped:
 			s.log("sigterm")
 			return s.shutdown(context.Background(), ReasonShutdown)
 
@@ -1275,6 +1424,13 @@ func (s *Supervisor) reportUsage(ctx context.Context) {
 const (
 	// ReasonShutdown — SIGTERM with the lease healthy.
 	ReasonShutdown = "shutdown"
+	// ReasonStoppedBeforeMount — SIGTERM arrived while the worker was still
+	// coming up, so the startup was abandoned and the epoch handed straight
+	// back. It is a distinct reason rather than ReasonShutdown because the
+	// volume's lease history is where an operator learns that this generation
+	// never served anything: no barrier ran, no durable point was reported, and
+	// the successor restores from the previous generation's replica (PLO-393).
+	ReasonStoppedBeforeMount = "stopped_before_mount"
 	// ReasonFenced — the worker's own deadline ran out: the write-stop margin
 	// was reached without a successful renewal, or the clock jumped. The
 	// authority was not taken away, it expired, so the ordered stop runs with
@@ -1360,6 +1516,15 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	defer cancel()
 
 	var incomplete error
+	// Which of exit 69's two identifiers the shortfall belongs to. `incomplete`
+	// records the FIRST step that fell short and this records what that step
+	// was, which is the whole of F-4's ask: the barrier and the drain are the
+	// local half of a stop and the final sync is the remote half, and an
+	// operator who cannot tell "the writeback cache did not drain in time" from
+	// "the object store would not take the final LTX" is reading the prose to
+	// find out. Same exit code either way — the plugin's handling of a stop that
+	// lost data does not depend on which half lost it (PLO-393 F-4).
+	incompleteCode := ErrCodeBarrierIncomplete
 
 	// 1. fence new operations. Out of band the seal already happened in
 	// fenceAndStop, before anything else could run; repeating it here is
@@ -1437,9 +1602,11 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	} else {
 		if err := s.Deps.Replicator.SyncAndWait(ctx); err != nil && incomplete == nil {
 			incomplete = fmt.Errorf("final replica sync: %w", err)
+			incompleteCode = ErrCodeReplicationFailed
 		}
 		if err := s.Deps.Replicator.Stop(ctx); err != nil && incomplete == nil {
 			incomplete = fmt.Errorf("stop replication: %w", err)
+			incompleteCode = ErrCodeReplicationFailed
 		}
 	}
 
@@ -1475,7 +1642,7 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 		// already means "data was lost"; PLO-383 makes it say how much, because
 		// "the margin was not enough" is only actionable with the number that
 		// would have been (benchmark-real-node.md §5).
-		return fatalf(CodeBarrierIncomplete, ErrCodeBarrierIncomplete, false,
+		return fatalf(CodeBarrierIncomplete, incompleteCode, false,
 			"stop did not complete inside the write-stop window (%s): %s",
 			s.shortfall(budget, pendingBefore), incomplete)
 	}
@@ -1628,6 +1795,10 @@ func (s *Supervisor) releaseLease(reason string) {
 
 func reasonFor(f *Fatal) string {
 	switch f.Exit {
+	case CodeOK:
+		// The only CodeOK that reaches here is a startup the stop signal
+		// abandoned. A clean stop releases with its own reason from shutdown.
+		return ReasonStoppedBeforeMount
 	case CodeIdentityMismatch:
 		return "identity_mismatch"
 	case CodeFenced:

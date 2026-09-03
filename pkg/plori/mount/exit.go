@@ -63,10 +63,18 @@ const (
 // Typed error identifiers carried in the stderr JSON `error` field. The plugin
 // branches on these, never on the prose.
 const (
-	ErrCodeSpecInvalid      = "E_SPEC_INVALID"
-	ErrCodeIdentityMismatch = "E_IDENTITY_MISMATCH"
-	ErrCodeLeaseLost        = "E_LEASE_LOST"
-	ErrCodeFenceMarkerHeld  = "E_FENCE_MARKER_HELD"
+	// ErrCodeStoppedBeforeMount reports the one exit 0 that is not a served
+	// filesystem being handed back: the worker was told to stop while it was
+	// still coming up, so it abandoned the startup and released the lease
+	// without ever publishing a mount. Exit 0 because nothing failed and
+	// nothing was lost — the process did exactly what it was asked — but the
+	// plugin still has to tell it apart from a clean stop, because no `ready`
+	// file was ever written and no NodePublish can succeed on it (PLO-393 F-3).
+	ErrCodeStoppedBeforeMount = "E_STOPPED_BEFORE_MOUNT"
+	ErrCodeSpecInvalid        = "E_SPEC_INVALID"
+	ErrCodeIdentityMismatch   = "E_IDENTITY_MISMATCH"
+	ErrCodeLeaseLost          = "E_LEASE_LOST"
+	ErrCodeFenceMarkerHeld    = "E_FENCE_MARKER_HELD"
 	// ErrCodeFencedOutOfBand reports that the epoch was taken away rather than
 	// allowed to run out — stale_epoch/lease_held from a renew, or a fence
 	// marker held by somebody else. Same exit code as any other fence (66); the

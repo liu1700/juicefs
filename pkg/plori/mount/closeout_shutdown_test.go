@@ -192,25 +192,25 @@ func TestASecondSigtermDoesNotRunTheStopTwice(t *testing.T) {
 	}
 }
 
-// TestATermArrivingDuringStartupIsDeferredUntilTheMountIsUp is a
-// characterisation test for a gap this audit found against PLO-326's "TERM
-// before mount" and "TERM during restore" corner cases.
+// TestATermArrivingBeforeTheMountIsUpAbortsTheStartup is the inversion of the
+// characterisation test this audit left behind (F-3, PLO-393).
 //
-// Run does the whole of start() — fence-marker claim, restore, open, integrity
-// check, identity match, session purge, repair, replication start — before it
-// ever selects on the stop channel (supervisor.go:89-116 then :427-447). The
-// signal is buffered by cmd (chan cap 2, cmd/plori_mount.go:127) and is acted
-// on only once the mount is fully up, so a TERM during a slow restore does not
-// abort it: the worker finishes coming up and then immediately tears back down.
+// It used to record the gap: Run executed the whole of start() — fence-marker
+// claim, restore, open, integrity check, identity match, session purge, repair,
+// replication start — before it ever looked at the stop channel, so a TERM that
+// was ALREADY waiting still paid for a full restore and only then tore back
+// down. Safe, but on a large replica the kubelet's grace period expires inside
+// that restore, and the SIGKILL that follows costs the next generation an
+// unconditional repair.
 //
-// It is safe — nothing is left half-mounted, and the lease is released — but it
-// is not the "abort early" the corner case implies, and on a large replica the
-// kubelet's grace period can expire during the restore, turning a clean stop
-// into a SIGKILL. See finding F-3.
-func TestATermArrivingDuringStartupIsDeferredUntilTheMountIsUp(t *testing.T) {
+// Now the signal cancels the startup context, the first checkpoint sees it
+// before the fence marker is claimed, and the process leaves without touching
+// the object store at all.
+func TestATermArrivingBeforeTheMountIsUpAbortsTheStartup(t *testing.T) {
 	vol := newCountingVolume()
 	rep := &slowReplicator{delay: 150 * time.Millisecond}
-	sup := newCloseoutSup(t, testSpec(), vol, &fakeCP{}, rep, newSharedFencer())
+	cp := &fakeCP{}
+	sup := newCloseoutSup(t, testSpec(), vol, cp, rep, newSharedFencer())
 
 	// The signal is already waiting before Run is called: the most extreme
 	// form of "TERM before mount".
@@ -218,19 +218,23 @@ func TestATermArrivingDuringStartupIsDeferredUntilTheMountIsUp(t *testing.T) {
 	stop <- syscall.SIGTERM
 
 	f := sup.Run(context.Background(), stop)
-	if f.Exit != CodeOK {
-		t.Fatalf("exit = %d (%v), want a clean stop", f.Exit, f.Err)
+	if f.Exit != CodeOK || f.ErrCode != ErrCodeStoppedBeforeMount {
+		t.Fatalf("exit = %d / %s, want %d / %s (%v)", f.Exit, f.ErrCode, CodeOK, ErrCodeStoppedBeforeMount, f.Err)
 	}
-	if !rep.restored() {
-		t.Error("restore was skipped; this test no longer exercises the deferral")
+	if rep.restored() {
+		t.Error("the restore ran anyway; a TERM that arrived before the startup did must abort it before the store is touched")
 	}
-	// The documented gap: the mount came all the way up first.
-	if !exists(t, sup.Paths.ReadyPath()) {
-		t.Log("a TERM before mount now aborts startup — finding F-3 is fixed; invert this test")
-		return
+	if exists(t, sup.Paths.ReadyPath()) {
+		t.Error("a startup that was abandoned must never publish a ready file")
 	}
-	t.Log("documented gap F-3: a TERM delivered before the mount was up still ran the whole " +
-		"startup chain (restore included) before the ordered stop began")
+	// No `clean` marker: this generation never served a filesystem, so it has
+	// nothing to tell the next one about what is durable.
+	if exists(t, sup.Paths.CleanStopPath()) {
+		t.Error("an abandoned startup must not claim a clean stop")
+	}
+	if cp.released != ReasonStoppedBeforeMount {
+		t.Errorf("release reason = %q, want %q", cp.released, ReasonStoppedBeforeMount)
+	}
 }
 
 type slowReplicator struct {
@@ -314,7 +318,7 @@ func TestExitSignalsDistinguishTheTerminalConditions(t *testing.T) {
 	want := map[string]signal{
 		"clean stop":          {CodeOK, ""},
 		"lease loss":          {CodeFenced, ErrCodeFencedOutOfBand},
-		"replication failure": {CodeBarrierIncomplete, ErrCodeBarrierIncomplete},
+		"replication failure": {CodeBarrierIncomplete, ErrCodeReplicationFailed},
 		"durability timeout":  {CodeBarrierIncomplete, ErrCodeBarrierIncomplete},
 		"corruption":          {CodeRestoreFailed, ErrCodeRestoreIntegrity},
 		"local-disk loss":     {CodeRefused, ErrCodeRestoreFailed},
@@ -325,18 +329,21 @@ func TestExitSignalsDistinguishTheTerminalConditions(t *testing.T) {
 		}
 	}
 
-	// The collision, stated rather than implied.
+	// F-4, closed: the two halves of a stop that fell short carry the same exit
+	// code — the plugin's handling does not change — and different identifiers,
+	// so the kubelet event says WHICH half.
 	if got["replication failure"] == got["durability timeout"] {
-		t.Logf("documented gap F-4: replication failure and durability timeout are both "+
-			"exit %d/%s and cannot be told apart from the exit signal",
+		t.Errorf("replication failure and durability timeout are both exit %d/%s again (F-4 regressed)",
 			got["durability timeout"].exit, got["durability timeout"].code)
-	} else {
-		t.Log("replication failure and durability timeout now differ — finding F-4 is fixed")
+	}
+	if got["replication failure"].exit != got["durability timeout"].exit {
+		t.Errorf("the two halves of a short stop must keep ONE exit code: %d vs %d",
+			got["replication failure"].exit, got["durability timeout"].exit)
 	}
 
 	// Every distinct condition that IS distinguishable must stay distinguishable.
 	seen := map[signal]string{}
-	for _, name := range []string{"clean stop", "lease loss", "durability timeout", "corruption", "local-disk loss"} {
+	for _, name := range []string{"clean stop", "lease loss", "replication failure", "durability timeout", "corruption", "local-disk loss"} {
 		if prev, dup := seen[got[name]]; dup {
 			t.Errorf("%s and %s share exit %d/%s", prev, name, got[name].exit, got[name].code)
 		}

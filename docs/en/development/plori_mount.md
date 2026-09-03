@@ -131,22 +131,27 @@ code never gets reused for a different meaning.
 
 | code | meaning | plugin action |
 |---|---|---|
-| 0 | clean stop after SIGTERM: fenced, barrier, unmount, final sync, lease released | normal |
+| 0 | clean stop after SIGTERM: fenced, barrier, unmount, final sync, lease released. Also the startup a SIGTERM abandoned before the mount was up (`E_STOPPED_BEFORE_MOUNT`) — nothing was published and no `ready` file exists, so a publish waiting on one still fails | normal |
 | 64 | spec invalid, unsupported `credential_source`, or an unknown field the worker must not ignore | fail publish, no retry |
 | 65 | identity mismatch (Format Name/UUID against the spec or the `juicefs_uuid` object, or the control-plane refused the format acknowledgement) | fail publish, no retry; the control-plane is told via `/lease/release reason=identity_mismatch` |
-| 66 | lease lost — renew returned `stale_epoch`/`lease_held`, the deadline passed, the fence marker was already held, or the FUSE session ended on its own | unpublish; the abnormal-exit guard cancels the run |
+| 66 | lease lost — renew returned `stale_epoch`/`lease_held`, the deadline passed, the fence marker was already held, or the FUSE session ended on its own. `E_FENCED_OUT_OF_BAND` is the same code with a distinct meaning: the epoch was taken away rather than allowed to run out, so this worker stopped **without** a barrier and without a final sync | unpublish; the abnormal-exit guard cancels the run |
 | 67 | restore failed: replica missing, corrupt, or failed its integrity check | fail publish; retryable only if the error JSON says so |
 | 68 | object store unreachable or credential rejected at startup | fail publish, retryable |
-| 69 | the barrier or the final sync did not finish inside the write-stop window — reported data loss, lease still released | unpublish; surface as a typed event |
+| 69 | the stop did not finish inside the write-stop window — reported data loss, lease still released. `E_BARRIER_INCOMPLETE` is the local half (the barrier or the writeback drain), `E_REPLICATION_FAILED` the remote half (the final replica sync, or replication that stopped and did not recover within a barrier period) | unpublish; surface as a typed event |
 | 70 | `.control` would be Agent-writable, the cache dir holds another tenant's staging, or trash-days is 0 | fail publish, no retry |
 
 The last line on stderr is a single JSON object with a typed `error` field
-(`E_SPEC_INVALID`, `E_IDENTITY_MISMATCH`, `E_FENCE_MARKER_HELD`,
-`E_RESTORE_INTEGRITY`, `E_BARRIER_INCOMPLETE`, `E_VOLUME_TRASH_DISABLED`,
+(`E_STOPPED_BEFORE_MOUNT`, `E_SPEC_INVALID`, `E_IDENTITY_MISMATCH`,
+`E_FENCE_MARKER_HELD`, `E_FENCED_OUT_OF_BAND`, `E_RESTORE_FAILED`,
+`E_RESTORE_INTEGRITY`, `E_RESTORED_TO_BARRIER`, `E_BARRIER_INCOMPLETE`,
+`E_REPLICATION_FAILED`, `E_VOLUME_TRASH_DISABLED`,
 `E_CACHE_DIR_TENANT_MISMATCH`, `E_CONTROL_FILE_AGENT_WRITABLE`,
 `E_OBJECT_STORE_UNREACHABLE`, `E_LEASE_LOST`). It is assembled from a closed
 field set rather than from a formatted struct, so it can be republished into a
-Pod event without leaking anything.
+Pod event without leaking anything. Several identifiers share one exit code on
+purpose: the code decides what the plugin DOES with the mount, the identifier
+tells an operator which of the conditions behind it happened, and adding a
+number for each would change the plugin's table every time a condition is split.
 
 ## Startup
 
@@ -193,6 +198,24 @@ Pod event without leaking anything.
 10. Write `<state-dir>/ready` once the mount is in the process's mount table and
     the root inode answers. Everything above has to be true before this file
     exists, because the plugin publishes the volume the moment it appears.
+
+A SIGTERM that arrives before step 10 **abandons** the startup rather than
+queueing behind it. Every step above runs under a context the signal cancels,
+and the worker gives up at the next of four checkpoints — in front of the fence
+claim, after the restore, before replication starts, and after the seed — tears
+down whatever exists by then (replicator aborted, database closed), releases the
+lease with reason `stopped_before_mount` and exits 0 with
+`E_STOPPED_BEFORE_MOUNT`. The alternative, which is what this used to do, is to
+finish a restore nobody is waiting for any more: on a large replica the
+kubelet's grace period expires inside it, the SIGKILL that follows leaves no
+`clean` marker, and the next generation pays for an unconditional repair. An
+abandoned startup writes no `clean` marker either, so a restore it interrupted
+is set aside by its successor rather than adopted.
+
+If the wait for the mount itself fails, the FUSE session is ended and joined
+before anything unmounts or closes the volume, and whatever it returned is
+reported on the exit line — it is usually the only thing that knows why the
+mount never appeared.
 
 ## The writer lease
 

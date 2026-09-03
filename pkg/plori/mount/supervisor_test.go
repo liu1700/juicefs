@@ -394,6 +394,29 @@ func newSup(t *testing.T, spec *MountSpec, fs *fakeFS, cp *fakeCP, rep *fakeRepl
 	return sup
 }
 
+// stopOnReady delivers one SIGTERM the instant the worker publishes its mount.
+//
+// Since PLO-393 F-3 a signal that arrives BEFORE the mount is up ABORTS the
+// startup rather than waiting behind it, so "queue a TERM and let the run loop
+// take it on its first pass" no longer means what it did — it now means the
+// abort, which TestATermArrivingBeforeTheMountIsUpAbortsTheStartup owns. This
+// keeps the old idiom's determinism, with no sleep, by hanging the send off the
+// `ready` log event: the worker emits it immediately after writing the ready
+// file and immediately before entering the run loop.
+func stopOnReady(sup *Supervisor) chan os.Signal {
+	ch := make(chan os.Signal, 2)
+	prev := sup.Deps.Log
+	sup.Deps.Log = func(event string, kv ...any) {
+		if prev != nil {
+			prev(event, kv...)
+		}
+		if event == "ready" {
+			ch <- syscall.SIGTERM
+		}
+	}
+	return ch
+}
+
 func healthyVolume() *fakeVolume {
 	return &fakeVolume{
 		id:       FormatIdentity{Name: "agents/550e8400-e29b-41d4-a716-446655440000", UUID: "6c1e5f2c-0f0a-4a1c-9f2d-2b4e6a8c0d1e", TrashDays: 1},
@@ -490,8 +513,7 @@ func TestEmptyReplicaFormatsOnlyOnAFirstGeneration(t *testing.T) {
 		fs := &fakeFS{vol: healthyVolume()}
 		rep := &fakeReplicator{restoreErr: ErrReplicaEmpty}
 		sup := newSup(t, spec, fs, &fakeCP{}, rep, &fakeFencer{})
-		stop := make(chan os.Signal, 1)
-		stop <- syscall.SIGTERM
+		stop := stopOnReady(sup)
 		got := sup.Run(context.Background(), stop)
 		if !fs.formatted {
 			t.Fatalf("expected a format, got exit %d: %v", got.Exit, got.Err)
@@ -545,8 +567,7 @@ func TestSigtermRunsTheOrderedShutdown(t *testing.T) {
 	rep := &fakeReplicator{}
 	sup := newSup(t, testSpec(), fs, cp, rep, &fakeFencer{})
 
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 	got := sup.Run(context.Background(), stop)
 	if got.Exit != CodeOK {
 		t.Fatalf("exit = %d, want 0 (%v)", got.Exit, got.Err)
@@ -585,8 +606,7 @@ func TestFailedShutdownBarrierExits69ButReleasesTheLease(t *testing.T) {
 	}
 	cp := &fakeCP{}
 	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 	got := sup.Run(context.Background(), stop)
 	if got.Exit != CodeBarrierIncomplete || got.ErrCode != ErrCodeBarrierIncomplete {
 		t.Fatalf("got exit %d / %s, want %d / %s", got.Exit, got.ErrCode, CodeBarrierIncomplete, ErrCodeBarrierIncomplete)
@@ -662,8 +682,7 @@ func TestDurablePointIsThePreBarrierInstant(t *testing.T) {
 		return BarrierResult{BarrierAt: time.Now().UTC()}, nil
 	}
 	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
 		t.Fatalf("exit = %d: %v", got.Exit, got.Err)
 	}
@@ -722,8 +741,7 @@ func TestRestoreReadsThePreviousGenerationsPrefix(t *testing.T) {
 	rep := &fakeReplicator{}
 	fs := &fakeFS{vol: healthyVolume()}
 	sup := newSup(t, spec, fs, &fakeCP{}, rep, &fakeFencer{prior: prior})
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
 		t.Fatalf("exit = %d: %v", got.Exit, got.Err)
 	}
@@ -916,8 +934,7 @@ func TestTheMarkerReclaimProceedsWhenBothProofsHold(t *testing.T) {
 	}}
 	cp := &fakeCP{}
 	sup := newSup(t, spec, &fakeFS{vol: healthyVolume()}, cp, &fakeReplicator{}, fencer)
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
 		t.Fatalf("exit = %d/%s (%v), want a clean stop", got.Exit, got.ErrCode, got.Err)
 	}

@@ -443,8 +443,7 @@ func TestASecondHolderAtTheSameEpochNeverMounts(t *testing.T) {
 	specA := specAtEpoch(9, 2*time.Minute)
 	volA := &readyReportingVolume{fakeVolume: healthyVolume(), auth: auth, epoch: 9}
 	supA := newCloseoutSup(t, specA, volA, asHolder{auth, "pod-a"}, &countingReplicator{}, fencer)
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(supA)
 	if f := supA.Run(context.Background(), stop); f.Exit != CodeOK {
 		t.Fatalf("the holder of epoch 9 exited %d: %v", f.Exit, f.Err)
 	}
@@ -508,8 +507,7 @@ func TestTheSameHolderReclaimsItsOwnEpochAfterACrash(t *testing.T) {
 	vol := &readyReportingVolume{fakeVolume: healthyVolume(), auth: auth, epoch: 9}
 	rep := &countingReplicator{}
 	sup := newCloseoutSup(t, spec, vol, asHolder{auth, "pod-a"}, rep, fencer)
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 
 	f := sup.Run(context.Background(), stop)
 	if f.Exit != CodeOK {

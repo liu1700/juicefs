@@ -24,7 +24,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -101,8 +100,7 @@ func runToCleanStop(t *testing.T, spec *MountSpec, rep Replicator, fencer Fencer
 	t.Helper()
 	sup := newSup(t, spec, &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, fencer)
 	sup.Deps.Replicator = rep
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
 		t.Fatalf("exit = %d: %v", got.Exit, got.Err)
 	}
@@ -216,8 +214,7 @@ func TestALocalDurablePointTheServerNeverHeardAboutWinsWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
 		t.Fatalf("exit = %d: %v", got.Exit, got.Err)
 	}
@@ -272,8 +269,7 @@ func TestASameEpochRestartUsesItsOwnDurablePoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stop := make(chan os.Signal, 1)
-	stop <- syscall.SIGTERM
+	stop := stopOnReady(sup)
 	if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
 		t.Fatalf("exit = %d: %v", got.Exit, got.Err)
 	}
@@ -433,8 +429,7 @@ func TestTheRestoreAnchorCarriesTheDurablePointsTransaction(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		stop := make(chan os.Signal, 1)
-		stop <- syscall.SIGTERM
+		stop := stopOnReady(sup)
 		if got := sup.Run(context.Background(), stop); got.Exit != CodeOK {
 			t.Fatalf("exit = %d: %v", got.Exit, got.Err)
 		}
