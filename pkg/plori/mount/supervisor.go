@@ -1354,7 +1354,48 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 	if res.BarrierAt.IsZero() {
 		res.BarrierAt = s.now().UTC()
 	}
+	// An idle tick makes no request (PLO-552). A barrier that drained no block
+	// and found the replica exactly where the last reported durable point left
+	// it has made nothing durable that point does not already cover: reporting
+	// it again would move two timestamps and nothing else, at the price of one
+	// control-plane call per period per mount — 20 calls/s across the 100-mount
+	// target now that the period is 5 s rather than 60.
+	//
+	// The skip errs in one direction only, and it is the safe one: the
+	// control-plane keeps an OLDER restore point than it might have, never a
+	// newer one, so nothing is ever claimed durable that is not. Data this very
+	// barrier flushed out of the VFS moves the replica, so the next tick reports
+	// it; the staleness is bounded by one period.
+	//
+	// The barrier still ran and lastBarrier still advances, so health.json's
+	// last_barrier_at keeps moving and an idle mount does not read as one whose
+	// T_before has stopped advancing. An anchor that could not be read is ""
+	// and never matches, so a worker that cannot see the replica position
+	// always reports.
+	if pendingBefore == 0 && s.durablePointStands(txid) {
+		s.noteBarrier(res)
+		return
+	}
 	s.reportDurablePoint(ctx, res, txid)
+}
+
+// durablePointStands reports whether the durable point already recorded covers
+// everything this barrier could have made durable, because it named this very
+// replica transaction. lastTxID is only ever set by a report that named an
+// anchor, so a non-empty match is proof there is a point to stand on.
+func (s *Supervisor) durablePointStands(txid string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return txid != "" && txid == s.lastTxID
+}
+
+// noteBarrier records a barrier that produced no new durable point. It exists
+// so that an idle mount still looks alive: health.json publishes
+// lastBarrier.BarrierAt, and the plugin and the barrier-age alert read it.
+func (s *Supervisor) noteBarrier(res BarrierResult) {
+	s.mu.Lock()
+	s.lastBarrier = res
+	s.mu.Unlock()
 }
 
 // anchorTxID is the replica position that goes with T_before.
