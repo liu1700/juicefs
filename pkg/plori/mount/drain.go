@@ -33,12 +33,12 @@ import (
 // tail: the supervisor has to know, at every instant, how much work is standing
 // between it and a durable stop. That number has exactly one honest source --
 // the periodic barrier, which is a real drain of a real backlog and already
-// runs every 60 s. Nothing here estimates from a formula; it divides a measured
-// elapsed by a measured backlog and keeps an exponential average of the
-// quotient.
+// runs every barrier period. Nothing here estimates from a formula; it divides
+// a measured elapsed by a measured backlog and keeps an exponential average of
+// the quotient.
 //
 // The average is over per-block cost rather than over total drain time because
-// the backlog is what varies: two barriers 60 s apart may drain 4 blocks and
+// the backlog is what varies: two consecutive barriers may drain 4 blocks and
 // 400, and only the quotient is comparable between them.
 type DrainModel struct {
 	mu sync.RWMutex
@@ -51,9 +51,11 @@ type DrainModel struct {
 
 const (
 	// drainEMAAlpha weights the newest sample. 0.3 reaches ~90% of a step
-	// change in six barriers, i.e. about six minutes at the 60 s barrier
-	// period -- fast enough to follow a node that has become slow, slow enough
-	// that one unlucky barrier does not move the stop instant by minutes.
+	// change in six barriers, i.e. about 30 s at the 5 s barrier period -- fast
+	// enough to follow a node that has become slow, slow enough that one
+	// unlucky barrier does not move the stop instant by minutes. Only barriers
+	// that drained something are folded in (minDrainSample), so a shorter
+	// period buys faster adaptation under load and changes nothing when idle.
 	drainEMAAlpha = 0.3
 	// minDrainSample is the shallowest backlog a barrier may be measured
 	// against. Below it the barrier's own fixed cost (24-168 ms measured with

@@ -67,10 +67,22 @@ const (
 	// DefaultBufferSizeMB is the floor the chunk store enforces anyway
 	// (pkg/chunk/cached_store.go:584-586 raises anything smaller to 32).
 	DefaultBufferSizeMB = 32
-	// DefaultBarrierInterval: 15/60/300 s all measured zero write stall and
-	// zero extra PUTs, so the period is chosen for how much an unclean death
-	// loses, not for what it costs.
-	DefaultBarrierInterval = 60 * time.Second
+	// DefaultBarrierInterval is the acknowledged-write loss window: an unclean
+	// death loses everything written since the last barrier, so the period is
+	// chosen for how much that costs, not for what the barrier costs. 15/60/300 s
+	// all measured zero write stall and zero extra PUTs, and a fence on an empty
+	// queue completes in 24-168 ms issuing no request at all.
+	//
+	// 5 s rather than the original 60 (PLO-552). 60 was a request-budget guess
+	// made before the measurement existed; Litestream, replicating the metadata
+	// beside this, defaults to a 1 s sync interval and promises "you lose at most
+	// one sync interval", and a durability barrier that promises sixty times
+	// worse than the thing it is anchoring is not a window anyone chose. What
+	// made 60 defensible was the fear of an idle fleet paying for empty
+	// barriers; Supervisor.runBarrier no longer reports a durable point that
+	// nothing moved, so an idle mount pays nothing at any period and the cost
+	// left is one control-plane call per period per ACTIVE writer.
+	DefaultBarrierInterval = 5 * time.Second
 	// DefaultLitestreamSync stays at 1 s deliberately: raising it does not
 	// reduce PUTs (batching is monitor-interval's job) and 10 s multiplies
 	// replica lag 7.7x.
