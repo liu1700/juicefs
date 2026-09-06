@@ -716,6 +716,12 @@ type cachedStore struct {
 	objectDataBytes     *prometheus.CounterVec
 	stageBlockDelay     prometheus.Counter
 	stageBlockErrors    prometheus.Counter
+
+	// closed is shut by Shutdown. Every background loop this store starts
+	// waits on it, so a store whose owner is done releases its goroutines
+	// instead of running for the life of the process (PLO-572).
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func logRequest(typeStr, key, param, reqID string, err error, used time.Duration) {
@@ -873,6 +879,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		pendingKeys:     make(map[string]*pendingItem),
 		pendingChanged:  make(chan struct{}),
 		group:           NewController(),
+		closed:          make(chan struct{}),
 	}
 	store.maxStagingBacklog.Store(int64(config.MaxStagingBacklog))
 	if config.UploadLimit > 0 {
@@ -904,9 +911,15 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 				logger.Warn("cache store is empty, use memory cache")
 				config.CacheSize = 100 << 20
 				config.CacheDir = "memory"
-				store.bcache = newMemStore(&config, store.bcache.getMetrics())
+				previous := store.bcache
+				store.bcache = newMemStore(&config, previous.getMetrics())
+				previous.stop()
 			}
-			time.Sleep(time.Second)
+			select {
+			case <-store.closed:
+				return
+			case <-time.After(time.Second):
+			}
 		}
 	}()
 
@@ -955,7 +968,11 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		}
 		go func() {
 			for {
-				time.Sleep(interval)
+				select {
+				case <-store.closed:
+					return
+				case <-time.After(interval):
+				}
 				store.scanDelayedStaging()
 			}
 		}()
@@ -1258,9 +1275,38 @@ func (store *cachedStore) scanDelayedStaging() {
 }
 
 func (store *cachedStore) uploader() {
-	for it := range store.pendingCh {
-		store.uploadStagingFile(it)
+	for {
+		select {
+		case <-store.closed:
+			return
+		case it := <-store.pendingCh:
+			store.uploadStagingFile(it)
+		}
 	}
+}
+
+// Shutdown releases every background goroutine this store started: the cache
+// watcher, the writeback uploaders and delayed-staging sweep, the prefetchers,
+// and the block cache's own maintenance loops.
+//
+// It is the counterpart of NewCachedStore for a process that opens a volume,
+// does one thing to it and closes it again. A long-lived mount never calls it,
+// so mount behaviour is unchanged; a caller that does call it must not use the
+// store afterwards.
+//
+// It is idempotent. Nothing is flushed here -- a caller that owes the object
+// store staged blocks must run the durability barrier BEFORE shutting the store
+// down, exactly as it must today.
+func (store *cachedStore) Shutdown() {
+	store.closeOnce.Do(func() {
+		close(store.closed)
+		if store.fetcher != nil {
+			store.fetcher.stop()
+		}
+		if store.bcache != nil {
+			store.bcache.stop()
+		}
+	})
 }
 
 func (store *cachedStore) canUpload() bool {

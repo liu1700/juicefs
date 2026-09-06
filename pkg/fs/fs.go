@@ -157,6 +157,11 @@ type FileSystem struct {
 
 	// Pre-parsed subdir prefixes for fast path checking
 	subdirPrefixes []string
+
+	// closed is shut by Close. cleanupCache waits on it, and closing it is
+	// what also releases the reader, the writer and the chunk store (PLO-572).
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 type File struct {
@@ -205,6 +210,7 @@ func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore, registry *
 			Buckets: prometheus.ExponentialBuckets(0.00001, 1.8, 29),
 		}),
 		registry: registry,
+		closed:   make(chan struct{}),
 	}
 
 	// Pre-parse subdir prefixes for fast path checking
@@ -271,7 +277,11 @@ func (fs *FileSystem) cleanupCache() {
 			}
 		}
 		fs.cacheM.Unlock()
-		time.Sleep(time.Second)
+		select {
+		case <-fs.closed:
+			return
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -1086,7 +1096,30 @@ func (fs *FileSystem) Close() error {
 		fs.logBuffer = nil
 		close(buffer)
 	}
-	return fs.Meta().CloseSession()
+	err := fs.Meta().CloseSession()
+	fs.Shutdown()
+	return err
+}
+
+// Shutdown releases every background goroutine this filesystem started: its own
+// attribute-cache sweeper, the VFS writer's flush loop, the VFS reader's
+// buffer-release loop, and the chunk store's loops underneath them (PLO-572).
+//
+// Close calls it, so a caller that closes the filesystem gets it for free. It
+// is separate and exported because a caller that shares the metadata client
+// with something else -- and so cannot close the session -- still has to be
+// able to release the loops. It is idempotent, and the filesystem must not be
+// used afterwards.
+//
+// The metadata engine is NOT shut down here: the caller supplied it to
+// NewFileSystem and owns it, and meta.Meta.Shutdown is how it goes.
+func (fs *FileSystem) Shutdown() {
+	fs.closeOnce.Do(func() {
+		close(fs.closed)
+		fs.writer.Shutdown()
+		fs.reader.Shutdown()
+		fs.store.Shutdown()
+	})
 }
 
 func (fs *FileSystem) Clone(ctx meta.Context, src, dst string, preserve bool) (err syscall.Errno) {

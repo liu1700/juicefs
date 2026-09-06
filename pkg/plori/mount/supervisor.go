@@ -433,6 +433,19 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 	if err := s.refusals(ctx); err != nil {
 		return err
 	}
+	// PLO-569: the restore put the slice-ID allocator back to where it stood at
+	// the restored point, so this generation would reissue the IDs the previous
+	// one issued from that same point -- and a slice ID is an object key. Lift
+	// it above them before anything in this process can allocate a slice, which
+	// means before the session purge and the post-crash repair, not after.
+	from, to, err := vol.RaiseSliceIDFloor(ctx)
+	if err != nil {
+		return fatalf(CodeRestoreFailed, ErrCodeSliceFloorFailed, false,
+			"raise the slice-ID floor: %s", err)
+	}
+	if to > from {
+		s.log("slice_id_floor", "from", from, "to", to)
+	}
 	// PLO-362: a restored database still lists the previous writer's session.
 	// With --heartbeat 300 its row does not expire for 25 minutes
 	// (pkg/meta/base.go:876-881 expireTime = heartbeat*5), and until then it

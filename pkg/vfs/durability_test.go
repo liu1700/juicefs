@@ -57,6 +57,7 @@ func (durabilityControlWriter) GetLength(Ino) uint64                  { return 0
 func (durabilityControlWriter) Truncate(Ino, uint64)                  {}
 func (durabilityControlWriter) UpdateMtime(Ino, time.Time)            {}
 func (durabilityControlWriter) FlushAll() error                       { return nil }
+func (durabilityControlWriter) Shutdown()                             {}
 
 func runDurabilityControl(v *VFS, uid uint32, payload []byte) ([]byte, syscall.Errno) {
 	out := &bytes.Buffer{}

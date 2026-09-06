@@ -56,6 +56,7 @@ func (s *blockingChunkStore) CheckCache(id uint64, size uint32, parts []chunk.Ra
 func (s *blockingChunkStore) UsedMemory() int64                  { return 0 }
 func (s *blockingChunkStore) UpdateLimit(upload, download int64) {}
 func (s *blockingChunkStore) BlobStorage() object.ObjectStorage  { return nil }
+func (s *blockingChunkStore) Shutdown()                          {}
 
 func createCancellationTestReader(t *testing.T, store chunk.ChunkStore) (*dataReader, Ino) {
 	t.Helper()

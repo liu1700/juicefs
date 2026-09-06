@@ -42,6 +42,8 @@ type cacheManager struct {
 	storeMap      map[string]*diskCache
 	stores        []*diskCache
 	metrics       *cacheManagerMetrics
+	closed        chan struct{}
+	closeOnce     sync.Once
 }
 
 func legacyKeyHash(s string) uint32 {
@@ -101,6 +103,9 @@ type CacheManager interface {
 	usedMemory() int64
 	isEmpty() bool
 	getMetrics() *cacheManagerMetrics
+	// stop releases every background goroutine the manager started. It is
+	// idempotent, and the manager must not be used afterwards.
+	stop()
 }
 
 func newCacheManager(config *Config, reg prometheus.Registerer, uploader func(key, path string, force bool) bool) CacheManager {
@@ -135,6 +140,7 @@ func newCacheManager(config *Config, reg prometheus.Registerer, uploader func(ke
 		storeMap:      make(map[string]*diskCache, len(dirs)),
 		stores:        make([]*diskCache, len(dirs)),
 		metrics:       metrics,
+		closed:        make(chan struct{}),
 	}
 
 	// 20% of buffer could be used for pending pages
@@ -166,8 +172,28 @@ func (m *cacheManager) cleanup() {
 		for _, id := range ids {
 			m.removeStore(id)
 		}
-		time.Sleep(time.Second)
+		select {
+		case <-m.closed:
+			return
+		case <-time.After(time.Second):
+		}
 	}
+}
+
+// stop releases the manager's own cleanup loop and every disk cache under it.
+func (m *cacheManager) stop() {
+	m.closeOnce.Do(func() {
+		close(m.closed)
+		m.Lock()
+		stores := make([]*diskCache, 0, len(m.stores))
+		stores = append(stores, m.stores...)
+		m.Unlock()
+		for _, s := range stores {
+			if s != nil {
+				s.stop()
+			}
+		}
+	})
 }
 
 func (m *cacheManager) isEmpty() bool {

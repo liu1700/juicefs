@@ -25,6 +25,11 @@ type prefetcher struct {
 	pending chan string
 	busy    map[string]bool
 	op      func(key string)
+	// closed is shut by stop. The worker goroutines select on it rather than
+	// on the channel being closed, so a fetch racing the stop drops its key
+	// instead of panicking on a send to a closed channel.
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func newPrefetcher(parallel int, fetch func(string)) *prefetcher {
@@ -32,6 +37,7 @@ func newPrefetcher(parallel int, fetch func(string)) *prefetcher {
 		pending: make(chan string, max(parallel*4, 10)),
 		busy:    make(map[string]bool),
 		op:      fetch,
+		closed:  make(chan struct{}),
 	}
 	for range parallel {
 		go p.do()
@@ -40,13 +46,25 @@ func newPrefetcher(parallel int, fetch func(string)) *prefetcher {
 }
 
 func (p *prefetcher) do() {
-	for key := range p.pending {
+	for {
+		var key string
+		select {
+		case <-p.closed:
+			return
+		case key = <-p.pending:
+		}
 		p.op(key)
 
 		p.Lock()
 		delete(p.busy, key)
 		p.Unlock()
 	}
+}
+
+// stop releases the worker goroutines. It is idempotent, and a prefetch
+// submitted after it is discarded.
+func (p *prefetcher) stop() {
+	p.closeOnce.Do(func() { close(p.closed) })
 }
 
 func (p *prefetcher) fetch(key string) {

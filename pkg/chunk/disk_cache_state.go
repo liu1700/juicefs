@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -84,6 +85,10 @@ type dcState interface {
 type baseDC struct {
 	cache  *diskCache
 	stopCh chan struct{}
+	// stopOnce keeps stop idempotent. A state is stopped when the machine
+	// transitions away from it and again when the whole cache is stopped, and
+	// the two can happen in either order.
+	stopOnce sync.Once
 }
 
 func newDCState(state int, cs *diskCache) dcState {
@@ -109,7 +114,7 @@ func (dc *baseDC) init(cs *diskCache) {
 }
 
 func (dc *baseDC) stop() {
-	close(dc.stopCh)
+	dc.stopOnce.Do(func() { close(dc.stopCh) })
 }
 func (dc *baseDC) onIOErr()            {}
 func (dc *baseDC) onIOSucc()           {}

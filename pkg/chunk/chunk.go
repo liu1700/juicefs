@@ -52,6 +52,12 @@ type ChunkStore interface {
 	UsedMemory() int64
 	UpdateLimit(upload, download int64)
 	BlobStorage() object.ObjectStorage
+	// Shutdown releases the background goroutines the store started. A
+	// long-lived mount never calls it; a process that opens and closes many
+	// stores must, or every one of them keeps its loops for the life of the
+	// process (PLO-572). It is idempotent, and the store must not be used
+	// afterwards.
+	Shutdown()
 }
 
 // DurabilityStatus describes writeback data that has not reached object storage.
