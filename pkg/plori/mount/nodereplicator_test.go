@@ -12,11 +12,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeLitestreamNode is a stand-in for the node-level `litestream replicate`
@@ -433,5 +435,125 @@ func TestRestoreReplacementDetachesTheOldRegistrationBeforeRegisteringAgain(t *t
 	}
 	if got, want := f.routes(), []string{"/register", "/unregister", "/register"}; !slices.Equal(got, want) {
 		t.Fatalf("control sequence = %v, want %v", got, want)
+	}
+}
+
+// TestRealLitestreamRestoreReplacement exercises the pinned daemon rather than
+// the in-process protocol fake. Set LITESTREAM_BIN to the exact release binary
+// for this opt-in test; normal package tests remain hermetic.
+func TestRealLitestreamRestoreReplacement(t *testing.T) {
+	bin := os.Getenv("LITESTREAM_BIN")
+	if bin == "" {
+		t.Skip("set LITESTREAM_BIN to run against Litestream v0.5.17")
+	}
+	version, err := exec.Command(bin, "version").Output()
+	if err != nil {
+		t.Fatalf("litestream version: %v", err)
+	}
+	if strings.TrimSpace(string(version)) != "v0.5.17" {
+		t.Fatalf("litestream version = %q, want v0.5.17", strings.TrimSpace(string(version)))
+	}
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 is required for the real Litestream fixture")
+	}
+
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "litestream.sock")
+	configPath := filepath.Join(dir, "litestream.yml")
+	if err := os.WriteFile(configPath, []byte("socket:\n  enabled: true\n  path: "+socketPath+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "replicate", "-config", configPath)
+	var daemonLog strings.Builder
+	cmd.Stdout = &daemonLog
+	cmd.Stderr = &daemonLog
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start litestream: %v", err)
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(os.Interrupt)
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			<-done
+		}
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(socketPath); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("litestream control socket was not created: %s", daemonLog.String())
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	oldDB := filepath.Join(dir, "meta.db")
+	otherDB := filepath.Join(dir, "other.db")
+	for path, value := range map[string]string{oldDB: "old", otherDB: "other"} {
+		if out, err := exec.Command("sqlite3", path, "CREATE TABLE data (value TEXT); INSERT INTO data VALUES ('"+value+"');").CombinedOutput(); err != nil {
+			t.Fatalf("initialize %s: %v: %s", path, err, out)
+		}
+	}
+	oldReplica := "file://" + filepath.Join(dir, "replica-old")
+	otherReplica := "file://" + filepath.Join(dir, "replica-other")
+	for path, replica := range map[string]string{oldDB: oldReplica, otherDB: otherReplica} {
+		if _, err := litestreamControl(context.Background(), socketPath, "/register", map[string]any{"path": path, "replica_url": replica}); err != nil {
+			t.Fatalf("register %s: %v", path, err)
+		}
+		if _, err := litestreamControl(context.Background(), socketPath, "/sync", map[string]any{"path": path, "wait": true, "timeout": 30}); err != nil {
+			t.Fatalf("sync %s: %v", path, err)
+		}
+	}
+
+	n := &NodeReplicator{SocketPath: socketPath, DBPath: oldDB}
+	if err := n.DetachBeforeRestore(context.Background()); err != nil {
+		t.Fatalf("unregister old database: %v", err)
+	}
+	if err := setAsideLocalDatabase(Paths{StateDir: dir}); err != nil {
+		t.Fatalf("set aside old database: %v", err)
+	}
+	if _, err := os.Stat(oldDB + ".superseded"); err != nil {
+		t.Fatalf("old database was not set aside: %v", err)
+	}
+	if out, err := exec.Command(bin, "restore", "-o", oldDB, oldReplica).CombinedOutput(); err != nil {
+		t.Fatalf("restore old database: %v: %s", err, out)
+	}
+	if _, err := litestreamControl(context.Background(), socketPath, "/register", map[string]any{"path": oldDB, "replica_url": oldReplica}); err != nil {
+		t.Fatalf("register restored database: %v", err)
+	}
+	if _, err := litestreamControl(context.Background(), socketPath, "/sync", map[string]any{"path": oldDB, "wait": true, "timeout": 30}); err != nil {
+		t.Fatalf("sync restored database: %v", err)
+	}
+	if _, err := litestreamControl(context.Background(), socketPath, "/sync", map[string]any{"path": otherDB, "wait": true, "timeout": 30}); err != nil {
+		t.Fatalf("other registration stopped after replacement: %v", err)
+	}
+	out, err := exec.Command("sqlite3", oldDB, "SELECT value FROM data;").CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "old" {
+		t.Fatalf("restored database = %q, err = %v; want old", strings.TrimSpace(string(out)), err)
+	}
+}
+
+func TestDetachFailureLeavesOldDatabaseInPlace(t *testing.T) {
+	paths := stateWithDatabase(t)
+	n := &NodeReplicator{SocketPath: filepath.Join(t.TempDir(), "missing.sock"), DBPath: paths.MetaPath()}
+	_, _, err := reconcileLocalDatabaseBeforeSetAside(paths, "vol-1", false, point("vol-1", 4), 0, func() error {
+		return n.DetachBeforeRestore(context.Background())
+	})
+	if err == nil {
+		t.Fatal("want detach failure")
+	}
+	for _, name := range []string{"meta.db", "meta.db-wal", "meta.db-shm", ".meta.db-litestream"} {
+		if _, err := os.Stat(filepath.Join(paths.StateDir, name)); err != nil {
+			t.Errorf("%s moved after failed detach: %v", name, err)
+		}
 	}
 }

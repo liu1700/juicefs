@@ -102,17 +102,15 @@ func reconcileLocalDatabaseBeforeSetAside(paths Paths, volumeID string, cleanSto
 
 	if reason, ok := adoptable(volumeID, cleanStop, local, serverEpoch); ok {
 		return localDBAdopted, reason, nil
-	} else if beforeSetAside != nil {
-		if err := beforeSetAside(); err != nil {
-			return localDBSetAside, "", fmt.Errorf("detach the old metadata registration: %w", err)
+	} else {
+		if beforeSetAside != nil {
+			if err := beforeSetAside(); err != nil {
+				return localDBSetAside, "", fmt.Errorf("detach the old metadata registration: %w", err)
+			}
 		}
 		if err := setAsideLocalDatabase(paths); err != nil {
 			return localDBSetAside, "", err
 		}
-		return localDBSetAside, reason, nil
-	} else if err := setAsideLocalDatabase(paths); err != nil {
-		return localDBSetAside, "", err
-	} else {
 		return localDBSetAside, reason, nil
 	}
 }
