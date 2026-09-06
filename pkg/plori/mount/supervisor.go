@@ -1138,7 +1138,7 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			// A replacement node replicator can appear between health ticks. Once
 			// replication is known failed, use this existing one-second guard to
 			// finish its bounded recovery before the durability window closes.
-			if s.replicationFailing() {
+			if !s.replicationFailureSince().IsZero() {
 				if f := s.checkReplication(ctx); f != nil {
 					return f
 				}
@@ -1269,7 +1269,7 @@ func (s *Supervisor) reloadReplicatorCredentials(ctx context.Context) {
 }
 
 // checkReplication asks the replicator whether it is still replicating this
-// worker's database, repairs it once, and stops the mount if it stays dead.
+// worker's database, retries repair within the failure window, and stops the mount if it stays dead.
 //
 // The rule is one instant, not a state machine: replFailedSince is set by the
 // first failing probe and cleared by the first succeeding one. From it come
@@ -1292,16 +1292,16 @@ func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 	if !ok {
 		return nil
 	}
-	now := s.now()
-	since := s.replicationFailedSince()
-	probe, cancel, canProbe := s.replicationRecoveryContext(ctx, now, since)
+	probeNow := s.now()
+	since := s.replicationFailureSince()
+	probe, cancel, canProbe := s.replicationRecoveryContext(ctx, probeNow, since)
 	if !canProbe {
 		// The regular health check does not own lease expiry. The guard has
 		// already made that decision before it requests a recovery retry.
 		if since.IsZero() {
 			return nil
 		}
-		return s.stopReplicationFailure(ctx, errors.New("replication recovery window closed"), now, since)
+		return s.stopReplicationFailure(ctx, errors.New("replication recovery window closed"), probeNow, since)
 	}
 	err := sup.Probe(probe)
 	cancel()
@@ -1316,6 +1316,9 @@ func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 		return nil
 	}
 
+	// Probe may consume its whole budget. Record the failure and calculate any
+	// next call from the time it returned, never from the time it began.
+	now := s.now()
 	s.mu.Lock()
 	if s.replFailedSince.IsZero() {
 		s.replFailedSince = now
@@ -1330,9 +1333,10 @@ func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 	if restarted {
 		return nil
 	}
-	restart, cancel, canRestart := s.replicationRecoveryContext(ctx, now, since)
+	restartNow := s.now()
+	restart, cancel, canRestart := s.replicationRecoveryContext(ctx, restartNow, since)
 	if !canRestart {
-		return s.stopReplicationFailure(ctx, err, now, since)
+		return s.stopReplicationFailure(ctx, err, restartNow, since)
 	}
 	if rerr := sup.Restart(restart); rerr != nil {
 		cancel()
@@ -1347,15 +1351,7 @@ func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 	return nil
 }
 
-// replicationFailing reports whether the health tick has found replication
-// unavailable. Only this state gets an extra probe on the existing guard tick.
-func (s *Supervisor) replicationFailing() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return !s.replFailedSince.IsZero()
-}
-
-func (s *Supervisor) replicationFailedSince() time.Time {
+func (s *Supervisor) replicationFailureSince() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.replFailedSince

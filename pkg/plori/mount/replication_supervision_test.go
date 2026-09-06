@@ -59,6 +59,37 @@ func (r *watchedReplicator) counts() (probes, restarts int) {
 	return r.probes, r.restarts
 }
 
+// slowProbeReplicator waits for its recovery context to expire. It models a
+// local socket call that cannot return before the supervisor's call budget.
+type slowProbeReplicator struct {
+	fakeReplicator
+
+	mu            sync.Mutex
+	probeCanceled error
+	restarts      int
+}
+
+func (r *slowProbeReplicator) Probe(ctx context.Context) error {
+	<-ctx.Done()
+	r.mu.Lock()
+	r.probeCanceled = ctx.Err()
+	r.mu.Unlock()
+	return ctx.Err()
+}
+
+func (r *slowProbeReplicator) Restart(context.Context) error {
+	r.mu.Lock()
+	r.restarts++
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *slowProbeReplicator) result() (error, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.probeCanceled, r.restarts
+}
+
 // supWithWatchedReplicator builds a supervisor far enough along to answer
 // health checks: a volume, a state directory, and a clock the test moves.
 func supWithWatchedReplicator(t *testing.T, rep *watchedReplicator) (*Supervisor, *fakeVolume, *time.Time) {
@@ -109,9 +140,8 @@ func TestADeadReplicatorShowsUpInHealthOnTheNextTick(t *testing.T) {
 	}
 }
 
-// One repair attempt per failure, not one per tick. A replicator that cannot
-// be revived would otherwise be restarted every ten seconds until the stop
-// trips, and each attempt on the exec path is a process spawn.
+// A successful repair is not repeated for one uninterrupted failure. A failed
+// repair is retried by the bounded guard path until the stop trips.
 func TestTheRepairIsAttemptedOncePerFailure(t *testing.T) {
 	rep := &watchedReplicator{}
 	sup, _, clock := supWithWatchedReplicator(t, rep)
@@ -277,7 +307,32 @@ func TestFailedReplicationRepairRetriesBeforeBarrierDeadline(t *testing.T) {
 	if f := sup.checkReplication(context.Background()); f != nil {
 		t.Fatalf("probe after re-registration stopped the worker: %v", f.Err)
 	}
-	if sup.replicationFailing() {
+	if !sup.replicationFailureSince().IsZero() {
 		t.Fatal("successful probe after re-registration left replication failed")
+	}
+}
+
+// A timed-out Probe consumes the lease stop budget. The supervisor must read
+// time again before attempting Restart; using the time from before Probe would
+// start a second network call after authority has expired.
+func TestAProbeThatConsumesTheLeaseBudgetDoesNotStartRestart(t *testing.T) {
+	rep := &slowProbeReplicator{}
+	sup, _, _ := supWithWatchedReplicator(t, &watchedReplicator{})
+	sup.Deps.Replicator = rep
+	sup.Options.BarrierInterval = 200 * time.Millisecond
+	now := time.Now()
+	sup.Deps.Now = time.Now
+	sup.deadline = NewDeadline(now.UTC().Add(40*time.Millisecond), 0, now)
+
+	f := sup.checkReplication(context.Background())
+	probeErr, restarts := rep.result()
+	if !errors.Is(probeErr, context.DeadlineExceeded) {
+		t.Fatalf("probe context error = %v, want deadline exceeded", probeErr)
+	}
+	if restarts != 0 {
+		t.Fatalf("restarts after exhausted lease stop budget = %d, want 0", restarts)
+	}
+	if f == nil {
+		t.Fatal("probe that exhausted the lease stop budget did not stop")
 	}
 }
