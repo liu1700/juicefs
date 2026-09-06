@@ -243,3 +243,41 @@ func TestAReplicatorThatCannotBeProbedIsNotTreatedAsFailed(t *testing.T) {
 		t.Fatalf("a replicator that does not implement the probe produced a stop: %v", f.Err)
 	}
 }
+
+// A node-replicator replacement can make the first repair race a missing socket.
+// That failed call must not consume recovery: the guard tick gets another bounded
+// chance to register with the fresh, empty daemon before the barrier window ends.
+func TestFailedReplicationRepairRetriesBeforeBarrierDeadline(t *testing.T) {
+	rep := &watchedReplicator{restartErr: errors.New("replicator socket unavailable")}
+	sup, _, clock := supWithWatchedReplicator(t, rep)
+	sup.Options.BarrierInterval = 5 * time.Second
+	rep.fail(errors.New("database not found"))
+
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("first failed repair stopped the worker: %v", f.Err)
+	}
+	if _, restarts := rep.counts(); restarts != 1 {
+		t.Fatalf("restarts after unavailable socket = %d, want 1", restarts)
+	}
+
+	// The replacement daemon is now up with no registration for this worker.
+	*clock = clock.Add(time.Second)
+	rep.mu.Lock()
+	rep.restartErr = nil
+	rep.healAfterRestart = true
+	rep.mu.Unlock()
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("re-registration before the barrier deadline stopped the worker: %v", f.Err)
+	}
+	if _, restarts := rep.counts(); restarts != 2 {
+		t.Fatalf("restarts after fresh daemon appeared = %d, want 2", restarts)
+	}
+
+	*clock = clock.Add(time.Second)
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("probe after re-registration stopped the worker: %v", f.Err)
+	}
+	if sup.replicationFailing() {
+		t.Fatal("successful probe after re-registration left replication failed")
+	}
+}
