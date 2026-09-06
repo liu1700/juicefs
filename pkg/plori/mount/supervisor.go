@@ -1135,6 +1135,14 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 				return s.fenceAndStop(fatalf(CodeFenced, ErrCodeLeaseLost, false,
 					"lease deadline reached without a successful renewal"), ReasonFenced)
 			}
+			// A replacement node replicator can appear between health ticks. Once
+			// replication is known failed, use this existing one-second guard to
+			// finish its bounded recovery before the durability window closes.
+			if !s.replicationFailureSince().IsZero() {
+				if f := s.checkReplication(ctx); f != nil {
+					return f
+				}
+			}
 
 		case <-renew.C:
 			ticks++
@@ -1261,7 +1269,7 @@ func (s *Supervisor) reloadReplicatorCredentials(ctx context.Context) {
 }
 
 // checkReplication asks the replicator whether it is still replicating this
-// worker's database, repairs it once, and stops the mount if it stays dead.
+// worker's database, retries repair within the failure window, and stops the mount if it stays dead.
 //
 // The rule is one instant, not a state machine: replFailedSince is set by the
 // first failing probe and cleared by the first succeeding one. From it come
@@ -1284,7 +1292,19 @@ func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 	if !ok {
 		return nil
 	}
-	err := sup.Probe(ctx)
+	probeNow := s.now()
+	since := s.replicationFailureSince()
+	probe, cancel, canProbe := s.replicationRecoveryContext(ctx, probeNow, since)
+	if !canProbe {
+		// The regular health check does not own lease expiry. The guard has
+		// already made that decision before it requests a recovery retry.
+		if since.IsZero() {
+			return nil
+		}
+		return s.stopReplicationFailure(ctx, errors.New("replication recovery window closed"), probeNow, since)
+	}
+	err := sup.Probe(probe)
+	cancel()
 	if err == nil {
 		s.mu.Lock()
 		wasFailing := !s.replFailedSince.IsZero()
@@ -1296,6 +1316,8 @@ func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 		return nil
 	}
 
+	// Probe may consume its whole budget. Record the failure and calculate any
+	// next call from the time it returned, never from the time it began.
 	now := s.now()
 	s.mu.Lock()
 	if s.replFailedSince.IsZero() {
@@ -1303,30 +1325,64 @@ func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 	}
 	since, restarted := s.replFailedSince, s.replRestarted
 	s.mu.Unlock()
-
-	failedFor := now.Sub(since)
-	if failedFor >= s.barrierInterval() {
-		s.log("replication_failed_stop", "error", err.Error(), "failed_for", failedFor.String())
-		// Write the verdict out before the stop begins: the ordered stop can
-		// take the whole write-stop margin, and an operator reading
-		// health.json during it should see why.
-		s.writeHealth()
-		return s.shutdown(ctx, ReasonReplicationFailed)
+	if now.Sub(since) >= s.barrierInterval() {
+		return s.stopReplicationFailure(ctx, err, now, since)
 	}
 
-	s.log("replication_probe_failed", "error", err.Error(), "failed_for", failedFor.String())
+	s.log("replication_probe_failed", "error", err.Error(), "failed_for", now.Sub(since).String())
 	if restarted {
 		return nil
 	}
-	s.mu.Lock()
-	s.replRestarted = true
-	s.mu.Unlock()
-	if rerr := sup.Restart(ctx); rerr != nil {
+	restartNow := s.now()
+	restart, cancel, canRestart := s.replicationRecoveryContext(ctx, restartNow, since)
+	if !canRestart {
+		return s.stopReplicationFailure(ctx, err, restartNow, since)
+	}
+	if rerr := sup.Restart(restart); rerr != nil {
+		cancel()
 		s.log("replication_restart_failed", "error", rerr.Error())
 		return nil
 	}
+	cancel()
+	s.mu.Lock()
+	s.replRestarted = true
+	s.mu.Unlock()
 	s.log("replication_restarted")
 	return nil
+}
+
+func (s *Supervisor) replicationFailureSince() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.replFailedSince
+}
+
+// replicationRecoveryContext limits a probe or re-registration to both the
+// remaining replication-failure window and the time before ordered lease stop.
+func (s *Supervisor) replicationRecoveryContext(parent context.Context, now, since time.Time) (context.Context, context.CancelFunc, bool) {
+	window := s.barrierInterval()
+	if !since.IsZero() {
+		window -= now.Sub(since)
+	}
+	stopBudget := s.deadline.StopBy(s.stopEarliness()).Sub(now)
+	if stopBudget < window {
+		window = stopBudget
+	}
+	if window <= 0 {
+		return nil, nil, false
+	}
+	recovery, cancel := context.WithTimeout(parent, window)
+	return recovery, cancel, true
+}
+
+func (s *Supervisor) stopReplicationFailure(ctx context.Context, err error, now, since time.Time) *Fatal {
+	failedFor := now.Sub(since)
+	s.log("replication_failed_stop", "error", err.Error(), "failed_for", failedFor.String())
+	// Write the verdict out before the stop begins: the ordered stop can take
+	// the whole write-stop margin, and an operator reading health.json during it
+	// should see why.
+	s.writeHealth()
+	return s.shutdown(ctx, ReasonReplicationFailed)
 }
 
 func (s *Supervisor) barrierInterval() time.Duration {

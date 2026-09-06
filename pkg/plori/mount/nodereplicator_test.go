@@ -390,3 +390,30 @@ func TestReplicaURLRefusesWithoutASpec(t *testing.T) {
 		t.Fatalf("ReplicaURL error = %v, want ErrSpec", err)
 	}
 }
+
+func TestRestartRetriesRegistrationAfterTheSocketReappears(t *testing.T) {
+	f := newFakeLitestreamNode(t)
+	n := newNodeReplicator(t, f)
+	if err := n.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// The old daemon is gone when the worker first tries to repair.
+	n.SocketPath = filepath.Join(t.TempDir(), "gone.sock")
+	if err := n.Restart(context.Background()); err == nil {
+		t.Fatal("restart unexpectedly succeeded without a daemon socket")
+	}
+
+	// A new daemon starts empty. Repeating the worker-owned restart registers
+	// the database again without any plugin-side MountSpec or lease operation.
+	n.SocketPath = f.socket
+	f.mu.Lock()
+	f.registered = map[string]string{}
+	f.mu.Unlock()
+	if err := n.Restart(context.Background()); err != nil {
+		t.Fatalf("restart after fresh daemon: %v", err)
+	}
+	if err := n.Probe(context.Background()); err != nil {
+		t.Fatalf("probe after re-registration: %v", err)
+	}
+}
