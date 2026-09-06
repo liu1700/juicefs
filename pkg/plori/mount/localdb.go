@@ -84,6 +84,15 @@ const (
 // when there is none) and `serverEpoch` the epoch of the control-plane's, 0
 // when the spec carries none.
 func reconcileLocalDatabase(paths Paths, volumeID string, cleanStop bool, local *DurablePoint, serverEpoch int64) (localDBVerdict, string, error) {
+	return reconcileLocalDatabaseBeforeSetAside(paths, volumeID, cleanStop, local, serverEpoch, nil)
+}
+
+// reconcileLocalDatabaseBeforeSetAside is reconcileLocalDatabase with one
+// narrow seam for a live node-level Litestream registration. A restore replaces
+// the database and its Litestream position directory, so that registration must
+// be removed while its old files still exist. The callback runs only after the
+// local database was rejected and immediately before the first rename.
+func reconcileLocalDatabaseBeforeSetAside(paths Paths, volumeID string, cleanStop bool, local *DurablePoint, serverEpoch int64, beforeSetAside func() error) (localDBVerdict, string, error) {
 	if _, err := os.Stat(paths.MetaPath()); err != nil {
 		if os.IsNotExist(err) {
 			return localDBAbsent, "no local database", nil
@@ -93,9 +102,15 @@ func reconcileLocalDatabase(paths Paths, volumeID string, cleanStop bool, local 
 
 	if reason, ok := adoptable(volumeID, cleanStop, local, serverEpoch); ok {
 		return localDBAdopted, reason, nil
-	} else if err := setAsideLocalDatabase(paths); err != nil {
-		return localDBSetAside, "", err
 	} else {
+		if beforeSetAside != nil {
+			if err := beforeSetAside(); err != nil {
+				return localDBSetAside, "", fmt.Errorf("detach the old metadata registration: %w", err)
+			}
+		}
+		if err := setAsideLocalDatabase(paths); err != nil {
+			return localDBSetAside, "", err
+		}
 		return localDBSetAside, reason, nil
 	}
 }
