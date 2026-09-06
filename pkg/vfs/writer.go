@@ -47,6 +47,11 @@ type DataWriter interface {
 	Truncate(inode Ino, length uint64)
 	UpdateMtime(inode Ino, mtime time.Time)
 	FlushAll() error
+	// Shutdown stops the background flush loop. It is idempotent, it flushes
+	// nothing -- the caller runs FlushAll first if it owes data -- and the
+	// writer must not be used afterwards. A mount never calls it; a process
+	// that opens and closes many writers must (PLO-572).
+	Shutdown()
 }
 
 type sliceWriter struct {
@@ -465,6 +470,8 @@ type dataWriter struct {
 	bufferSize int64
 	files      map[Ino]*fileWriter
 	maxRetries uint32
+	closed     chan struct{}
+	closeOnce  sync.Once
 }
 
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
@@ -477,9 +484,15 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 		bufferSize: int64(conf.Chunk.BufferSize),
 		files:      make(map[Ino]*fileWriter),
 		maxRetries: uint32(conf.Meta.Retries),
+		closed:     make(chan struct{}),
 	}
 	go w.flushAll()
 	return w
+}
+
+// Shutdown stops the background flush loop started by NewDataWriter.
+func (w *dataWriter) Shutdown() {
+	w.closeOnce.Do(func() { close(w.closed) })
 }
 
 func (w *dataWriter) flushAll() {
@@ -508,7 +521,11 @@ func (w *dataWriter) flushAll() {
 			w.Lock()
 		}
 		w.Unlock()
-		time.Sleep(time.Millisecond * 100)
+		select {
+		case <-w.closed:
+			return
+		case <-time.After(time.Millisecond * 100):
+		}
 	}
 }
 

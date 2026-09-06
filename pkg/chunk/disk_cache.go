@@ -96,6 +96,12 @@ type diskCache struct {
 	// newBlockCooldown reduces the initial access time for newly cached staged blocks.
 	// This helps prevent a surge of writes from evicting active read blocks.
 	stagedBlockCooldown time.Duration
+
+	// closed is shut by stop and is what every maintenance loop below waits
+	// on instead of sleeping outright. A cache that is closed keeps answering
+	// reads from whatever is already on disk; only the loops go.
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func newDiskCache(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *diskCache {
@@ -112,6 +118,7 @@ func newDiskCache(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64,
 		keyIndex, _ = NewKeyIndex(config)
 	}
 	c := &diskCache{
+		closed:              make(chan struct{}),
 		m:                   m,
 		dir:                 dir,
 		mode:                config.CacheMode,
@@ -158,6 +165,32 @@ func newDiskCache(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64,
 	go c.scanStaging()
 	go c.checkTimeout()
 	return c
+}
+
+// stop releases every maintenance goroutine this disk cache started, including
+// the state machine's own ticker. It is idempotent. Nothing is flushed and
+// nothing is deleted: the loops are periodic housekeeping, and a process that
+// is done with the cache has no housekeeping left to do.
+func (cache *diskCache) stop() {
+	cache.closeOnce.Do(func() {
+		close(cache.closed)
+		cache.stateLock.Lock()
+		cache.state.stop()
+		cache.stateLock.Unlock()
+	})
+}
+
+// sleepOrStop waits for d and reports whether the caller should keep looping.
+func (cache *diskCache) sleepOrStop(d time.Duration) bool {
+	if d <= 0 {
+		d = time.Millisecond
+	}
+	select {
+	case <-cache.closed:
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 func (cache *diskCache) setLimitByFreeRatio(usage DiskFreeRatio, freeRatio float32) {
@@ -218,7 +251,9 @@ func (cache *diskCache) createLockFile() {
 func (cache *diskCache) checkLockFile() {
 	lockfile := cache.lockFilePath()
 	for cache.available() {
-		time.Sleep(time.Second * 10)
+		if !cache.sleepOrStop(time.Second * 10) {
+			return
+		}
 		if err := cache.statFile(lockfile); err != nil && os.IsNotExist(err) {
 			logger.Infof("lockfile %s is lost, cache device maybe broken", lockfile)
 			if inRootVolume(cache.dir) && cache.freeRatio < 0.2 {
@@ -288,7 +323,9 @@ func (c *diskCache) checkTimeout() {
 			}
 		}
 		c.opMu.Unlock()
-		time.Sleep(time.Second)
+		if !c.sleepOrStop(time.Second) {
+			return
+		}
 	}
 }
 
@@ -357,7 +394,9 @@ func (cache *diskCache) checkFreeSpace() {
 		if cache.rawFull.Load() {
 			cache.uploadStaging()
 		}
-		time.Sleep(time.Second)
+		if !cache.sleepOrStop(time.Second) {
+			return
+		}
 	}
 	logger.Infof("stop checkFreeSpace at %s", cache.dir)
 }
@@ -402,7 +441,9 @@ func (cache *diskCache) cleanupExpire() {
 			_ = cache.removeFile(cache.cachePath(cache.getPathFromKey(k)))
 		}
 		todel = todel[:0]
-		time.Sleep(interval / 1000 * time.Duration((cnt+1-deleted)*1000/(cnt+1)))
+		if !cache.sleepOrStop(interval / 1000 * time.Duration((cnt+1-deleted)*1000/(cnt+1))) {
+			return
+		}
 	}
 }
 
@@ -413,7 +454,9 @@ func (cache *diskCache) refreshCacheKeys() {
 	cache.scanCached(true)
 	if cache.scanInterval > 0 {
 		for {
-			time.Sleep(cache.scanInterval)
+			if !cache.sleepOrStop(cache.scanInterval) {
+				return
+			}
 			cache.scanCached(false)
 		}
 	}
@@ -727,7 +770,12 @@ func (cache *diskCache) stagePath(key string) string {
 // flush cached block into disk
 func (cache *diskCache) flush() {
 	for {
-		w := <-cache.pending
+		var w pendingFile
+		select {
+		case <-cache.closed:
+			return
+		case w = <-cache.pending:
+		}
 		path := cache.cachePath(w.key)
 		if cache.enabled() && cache.flushPage(path, w.page.Data, w.dropCache, 0) == nil {
 			cache.add(w.key, int32(len(w.page.Data)), uint32(time.Now().Unix()))

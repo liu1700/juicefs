@@ -76,6 +76,10 @@ type DataReader interface {
 	Open(inode Ino, length uint64) FileReader
 	Truncate(inode Ino, length uint64)
 	Invalidate(inode Ino, off, length uint64)
+	// Shutdown stops the background read-buffer loop. It is idempotent and the
+	// reader must not be used afterwards. A mount never calls it; a process
+	// that opens and closes many readers must (PLO-572).
+	Shutdown()
 }
 
 type frange struct {
@@ -704,6 +708,8 @@ type dataReader struct {
 	readAheadTotal uint64
 	maxRequests    int
 	maxRetries     uint32
+	closed         chan struct{}
+	closeOnce      sync.Once
 }
 
 func NewDataReader(conf *Config, m meta.Meta, store chunk.ChunkStore) DataReader {
@@ -722,9 +728,15 @@ func NewDataReader(conf *Config, m meta.Meta, store chunk.ChunkStore) DataReader
 		readAheadMax:   uint64(readAheadMax),
 		maxRequests:    readAheadMax/conf.Chunk.BlockSize*readSessions + 1,
 		maxRetries:     uint32(conf.Meta.Retries),
+		closed:         make(chan struct{}),
 	}
 	go r.checkReadBuffer()
 	return r
+}
+
+// Shutdown stops the background buffer-release loop started by NewDataReader.
+func (r *dataReader) Shutdown() {
+	r.closeOnce.Do(func() { close(r.closed) })
 }
 
 func (r *dataReader) readBufferUsed() int64 {
@@ -744,7 +756,11 @@ func (r *dataReader) checkReadBuffer() {
 			}
 		}
 		r.Unlock()
-		time.Sleep(time.Second)
+		select {
+		case <-r.closed:
+			return
+		case <-time.After(time.Second):
+		}
 	}
 }
 

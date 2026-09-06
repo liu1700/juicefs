@@ -40,10 +40,14 @@ type memcache struct {
 	cacheExpire time.Duration
 
 	metrics *cacheManagerMetrics
+
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
 func newMemStore(config *Config, metrics *cacheManagerMetrics) *memcache {
 	c := &memcache{
+		closed:      make(chan struct{}),
 		capacity:    int64(config.CacheSize),
 		maxItems:    config.CacheItems,
 		pages:       make(map[string]memItem),
@@ -202,8 +206,17 @@ func (c *memcache) cleanupExpire() {
 		if deleted > 0 {
 			logger.Debugf("Expired cache blocks: %d blocks (%s), remaining: %d blocks (%s)", deleted, humanize.IBytes(uint64(freed)), len(c.pages), humanize.IBytes(uint64(c.used)))
 		}
-		time.Sleep(interval / 1000 * time.Duration((cnt+1-deleted)*1000/(cnt+1)))
+		select {
+		case <-c.closed:
+			return
+		case <-time.After(interval / 1000 * time.Duration((cnt+1-deleted)*1000/(cnt+1))):
+		}
 	}
+}
+
+// stop releases the expiry loop. It is idempotent.
+func (c *memcache) stop() {
+	c.closeOnce.Do(func() { close(c.closed) })
 }
 
 func (c *memcache) stage(key string, data []byte, tierID uint8) (string, error) {

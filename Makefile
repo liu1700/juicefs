@@ -163,9 +163,16 @@ test.plori.unit:
 # SKIP_NON_CORE is upstream's gate for the cases that need a KeyDB or a Redis
 # cluster. ./pkg/object's remote backends skip themselves when their credentials
 # are absent (38 of them).
+# ./pkg/fs is here and NOT in test.plori.unit for the same reason ./pkg/object
+# is: it has no plori-tagged build to test. Its suite reaches meta.NewClient
+# with `memkv://`, and pkg/meta/tkv_mem.go is `//go:build !plori`, so under the
+# release tag set NewClient calls logger.Fatalf and kills the test binary before
+# anything runs. The default build is the real build for this package anyway --
+# it is what plori-runtime's storage-worker links -- and PLO-572's
+# open/close goroutine test lives in it.
 test.plori.upstream:
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 25m \
-		./pkg/chunk/... ./pkg/vfs/... ./pkg/object/... ./pkg/plori/mountspec/...
+		./pkg/chunk/... ./pkg/vfs/... ./pkg/fs/... ./pkg/object/... ./pkg/plori/mountspec/...
 
 test.plori.security:
 	python3 hack/verify_plori_security_test.py
