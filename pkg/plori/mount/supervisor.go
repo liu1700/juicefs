@@ -719,7 +719,12 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	if dp := s.Spec.DurablePoint; dp != nil {
 		serverEpoch = dp.FenceEpoch
 	}
-	verdict, why, rerr := reconcileLocalDatabase(s.Paths, s.Spec.StorageVolumeID, cleanStop, localPoint, serverEpoch)
+	verdict, why, rerr := reconcileLocalDatabaseBeforeSetAside(s.Paths, s.Spec.StorageVolumeID, cleanStop, localPoint, serverEpoch, func() error {
+		if n, ok := s.Deps.Replicator.(interface{ DetachBeforeRestore(context.Context) error }); ok {
+			return n.DetachBeforeRestore(ctx)
+		}
+		return nil
+	})
 	if rerr != nil {
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "reconcile the local metadata database: %s", rerr)
 	}

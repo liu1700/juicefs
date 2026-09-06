@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -415,5 +416,22 @@ func TestRestartRetriesRegistrationAfterTheSocketReappears(t *testing.T) {
 	}
 	if err := n.Probe(context.Background()); err != nil {
 		t.Fatalf("probe after re-registration: %v", err)
+	}
+}
+
+func TestRestoreReplacementDetachesTheOldRegistrationBeforeRegisteringAgain(t *testing.T) {
+	f := newFakeLitestreamNode(t)
+	n := newNodeReplicator(t, f)
+	if err := n.Start(context.Background()); err != nil {
+		t.Fatalf("register old database: %v", err)
+	}
+	if err := n.DetachBeforeRestore(context.Background()); err != nil {
+		t.Fatalf("detach old database: %v", err)
+	}
+	if err := n.Start(context.Background()); err != nil {
+		t.Fatalf("register restored database: %v", err)
+	}
+	if got, want := f.routes(), []string{"/register", "/unregister", "/register"}; !slices.Equal(got, want) {
+		t.Fatalf("control sequence = %v, want %v", got, want)
 	}
 }

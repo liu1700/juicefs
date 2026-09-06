@@ -5,6 +5,7 @@ package mount
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -207,5 +208,63 @@ func TestStartClearsThePreviousGenerationsLivenessFiles(t *testing.T) {
 		if _, err := os.Stat(stale); !os.IsNotExist(err) {
 			t.Errorf("%s survived startup; the plugin would read the previous generation's liveness as this one's", stale)
 		}
+	}
+}
+
+func TestSetAsideDetachesBeforeMovingTheOldDatabase(t *testing.T) {
+	p := stateWithDatabase(t)
+	called := false
+	verdict, _, err := reconcileLocalDatabaseBeforeSetAside(p, "vol-1", false, point("vol-1", 4), 0, func() error {
+		called = true
+		for _, name := range []string{"meta.db", "meta.db-wal", "meta.db-shm", ".meta.db-litestream"} {
+			if _, err := os.Stat(filepath.Join(p.StateDir, name)); err != nil {
+				return fmt.Errorf("%s disappeared before detach: %w", name, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !called {
+		t.Fatal("the old registration was not detached before set-aside")
+	}
+	if verdict != localDBSetAside {
+		t.Fatalf("verdict = %s, want %s", verdict, localDBSetAside)
+	}
+}
+
+type restoreDetachRecorder struct {
+	fakeReplicator
+	paths    Paths
+	detached bool
+}
+
+func (r *restoreDetachRecorder) DetachBeforeRestore(context.Context) error {
+	for _, name := range []string{"meta.db", "meta.db-wal", "meta.db-shm", ".meta.db-litestream"} {
+		if _, err := os.Stat(filepath.Join(r.paths.StateDir, name)); err != nil {
+			return fmt.Errorf("%s disappeared before registration detach: %w", name, err)
+		}
+	}
+	r.detached = true
+	return nil
+}
+
+func TestSupervisorDetachesTheNodeRegistrationBeforeAnUncleanRestore(t *testing.T) {
+	paths := stateWithDatabase(t)
+	rep := &restoreDetachRecorder{paths: paths}
+	s := &Supervisor{
+		Spec:  testSpec(),
+		Paths: paths,
+		Deps:  Deps{Replicator: rep, Fencer: &fakeFencer{}},
+	}
+	if err := s.restoreOrFormat(context.Background()); err != nil {
+		t.Fatalf("restoreOrFormat: %v", err)
+	}
+	if !rep.detached {
+		t.Fatal("the node registration was not detached before the unclean restore")
+	}
+	if got := rep.order(); len(got) != 1 || got[0] != "restore" {
+		t.Fatalf("replicator calls = %v, want restore after detachment", got)
 	}
 }

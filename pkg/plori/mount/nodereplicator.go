@@ -162,13 +162,28 @@ type registerResponse struct {
 	Path   string `json:"path"`
 }
 
+// DetachBeforeRestore removes this database's old registration before the
+// successor moves its database and Litestream position directory aside. It is
+// called only after the successor has acquired its new fence marker. A missing
+// registration is harmless (for example, after a daemon restart); any other
+// failure leaves the old files untouched and fails startup closed.
+func (n *NodeReplicator) DetachBeforeRestore(ctx context.Context) error {
+	_, err := n.control(ctx, "/unregister", map[string]any{
+		"path":    n.DBPath,
+		"timeout": 30,
+	})
+	if err != nil && !isNotRegistered(err) {
+		return fmt.Errorf("unregister old metadata database from the node replicator: %w", err)
+	}
+	return nil
+}
+
 // Start registers this worker's database with the node replicator.
 //
-// `already_registered` is accepted rather than refused. It is what a crash
-// restart at the same epoch looks like from the daemon's side — the daemon
-// outlives workers by design (PLO-369) — and the registration it already
-// holds is for the same database and the same prefix, because both are
-// derived from the same spec.
+// `already_registered` is accepted only when the on-disk database was kept.
+// Before a restore replaces that database, DetachBeforeRestore removes the old
+// registration while its Litestream state still exists. The remaining case is
+// a crash restart that adopts the same database and prefix.
 func (n *NodeReplicator) Start(ctx context.Context) error {
 	replica, err := n.ReplicaURL()
 	if err != nil {
