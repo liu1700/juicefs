@@ -495,7 +495,9 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 		}
 		// The seed sync just completed, so reading the position now IS reading
 		// it at T_before: nothing has been written since (PLO-416).
-		s.reportDurablePoint(ctx, BarrierResult{DurableAt: s.now().UTC(), BarrierAt: s.now().UTC()}, s.anchorTxID(ctx))
+		if txid, confirmed := s.anchorTxID(ctx); confirmed {
+			s.reportDurablePoint(ctx, BarrierResult{DurableAt: s.now().UTC(), BarrierAt: s.now().UTC()}, txid)
+		}
 	}
 	// The seed pushes a whole first replica, so it is the last step long enough
 	// to be worth interrupting. Past this line the deferred teardown above is
@@ -1412,7 +1414,7 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 	tBefore := s.now().UTC()
 	// The anchor's txid is read HERE, at T_before, and not after the barrier
 	// (PLO-416). See anchorTxID.
-	txid := s.anchorTxID(bctx)
+	txid, replicaConfirmed := s.anchorTxID(bctx)
 	// The periodic barrier IS a drain of the live backlog, so it is the one
 	// honest measurement of how long a drain takes on this node, under this
 	// workload, right now. Sampling anything else would be a model; this is an
@@ -1447,6 +1449,13 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 	// and never matches, so a worker that cannot see the replica position
 	// always reports.
 	if pendingBefore == 0 && s.durablePointStands(txid) {
+		s.noteBarrier(res)
+		return
+	}
+	if !replicaConfirmed {
+		// The barrier made the data-plane backlog durable, but a failed metadata
+		// sync cannot name a replica prefix the next generation can restore.
+		// Keep the previous local and control-plane point intact.
 		s.noteBarrier(res)
 		return
 	}
@@ -1491,16 +1500,18 @@ func (s *Supervisor) noteBarrier(res BarrierResult) {
 // staged at its start — which is exactly that set. The anchor can therefore
 // only be at or behind the true durable frontier, never ahead of it.
 //
-// A failure is not fatal: DurableAt alone is still a usable restore point
-// (the timestamp path), so the anchor degrades to what it was before #47
-// rather than aborting a barrier that is about to make real data durable.
-func (s *Supervisor) anchorTxID(ctx context.Context) string {
+// A successful sync can still return no position for a brand-new replica. In
+// that case DurableAt remains a usable timestamp anchor. A failed sync proves
+// neither an id nor a timestamp names readable metadata, so it must leave the
+// previous durable point intact while the barrier still drains data and health
+// continues to advance.
+func (s *Supervisor) anchorTxID(ctx context.Context) (string, bool) {
 	txid, err := s.Deps.Replicator.TxID(ctx)
 	if err != nil {
 		s.log("replica_txid_unavailable", "error", err.Error())
-		return ""
+		return "", false
 	}
-	return txid
+	return txid, true
 }
 
 func (s *Supervisor) reportDurablePoint(ctx context.Context, res BarrierResult, txid string) {
@@ -1838,13 +1849,14 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	var res BarrierResult
 	var pendingBefore uint64
 	var anchorTxID string
+	var replicaConfirmed bool
 	if !outOfBand {
 		tBefore := s.now().UTC()
 		// Same ordering as the periodic barrier, and here it also fixes a
 		// second-order bug: step 5 stops the replicator, so a txid read in
 		// step 6 was always read from a replicator that had already exited
 		// (PLO-416).
-		anchorTxID = s.anchorTxID(ctx)
+		anchorTxID, replicaConfirmed = s.anchorTxID(ctx)
 		pendingBefore = s.vol.PendingBlocks()
 		startedAt := s.now()
 		var err error
@@ -1912,7 +1924,9 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// durable point exists, and a usage figure for a volume somebody else owns
 	// would overwrite the successor's.
 	if incomplete == nil && !outOfBand {
-		s.reportDurablePoint(context.WithoutCancel(ctx), res, anchorTxID)
+		if replicaConfirmed {
+			s.reportDurablePoint(context.WithoutCancel(ctx), res, anchorTxID)
+		}
 		s.reportUsage(context.WithoutCancel(ctx))
 	}
 

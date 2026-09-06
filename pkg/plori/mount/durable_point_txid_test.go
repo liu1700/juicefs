@@ -91,16 +91,18 @@ func TestTheDurablePointsTxIDIsReadBeforeTheBarrierNotAfter(t *testing.T) {
 	}
 }
 
-// The barrier is worth running even when the anchor cannot be read: the blocks
-// still become durable, and T_before alone is the pre-#47 restore point. A
-// replicator that cannot answer must therefore degrade, not abort.
-func TestAnUnreadableAnchorStillRecordsTheDurablePoint(t *testing.T) {
+// A failed metadata sync proves that this generation has no readable replica.
+// The barrier still drains staged blocks and health still advances, but neither
+// the local file nor the control plane may be overwritten with an unrecoverable
+// epoch. This is distinct from a successful sync that has no transaction yet.
+func TestAFailedMetadataSyncKeepsThePriorDurablePoint(t *testing.T) {
 	rep := &silentTxIDReplicator{}
 	vol := healthyVolume()
 	vol.barrier = func(context.Context) (BarrierResult, error) {
 		return BarrierResult{BarrierAt: time.Now().UTC()}, nil
 	}
-	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &rep.fakeReplicator, &fakeFencer{})
+	cp := &fakeCP{}
+	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, cp, &rep.fakeReplicator, &fakeFencer{})
 	sup.Deps.Replicator = rep
 	sup.vol = vol
 	sup.drain = NewDrainModel(DefaultDrainPerBlock)
@@ -108,22 +110,56 @@ func TestAnUnreadableAnchorStillRecordsTheDurablePoint(t *testing.T) {
 	if err := os.MkdirAll(sup.Paths.StateDir, 0o700); err != nil {
 		t.Fatalf("state dir: %v", err)
 	}
+	prior := DurablePoint{Volume: sup.Spec.StorageVolumeID, FenceEpoch: sup.Spec.FenceEpoch - 1,
+		DurableAt: time.Date(2026, 9, 6, 20, 16, 25, 0, time.UTC), BarrierAt: time.Date(2026, 9, 6, 20, 16, 26, 0, time.UTC), ReplicaTxID: formatTXID(7)}
+	if err := writeJSONAtomic(sup.Paths.DurablePointPath(), prior); err != nil {
+		t.Fatalf("write prior durable point: %v", err)
+	}
 
 	sup.runBarrier(context.Background())
 
-	data, err := os.ReadFile(sup.Paths.DurablePointPath())
+	got, err := ReadDurablePoint(sup.Paths.DurablePointPath())
 	if err != nil {
-		t.Fatalf("a barrier whose anchor could not be read wrote no durable point at all: %v", err)
+		t.Fatalf("read durable point: %v", err)
 	}
-	var dp DurablePoint
-	if err := json.Unmarshal(data, &dp); err != nil {
-		t.Fatalf("decode durable-point.json: %v", err)
+	if got == nil || got.FenceEpoch != prior.FenceEpoch || !got.DurableAt.Equal(prior.DurableAt) || got.ReplicaTxID != prior.ReplicaTxID {
+		t.Fatalf("durable point = %#v, want prior %#v", got, prior)
 	}
-	if dp.ReplicaTxID != "" {
-		t.Errorf("replica txid = %q, want empty rather than a guess", dp.ReplicaTxID)
+	if got := countCalls(cp.order(), "durable_point"); got != 0 {
+		t.Errorf("control-plane durable reports = %d, want 0 after failed metadata sync", got)
 	}
-	if dp.DurableAt.IsZero() {
-		t.Error("T_before is missing, so the timestamp fallback has nothing to restore to either")
+	if sup.lastBarrier.BarrierAt.IsZero() {
+		t.Error("failed metadata sync prevented the completed barrier from updating health")
+	}
+}
+
+func TestSuccessfulSyncWithoutReplicaPositionUsesTimestampFallback(t *testing.T) {
+	rep := &emptyTxIDReplicator{}
+	vol := healthyVolume()
+	vol.barrier = func(context.Context) (BarrierResult, error) { return BarrierResult{BarrierAt: time.Now().UTC()}, nil }
+	cp := &fakeCP{}
+	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, cp, &rep.fakeReplicator, &fakeFencer{})
+	sup.Deps.Replicator = rep
+	sup.vol = vol
+	sup.drain = NewDrainModel(DefaultDrainPerBlock)
+	sup.deadline = NewDeadline(time.Now().UTC().Add(time.Hour), 0, time.Now())
+	if err := os.MkdirAll(sup.Paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	sup.runBarrier(context.Background())
+	got, err := ReadDurablePoint(sup.Paths.DurablePointPath())
+	if err != nil || got == nil {
+		t.Fatalf("read timestamp fallback point: %v", err)
+	}
+	if got.ReplicaTxID != "" {
+		t.Errorf("replica txid = %q, want empty after a successful positionless sync", got.ReplicaTxID)
+	}
+	if got.DurableAt.IsZero() {
+		t.Error("successful positionless sync did not record its timestamp anchor")
+	}
+	if calls := countCalls(cp.order(), "durable_point"); calls != 1 {
+		t.Errorf("control-plane durable reports = %d, want 1", calls)
 	}
 }
 
@@ -139,3 +175,40 @@ func (r *silentTxIDReplicator) TxID(context.Context) (string, error) {
 }
 
 var errReplicaUnavailable = &controlStatusError{Route: "/sync", Status: 500, Body: "replica unavailable"}
+
+type emptyTxIDReplicator struct{ fakeReplicator }
+
+func (r *emptyTxIDReplicator) TxID(context.Context) (string, error) { return "", nil }
+
+func TestShutdownAfterFailedMetadataSyncKeepsThePriorDurablePoint(t *testing.T) {
+	rep := &silentTxIDReplicator{}
+	vol := healthyVolume()
+	cp := &fakeCP{}
+	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, cp, &rep.fakeReplicator, &fakeFencer{})
+	sup.Deps.Replicator = rep
+	sup.vol = vol
+	sup.drain = NewDrainModel(DefaultDrainPerBlock)
+	sup.deadline = NewDeadline(time.Now().UTC().Add(time.Hour), 0, time.Now())
+	if err := os.MkdirAll(sup.Paths.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prior := DurablePoint{Volume: sup.Spec.StorageVolumeID, FenceEpoch: sup.Spec.FenceEpoch - 1,
+		DurableAt: time.Date(2026, 9, 6, 20, 16, 25, 0, time.UTC), BarrierAt: time.Date(2026, 9, 6, 20, 16, 26, 0, time.UTC), ReplicaTxID: formatTXID(7)}
+	if err := writeJSONAtomic(sup.Paths.DurablePointPath(), prior); err != nil {
+		t.Fatalf("write prior durable point: %v", err)
+	}
+
+	if got := sup.shutdown(context.Background(), ReasonShutdown); got.Exit != CodeOK {
+		t.Fatalf("shutdown exit = %d, want %d (%v)", got.Exit, CodeOK, got.Err)
+	}
+	got, err := ReadDurablePoint(sup.Paths.DurablePointPath())
+	if err != nil || got == nil {
+		t.Fatalf("read durable point: %v", err)
+	}
+	if got.FenceEpoch != prior.FenceEpoch || !got.DurableAt.Equal(prior.DurableAt) || got.ReplicaTxID != prior.ReplicaTxID {
+		t.Fatalf("durable point = %#v, want prior %#v", got, prior)
+	}
+	if calls := countCalls(cp.order(), "durable_point"); calls != 0 {
+		t.Errorf("control-plane durable reports = %d, want 0 after failed shutdown metadata sync", calls)
+	}
+}

@@ -174,11 +174,10 @@ func TestADirtyBarrierStillReportsTheDurablePoint(t *testing.T) {
 	}
 }
 
-// An anchor the worker cannot read is not an anchor that matches. A replicator
-// answering nothing must never be mistaken for a replica that has not moved,
-// or a mount whose Litestream control socket is wedged would stop reporting
-// durable points entirely and nobody would learn it from the traffic.
-func TestAnUnreadableAnchorIsNeverTreatedAsIdle(t *testing.T) {
+// A failed metadata sync cannot name a restorable prefix. The completed
+// barriers still advance health, but they must not publish an epoch whose
+// timestamp points to no replica artifacts.
+func TestAFailedMetadataSyncIsNeverReportedAsDurable(t *testing.T) {
 	rep := &silentTxIDReplicator{}
 	vol := healthyVolume()
 	cp := &fakeCP{}
@@ -195,8 +194,11 @@ func TestAnUnreadableAnchorIsNeverTreatedAsIdle(t *testing.T) {
 	sup.runBarrier(context.Background())
 	sup.runBarrier(context.Background())
 
-	if got := countCalls(cp.order(), "durable_point"); got != 3 {
-		t.Errorf("%d durable points reported, want 3 — an empty anchor matched an empty anchor and the mount went silent", got)
+	if got := countCalls(cp.order(), "durable_point"); got != 0 {
+		t.Errorf("%d durable points reported, want 0 after failed metadata sync", got)
+	}
+	if sup.lastBarrier.BarrierAt.IsZero() {
+		t.Error("failed metadata sync prevented the completed barriers from updating health")
 	}
 }
 
