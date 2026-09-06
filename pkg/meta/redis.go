@@ -510,7 +510,11 @@ func (m *redisMeta) setIfSmall(name string, value, diff int64) (bool, error) {
 	var changed bool
 	ctx := Background()
 	origName := name
-	name = m.prefix + name
+	// counterKey, not prefix+name: nextInode, nextChunk and nextSession are
+	// stored lower-cased on Redis, and prefix+name would address a key nothing
+	// else reads or writes. It is the same string for every other counter, so
+	// this changes nothing for the callers that existed before PLO-569.
+	name = m.counterKey(name)
 	err := m.txn(ctx.WithValue(txMethodKey{}, "setIfSmall:"+name), func(tx *redis.Tx) error {
 		changed = false
 		old, err := tx.Get(ctx, name).Int64()

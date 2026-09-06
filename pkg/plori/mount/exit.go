@@ -102,6 +102,13 @@ const (
 	// write (crash-consistency.md §7 Rank 1). PLO-335 decides whether this is
 	// ever Agent-visible; today it is operator-only.
 	ErrCodeRestoredToBarrier = "E_RESTORED_TO_BARRIER"
+	// ErrCodeSliceFloorFailed reports that the slice-ID floor could not be
+	// written to the restored metadata (PLO-569). It is fatal and not
+	// retryable: without the floor this generation reissues the slice IDs the
+	// previous generation issued from the same restore point, and serving a
+	// filesystem whose writes can overwrite another generation's objects is
+	// worse than refusing to mount it.
+	ErrCodeSliceFloorFailed = "E_SLICE_FLOOR_FAILED"
 )
 
 // Fatal is a refusal that carries the exit code and the typed identifier the

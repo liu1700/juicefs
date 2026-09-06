@@ -158,6 +158,19 @@ type Volume interface {
 	// starts, so its metadata writes are part of the first transaction this
 	// epoch replicates and no Agent ever sees the stat-ok/read-EIO file.
 	RepairAfterRestore(ctx context.Context) (RepairReport, error)
+	// RaiseSliceIDFloor moves the slice-ID allocator above every ID a writer
+	// that restored this same point could already have issued, and reports the
+	// counter before and after (PLO-569).
+	//
+	// A restore carries the nextChunk counter back to the restored point, and a
+	// slice ID names an object key
+	// (`chunks/<id/1e6>/<id/1000>/<id>_<index>_<blockSize>`). Two generations
+	// restored from one point are therefore handed the same IDs and write the
+	// same keys, and the loser's blocks silently replace the winner's under
+	// metadata that still points at them. The floor is derived from the wall
+	// clock, which a restore cannot roll back, and it only ever moves the
+	// counter up.
+	RaiseSliceIDFloor(ctx context.Context) (from, to int64, err error)
 	// PurgeSessions deletes every client session recorded in the restored
 	// metadata before this process opens its own (PLO-362). With
 	// --heartbeat 300 the previous writer's row does not expire for 25

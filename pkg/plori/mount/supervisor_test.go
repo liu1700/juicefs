@@ -63,6 +63,11 @@ type fakeVolume struct {
 	pending atomic.Uint64
 	// backlogCaps is every cap the supervisor pushed down, in order.
 	backlogCaps []int64
+	// floor* are the slice-ID floor seam (PLO-569).
+	floorFrom   int64
+	floorTo     int64
+	floorErr    error
+	floorRaises int
 }
 
 func (f *fakeVolume) record(name string) {
@@ -86,6 +91,13 @@ func (f *fakeVolume) RepairAfterRestore(context.Context) (RepairReport, error) {
 	f.repaired++
 	f.mu.Unlock()
 	return f.repair, f.repairErr
+}
+func (f *fakeVolume) RaiseSliceIDFloor(context.Context) (int64, int64, error) {
+	f.record("slice_id_floor")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.floorRaises++
+	return f.floorFrom, f.floorTo, f.floorErr
 }
 func (f *fakeVolume) PurgeSessions(context.Context) (int, error) {
 	f.record("purge_sessions")

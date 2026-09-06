@@ -553,6 +553,15 @@ func (p *ploriVolume) StoredUUID(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(buf[:n])), nil
 }
 
+// RaiseSliceIDFloor lifts the restored slice-ID allocator above every ID a
+// generation restored from the same point could already have issued (PLO-569).
+// The floor is microseconds since 2026-01-01 UTC; the raise is one metadata
+// transaction and is skipped when the counter is already above it.
+func (p *ploriVolume) RaiseSliceIDFloor(ctx context.Context) (int64, int64, error) {
+	_, from, to, err := meta.PloriRaiseSliceIDFloor(p.m, meta.PloriSliceIDFloor(time.Now()))
+	return from, to, err
+}
+
 func (p *ploriVolume) PurgeSessions(ctx context.Context) (int, error) {
 	return meta.PloriPurgeAllSessions(p.m)
 }
