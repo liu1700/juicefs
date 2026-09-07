@@ -559,15 +559,18 @@ dbs:
 		}
 	}
 
-	// Replicate the two L0 files with compaction held at one hour, then restart
-	// with the accelerated L1 cadence. This removes tick timing from the test:
-	// the first L1 pass must compact the already-replicated 2-3 range.
+	// Litestream makes an immediate L1 compaction attempt when a daemon starts,
+	// irrespective of its configured interval. Let that pass consume only the
+	// baseline, then the hour-long cadence holds while TXIDs 2 and 3 replicate.
 	stage := startDaemon(stageCfgPath)
 	t.Cleanup(func() {
 		if stage.ProcessState == nil {
 			_ = stage.Process.Signal(os.Interrupt)
 			_ = stage.Wait()
 		}
+	})
+	waitFor("baseline L1 compaction", func() bool {
+		return hasLTX("1", "0000000000000001", "0000000000000001")
 	})
 	sql(`INSERT INTO t VALUES (1, "durable");`)
 	tBefore := time.Now().UTC()
