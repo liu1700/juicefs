@@ -63,6 +63,15 @@ func TestPloriWriteGateStopsAnAlreadyOpenHandle(t *testing.T) {
 	if err := v.FlushAll(""); err == nil {
 		t.Error("a handle opened before the write gate closed still committed its slices")
 	}
+	// The first barrier owns the in-flight commit and must report its failure.
+	// Once that slice has drained, a later barrier may drain other files, while
+	// the failed writer continues to report the retained error to its caller.
+	if err := v.FlushAll(""); err != nil {
+		t.Fatalf("barrier after the fenced commit drained: %v", err)
+	}
+	if err := v.Fsync(ctx, fe.Inode, 1, fh); err != syscall.EIO {
+		t.Fatalf("fsync after the fenced commit = %s, want EIO", err)
+	}
 	if e := v.Truncate(ctx, fe.Inode, 4096, fh, &meta.Attr{}); e != syscall.EROFS {
 		t.Errorf("Truncate through an open handle = %s, want EROFS", e)
 	}
