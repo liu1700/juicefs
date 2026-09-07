@@ -365,16 +365,22 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 		buf.Acquire()
 	}
 	defer buf.Release()
-	if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
-		// block will be freed after written into disk
-		store.bcache.cache(key, block, false, false)
-	}
 	n, err := store.compressor.Compress(buf.Data, block.Data)
-	block.Release()
 	if err != nil {
+		block.Release()
 		return fmt.Errorf("Compress block key %s: %s", key, err)
 	}
 	buf.Data = buf.Data[:n]
+	// bcache flushes the page from its own goroutine, so it owns block.Data --
+	// both the slice header and the bytes -- from here on. Publish it only
+	// after the last write above: when buf aliases block, Compress rewrote that
+	// buffer in place, and it still holds the plain block only if it kept the
+	// same length.
+	if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) && (buf != block || n == blen) {
+		// block will be freed after written into disk
+		store.bcache.cache(key, block, false, false)
+	}
+	block.Release()
 
 	try, max := 0, 3
 	if sync {

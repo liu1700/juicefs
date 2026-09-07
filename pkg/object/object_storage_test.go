@@ -1305,6 +1305,89 @@ func TestListAllWithDelimiterDeepStart(t *testing.T) {
 	}
 }
 
+// failingListStore fails List for one directory, to check that the failure
+// reaches the caller of ListAllWithDelimiter instead of being swallowed.
+type failingListStore struct {
+	ObjectStorage
+	failPrefix string
+	failErr    error
+}
+
+func (s *failingListStore) List(ctx context.Context, prefix, startAfter, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
+	if s.failPrefix != "" && prefix == s.failPrefix {
+		return nil, false, "", s.failErr
+	}
+	return s.ObjectStorage.List(ctx, prefix, startAfter, token, delimiter, limit, followLink)
+}
+
+// ListAllWithDelimiter walks the tree on one goroutine and lists each directory
+// on ten others. The walker used to share its `err` with those threads as a
+// stop flag, but wrote it on the recursion path without holding any of their
+// locks (PLO-573). Run this wide and deep enough to hit that handshake many
+// times, and check the listing itself while we are here.
+func TestListAllWithDelimiterConcurrentWalk(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir() + "/"
+	s, err := CreateStorage("file", root, "", "", "")
+	if err != nil {
+		t.Fatalf("create storage: %s", err)
+	}
+
+	// More directories than the walker's ten listing threads, each with a
+	// subdirectory so the walker recurses while the other threads wait.
+	var want []string
+	for d := 0; d < 24; d++ {
+		for f := 0; f < 3; f++ {
+			key := fmt.Sprintf("d%02d/s/f%d", d, f)
+			if err := s.Put(ctx, key, bytes.NewReader([]byte(key))); err != nil {
+				t.Fatalf("put %s: %s", key, err)
+			}
+			want = append(want, key)
+		}
+	}
+	sort.Strings(want)
+
+	t.Run("EveryObjectExactlyOnce", func(t *testing.T) {
+		ch, err := ListAllWithDelimiter(ctx, s, "", "", "", true)
+		if err != nil {
+			t.Fatalf("list all with delimiter: %s", err)
+		}
+		var got []string
+		for obj := range ch {
+			if obj == nil {
+				t.Fatal("list all with delimiter reported a failure on a healthy store")
+			}
+			if !obj.IsDir() {
+				got = append(got, obj.Key())
+			}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("listed %d keys, want %d: got %v", len(got), len(want), got)
+		}
+	})
+
+	t.Run("ADirectoryFailureReachesTheCaller", func(t *testing.T) {
+		failing := &failingListStore{
+			ObjectStorage: s,
+			failPrefix:    "d07/",
+			failErr:       errors.New("list refused"),
+		}
+		ch, err := ListAllWithDelimiter(ctx, failing, "", "", "", true)
+		if err != nil {
+			t.Fatalf("list all with delimiter: %s", err)
+		}
+		var failed bool
+		for obj := range ch {
+			if obj == nil {
+				failed = true
+			}
+		}
+		if !failed {
+			t.Fatal("a failing List was not reported to the consumer")
+		}
+	})
+}
+
 func TestEtcd(t *testing.T) { //skip mutate
 	if os.Getenv("ETCD_ADDR") == "" {
 		t.SkipNow()
