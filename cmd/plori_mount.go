@@ -687,6 +687,7 @@ func (p *ploriVolume) SetStagingBacklogCap(blocks int64) {
 // A cancelled observation reports no breakdown rather than a floor as if it were total.
 func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, error) {
 	metaCtx := meta.WrapContext(ctx)
+	defer metaCtx.Cancel()
 	var total, avail, iused, iavail uint64
 	if st := p.m.StatFS(metaCtx, meta.RootInode, &total, &avail, &iused, &iavail); st != 0 {
 		return pmount.Usage{}, st
