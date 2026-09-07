@@ -27,6 +27,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -48,6 +49,19 @@ import (
 // zero object requests" can be checked instead of argued.
 
 const quotaTestCeiling = 8 << 20
+
+type heldQuotaWriteMeta struct {
+	meta.Meta
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (m *heldQuotaWriteMeta) Write(ctx meta.Context, inode meta.Ino, indx uint32, off uint32, slice meta.Slice, mtime time.Time) syscall.Errno {
+	m.once.Do(func() { close(m.entered) })
+	<-m.release
+	return syscall.ENOSPC
+}
 
 // writeAndFlush writes one buffer and forces its slices to commit, returning
 // the errno the commit produced.
@@ -111,6 +125,188 @@ func TestPloriGrantAppliesLiveThroughTheVFS(t *testing.T) {
 	defer v.Release(ctx, fe.Inode, fh)
 	if e := writeAndFlush(t, v, ctx, fe.Inode, fh, 0, make([]byte, 1<<20)); e != 0 {
 		t.Errorf("write after the grant = %s, want it to succeed", e)
+	}
+}
+
+// TestPloriDurabilityBarrierSkipsAPreExistingQuotaRefusal verifies that a
+// failed file remains failed to its caller without stopping a later volume-wide
+// durability point. The first writer intentionally stays open across both the
+// refusal and the grant.
+func TestPloriDurabilityBarrierSkipsAPreExistingQuotaRefusal(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+
+	if err := meta.PloriApplyGrant(v.Meta, quotaTestCeiling, 16384); err != nil {
+		t.Fatalf("set the starting ceiling: %s", err)
+	}
+	failed, failedFH, e := v.Create(ctx, 1, "refused-but-open", 0644, 0, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatalf("create refused writer: %s", e)
+	}
+
+	buf := make([]byte, 1<<20)
+	var refused syscall.Errno
+	accepted := 0
+	for i := range 32 {
+		refused = writeAndFlush(t, v, ctx, failed.Inode, failedFH, uint64(i)*uint64(len(buf)), buf)
+		if refused != 0 {
+			break
+		}
+		accepted++
+	}
+	if refused != syscall.ENOSPC {
+		t.Fatalf("quota refusal = %s, want ENOSPC", refused)
+	}
+
+	// A permanent refusal retains a per-file error and its refused slice is
+	// gone. It must not prevent a later volume-wide drain.
+	if err := v.FlushAll(""); err != nil {
+		t.Fatalf("barrier after a pre-existing ENOSPC = %v", err)
+	}
+	if e := v.Fsync(ctx, failed.Inode, 1, failedFH); e != syscall.ENOSPC {
+		t.Fatalf("fsync on the refused open writer = %s, want ENOSPC", e)
+	}
+
+	if err := meta.PloriApplyGrant(v.Meta, 256<<20, 65536); err != nil {
+		t.Fatalf("apply growth after the refusal: %s", err)
+	}
+	healthy, healthyFH, e := v.Create(ctx, 1, "durable-after-growth", 0644, 0, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatalf("create healthy writer: %s", e)
+	}
+	data := []byte("the healthy writer completes after growth")
+	if e := writeAndFlush(t, v, ctx, healthy.Inode, healthyFH, 0, data); e != 0 {
+		t.Fatalf("healthy writer after growth: %s", e)
+	}
+	for i := 0; i < 3; i++ {
+		if err := v.FlushAll(""); err != nil {
+			t.Fatalf("barrier %d after growth = %v", i+1, err)
+		}
+	}
+	if e := v.Fsync(ctx, failed.Inode, 1, failedFH); e != syscall.ENOSPC {
+		t.Fatalf("growth cleared refused writer error: %s", e)
+	}
+
+	v.Release(ctx, healthy.Inode, healthyFH)
+	_, reopenedFH, e := v.Open(ctx, healthy.Inode, syscall.O_RDONLY)
+	if e != 0 {
+		t.Fatalf("reopen healthy writer: %s", e)
+	}
+	defer v.Release(ctx, healthy.Inode, reopenedFH)
+	got := make([]byte, len(data))
+	if n, e := v.Read(ctx, healthy.Inode, got, 0, reopenedFH); e != 0 || n != len(data) || string(got) != string(data) {
+		t.Fatalf("read healthy durable data = (%d, %s, %q), want (%d, 0, %q)", n, e, got, len(data), data)
+	}
+
+	// Closing releases the failed writer's private error. Reopening checks that
+	// the refused suffix never entered the file's committed contents.
+	v.Release(ctx, failed.Inode, failedFH)
+	writer := v.writer.(*dataWriter)
+	deadline := time.Now().Add(time.Second)
+	for writer.find(failed.Inode) != nil && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if writer.find(failed.Inode) != nil {
+		t.Fatal("the closed refused writer was not released")
+	}
+	entry, e := v.GetAttr(ctx, failed.Inode, 0)
+	if e != 0 {
+		t.Fatalf("stat refused writer after close: %s", e)
+	}
+	if want := uint64(accepted * len(buf)); entry.Attr.Length != want {
+		t.Fatalf("refused file length = %d, want committed prefix %d", entry.Attr.Length, want)
+	}
+	_, failedReadFH, e := v.Open(ctx, failed.Inode, syscall.O_RDONLY)
+	if e != 0 {
+		t.Fatalf("reopen refused writer: %s", e)
+	}
+	if n, e := v.Read(ctx, failed.Inode, make([]byte, 1), uint64(accepted*len(buf)), failedReadFH); e != 0 || n != 0 {
+		t.Fatalf("read refused suffix = (%d, %s), want (0, 0)", n, e)
+	}
+	v.Release(ctx, failed.Inode, failedReadFH)
+	_, failedWriteFH, e := v.Open(ctx, failed.Inode, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatalf("reopen refused writer for a new write: %s", e)
+	}
+	reopened := []byte("committed after reopening")
+	off := uint64(accepted * len(buf))
+	if e := writeAndFlush(t, v, ctx, failed.Inode, failedWriteFH, off, reopened); e != 0 {
+		t.Fatalf("write through reopened writer: %s", e)
+	}
+	v.Release(ctx, failed.Inode, failedWriteFH)
+	_, verifyFH, e := v.Open(ctx, failed.Inode, syscall.O_RDONLY)
+	if e != 0 {
+		t.Fatalf("reopen committed replacement data: %s", e)
+	}
+	defer v.Release(ctx, failed.Inode, verifyFH)
+	got = make([]byte, len(reopened))
+	if n, e := v.Read(ctx, failed.Inode, got, off, verifyFH); e != 0 || n != len(reopened) || string(got) != string(reopened) {
+		t.Fatalf("read reopened writer data = (%d, %s, %q), want (%d, 0, %q)", n, e, got, len(reopened), reopened)
+	}
+}
+
+// TestPloriDurabilityBarrierReportsAQuotaRefusalItDrains holds a commit until
+// FlushAll has captured its error generation. The barrier that caused the
+// ENOSPC must return it; after the rejected slice drains, the next barrier may
+// proceed while the file's fsync still returns ENOSPC.
+func TestPloriDurabilityBarrierReportsAQuotaRefusalItDrains(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+	held := &heldQuotaWriteMeta{
+		Meta:    v.Meta,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	v.writer.(*dataWriter).m = held
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(held.release) }) }
+	t.Cleanup(release)
+
+	fe, fh, e := v.Create(ctx, 1, "held-quota-refusal", 0644, 0, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatalf("create: %s", e)
+	}
+	defer v.Release(ctx, fe.Inode, fh)
+	defer release()
+	if e := v.Write(ctx, fe.Inode, []byte("buffered until the barrier"), 0, fh); e != 0 {
+		t.Fatalf("write: %s", e)
+	}
+
+	barrier := make(chan error, 1)
+	go func() { barrier <- v.FlushAll("") }()
+	select {
+	case <-held.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("FlushAll did not start the held commit")
+	}
+	writer := v.writer.(*dataWriter).find(fe.Inode)
+	flushDeadline := time.Now().Add(5 * time.Second)
+	for {
+		writer.Lock()
+		flushing := writer.flushwaiting > 0
+		writer.Unlock()
+		if flushing {
+			break
+		}
+		if time.Now().After(flushDeadline) {
+			t.Fatal("the held commit did not run under FlushAll")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	release()
+	select {
+	case err := <-barrier:
+		if err != syscall.ENOSPC {
+			t.Fatalf("barrier that drained the held commit = %v, want ENOSPC", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("FlushAll did not finish after the held commit was released")
+	}
+	if err := v.FlushAll(""); err != nil {
+		t.Fatalf("barrier after the held refusal drained: %v", err)
+	}
+	if e := v.Fsync(ctx, fe.Inode, 1, fh); e != syscall.ENOSPC {
+		t.Fatalf("fsync after the held refusal = %s, want ENOSPC", e)
 	}
 }
 

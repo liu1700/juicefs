@@ -225,6 +225,7 @@ func (c *chunkWriter) commitThread() {
 				err = syscall.EIO
 			}
 			f.err = err
+			f.errSeq++
 			logger.Errorf("write inode:%d indx:%d %s", f.inode, c.indx, err)
 		}
 		s.committed = true
@@ -245,6 +246,7 @@ type fileWriter struct {
 	length       uint64
 	tierID       uint8
 	err          syscall.Errno
+	errSeq       uint64
 	flushwaiting uint16
 	writewaiting uint16
 	refs         uint16
@@ -389,6 +391,13 @@ func (f *fileWriter) updateMtime(t time.Time) {
 }
 
 func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
+	return f.flushSince(ctx, 0)
+}
+
+// flushSince waits for all work pending at the durability point. A non-zero
+// since ignores an error the file writer retained before that
+// point, while preserving failures that happen as this call drains work.
+func (f *fileWriter) flushSince(ctx meta.Context, since uint64) syscall.Errno {
 	s := time.Now()
 	f.Lock()
 	defer f.Unlock()
@@ -432,10 +441,17 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	if f.flushwaiting == 0 && f.writewaiting > 0 {
 		f.writecond.Broadcast()
 	}
-	if err == 0 {
+	if err == 0 && (since == 0 || f.errSeq > since) {
 		err = f.err
 	}
 	return err
+}
+
+func (f *fileWriter) flushForBarrier(ctx meta.Context) syscall.Errno {
+	f.Lock()
+	since := f.errSeq
+	f.Unlock()
+	return f.flushSince(ctx, since)
 }
 
 func (f *fileWriter) Flush(ctx meta.Context) syscall.Errno {
@@ -601,7 +617,7 @@ func (w *dataWriter) FlushAll() error {
 	for inode, ind := range w.files {
 		ind.refs++
 		w.Unlock()
-		eno := ind.Flush(meta.Background())
+		eno := ind.flushForBarrier(meta.Background())
 		w.free(ind)
 		if eno != 0 {
 			logger.Errorf("flush %s: %s", inode, eno)
