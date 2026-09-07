@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -87,8 +88,10 @@ type Source struct {
 	// supplied once at construction and can never rotate.
 	path string
 
-	// readFile and now are seams for the tests. Nothing else replaces them.
+	// readFile and now are seams for the tests. readPair keeps each reload on
+	// one credential generation, whether it arrives as a JSON file or a projected Secret.
 	readFile func(string) ([]byte, error)
+	readPair func() (Pair, error)
 	now      func() time.Time
 
 	cur   atomic.Pointer[Pair]
@@ -144,6 +147,20 @@ func Static(accessKeyID, secretAccessKey string) (*Source, error) {
 // credential cannot mount.
 func FromFile(path string) (*Source, error) {
 	s := newSource(path)
+	s.readPair = func() (Pair, error) { return readCredentialDocument(s.readFile, path) }
+	if _, err := s.Reload(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// FromProjectedSecret reads the two standard AWS keys from one Kubernetes Secret
+// projection. Kubelet atomically replaces the ..data symlink for each Secret
+// generation; resolving it once before both reads prevents an old access key and a
+// new secret key from being combined during that replacement.
+func FromProjectedSecret(dir string) (*Source, error) {
+	s := newSource(dir)
+	s.readPair = func() (Pair, error) { return readProjectedSecret(s.readFile, dir) }
 	if _, err := s.Reload(); err != nil {
 		return nil, err
 	}
@@ -154,6 +171,34 @@ func newSource(path string) *Source {
 	s := &Source{path: path, readFile: os.ReadFile, now: time.Now}
 	s.cache = aws.NewCredentialsCache(providerFunc(s.retrieve))
 	return s
+}
+
+func readCredentialDocument(readFile func(string) ([]byte, error), path string) (Pair, error) {
+	data, err := readFile(path)
+	if err != nil {
+		return Pair{}, fmt.Errorf("read credential file: %w", err)
+	}
+	var pair Pair
+	if err := json.Unmarshal(data, &pair); err != nil {
+		return Pair{}, errors.New("credential file is not a JSON credential document")
+	}
+	return pair, nil
+}
+
+func readProjectedSecret(readFile func(string) ([]byte, error), dir string) (Pair, error) {
+	generation, err := filepath.EvalSymlinks(filepath.Join(dir, "..data"))
+	if err != nil {
+		return Pair{}, fmt.Errorf("resolve credential Secret generation: %w", err)
+	}
+	id, err := readFile(filepath.Join(generation, "AWS_ACCESS_KEY_ID"))
+	if err != nil {
+		return Pair{}, fmt.Errorf("read projected access key: %w", err)
+	}
+	secret, err := readFile(filepath.Join(generation, "AWS_SECRET_ACCESS_KEY"))
+	if err != nil {
+		return Pair{}, fmt.Errorf("read projected secret key: %w", err)
+	}
+	return Pair{AccessKeyID: string(id), SecretAccessKey: string(secret)}, nil
 }
 
 // Rotates reports whether this source can pick up a new pair without a
@@ -199,16 +244,12 @@ func (s *Source) Reload() (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := s.readFile(s.path)
-	if err != nil {
-		return false, s.refreshFailed(fmt.Errorf("read credential file: %w", err))
+	if s.readPair == nil {
+		return false, s.refreshFailed(ErrNoCredential)
 	}
-	var next Pair
-	if err := json.Unmarshal(data, &next); err != nil {
-		// The error deliberately does not wrap the decoder's message: a JSON
-		// decoder quotes the offending input, and the offending input is a
-		// secret (threat-model F-11).
-		return false, s.refreshFailed(errors.New("credential file is not a JSON credential document"))
+	next, err := s.readPair()
+	if err != nil {
+		return false, s.refreshFailed(err)
 	}
 	if !next.valid() {
 		return false, s.refreshFailed(errors.New("credential file names an empty access key id or secret"))
