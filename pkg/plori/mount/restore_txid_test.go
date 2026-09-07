@@ -20,6 +20,7 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -486,11 +487,6 @@ dbs:
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stageCfgPath := filepath.Join(root, "stage.yml")
-	stageCfg := strings.Replace(cfg, "- interval: 3s", "- interval: 1h", 1)
-	if err := os.WriteFile(stageCfgPath, []byte(stageCfg), 0o600); err != nil {
-		t.Fatal(err)
-	}
 
 	sql := func(stmt string) string {
 		t.Helper()
@@ -541,50 +537,58 @@ dbs:
 		t.Fatal("forced baseline snapshot is missing")
 	}
 
-	startDaemon := func(config string) *exec.Cmd {
+	// A litestream daemon runs one L1 compaction pass as soon as it starts,
+	// whatever interval the level is configured with, so staging must not run a
+	// daemon at all. `-once` replicates and exits with every background monitor
+	// disabled, which leaves L1 empty until the accelerated daemon starts.
+	stage := func(what string) {
 		t.Helper()
-		cmd := exec.Command(bin, "replicate", "-config", config)
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start litestream replicate: %v", err)
-		}
-		return cmd
-	}
-	stopDaemon := func(cmd *exec.Cmd) {
-		t.Helper()
-		if cmd.Process != nil {
-			_ = cmd.Process.Signal(os.Interrupt)
-		}
-		if err := cmd.Wait(); err != nil {
-			t.Fatalf("stop litestream replicate: %v", err)
+		out, err := exec.Command(bin, "replicate", "-config", cfgPath, "-once").CombinedOutput()
+		if err != nil {
+			t.Fatalf("stage %s: %v: %s", what, err, out)
 		}
 	}
 
-	// Litestream makes an immediate L1 compaction attempt when a daemon starts,
-	// irrespective of its configured interval. Let that pass consume only the
-	// baseline, then the hour-long cadence holds while TXIDs 2 and 3 replicate.
-	stage := startDaemon(stageCfgPath)
-	t.Cleanup(func() {
-		if stage.ProcessState == nil {
-			_ = stage.Process.Signal(os.Interrupt)
-			_ = stage.Wait()
-		}
-	})
-	waitFor("baseline L1 compaction", func() bool {
-		return hasLTX("1", "0000000000000001", "0000000000000001")
-	})
 	sql(`INSERT INTO t VALUES (1, "durable");`)
 	tBefore := time.Now().UTC()
+	stage("the durable transaction")
 	waitFor("durable L0 replication", func() bool { return hasLTX("0", "0000000000000002", "0000000000000002") })
 	sql(`INSERT INTO t VALUES (2, "late");`)
+	stage("the late transaction")
 	waitFor("late L0 replication", func() bool { return hasLTX("0", "0000000000000003", "0000000000000003") })
-	stopDaemon(stage)
 
-	cmd := startDaemon(cfgPath)
+	// The accelerated daemon's first compaction pass covers TXIDs 2 and 3
+	// together only if both L0 files are staged and L1 is still empty.
+	l0Files, err := filepath.Glob(filepath.Join(replica, "ltx", "0", "*.ltx"))
+	if err != nil {
+		t.Fatalf("list L0 files: %v", err)
+	}
+	l1Files, err := filepath.Glob(filepath.Join(replica, "ltx", "1", "*.ltx"))
+	if err != nil {
+		t.Fatalf("list L1 files: %v", err)
+	}
+	if len(l1Files) > 0 ||
+		!hasLTX("0", "0000000000000002", "0000000000000002") ||
+		!hasLTX("0", "0000000000000003", "0000000000000003") {
+		t.Fatalf("staging premise broken: L0=%v L1=%v; want both durable L0 files and an empty L1", l0Files, l1Files)
+	}
+
+	// Litestream's debug log is the only record of what its compactor decided,
+	// so keep the daemon's stderr and report it once the daemon has stopped.
+	var daemonLog bytes.Buffer
+	cmd := exec.Command(bin, "replicate", "-config", cfgPath)
+	cmd.Stderr = &daemonLog
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start litestream replicate: %v", err)
+	}
 	t.Cleanup(func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Signal(os.Interrupt)
 		}
 		_ = cmd.Wait()
+		if daemonLog.Len() > 0 {
+			t.Logf("litestream daemon log:\n%s", daemonLog.String())
+		}
 	})
 	waitFor("L1 compaction that straddles the durable transaction", straddlesDurable)
 	waitFor("retention of the durable transaction's L0 file", func() bool {
