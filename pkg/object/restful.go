@@ -36,6 +36,20 @@ import (
 var resolver = dnscache.New(time.Minute)
 var httpClient *http.Client
 
+// Dialing IPv6 as the primary address family and IPv4 as a fallback costs 300 milliseconds on
+// every cold connection in an environment where a pod has an IPv6 address and default route but
+// IPv6 egress does not reach the destination: the IPv6 attempt gets no answer and only gives up
+// when the fallback timer fires. When a DNS answer carries only an IPv6 (AAAA) address, there is
+// no IPv4 fallback to race against, so the dial waits out the full dialer timeout instead of
+// failing fast. No object store this fork talks to requires IPv6. Set JFS_ENABLE_IPV6=1 to
+// restore the IPv6-primary, IPv4-fallback dual-stack race.
+var enableIPv6 = isIPv6Enabled(os.Getenv("JFS_ENABLE_IPV6"))
+
+func isIPv6Enabled(val string) bool {
+	v := strings.ToLower(strings.TrimSpace(val))
+	return v == "1" || v == "true"
+}
+
 func splitIPsByVersion(ips []net.IP) ([]net.IP, []net.IP) {
 	ipv6 := make([]net.IP, 0, len(ips))
 	ipv4 := make([]net.IP, 0, len(ips))
@@ -47,6 +61,32 @@ func splitIPsByVersion(ips []net.IP) ([]net.IP, []net.IP) {
 		}
 	}
 	return ipv6, ipv4
+}
+
+// dialFamilies splits a DNS answer into the primary and fallback address groups that
+// dialParallel races. When IPv6 is disabled (the default), IPv6 addresses are dropped and the
+// IPv4 addresses become the only primaries, with no fallback group, so a cold connection dials
+// IPv4 directly instead of waiting on an IPv6 attempt that cannot succeed. When IPv6 is enabled,
+// the historical behavior is unchanged: IPv6 addresses are primary and IPv4 addresses are the
+// fallback.
+func dialFamilies(ips []net.IP, enableIPv6 bool) (primaries, fallbacks []net.IP) {
+	ipv6, ipv4 := splitIPsByVersion(ips)
+	if !enableIPv6 {
+		return ipv4, nil
+	}
+	return ipv6, ipv4
+}
+
+// dialResolved dials an already-resolved DNS answer. It is split out from the DialContext
+// closure so the no-IPv4-address fast failure is testable without a real DNS lookup.
+func dialResolved(ctx context.Context, dialer *net.Dialer, network, host string, ips []net.IP, port string, enableIPv6 bool) (net.Conn, error) {
+	primaries, fallbacks := dialFamilies(ips, enableIPv6)
+	if len(primaries) == 0 && len(fallbacks) == 0 {
+		// IPv6 is disabled and the DNS answer had only IPv6 addresses: fail fast instead of
+		// handing dialParallel two empty address lists to wait out.
+		return nil, &net.DNSError{Err: "no IPv4 address found", Name: host, IsNotFound: true}
+	}
+	return dialParallel(ctx, dialer, network, primaries, fallbacks, port)
 }
 
 // dialParallel is adapted from the Go standard library.
@@ -174,8 +214,7 @@ func init() {
 				if len(ips) == 0 {
 					return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 				}
-				ipv6, ipv4 := splitIPsByVersion(ips)
-				return dialParallel(ctx, dialer, network, ipv6, ipv4, port)
+				return dialResolved(ctx, dialer, network, host, ips, port, enableIPv6)
 			},
 			DisableCompression: true,
 			TLSClientConfig:    &tls.Config{},
