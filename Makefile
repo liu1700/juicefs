@@ -137,15 +137,8 @@ test.plori.unit:
 # names its tests rather than running the package.
 	$(PLORI_CGO) go test -count=1 -timeout 5m -tags "$(PLORI_TAGS)" ./cmd/ \
 		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath|TestTheTrashIsNotWalked|TestAFailedTrashWalk'
-# PLO-414: nothing in the fork ran under -race, so a Page ownership bug in the
-# write path every mount uses was invisible here -- the block cache flushed a
-# page from its own goroutine while upload() was still compressing into it and
-# re-slicing it. ./pkg/plori is what reached it (the restore fixtures build a
-# real cachedStore), and it is cheap, so race it on every run.
-#
-# ./pkg/chunk and ./pkg/vfs are deliberately not raced yet: ./pkg/chunk still
-# reports unrelated pre-existing races in TestCacheManager, TestStoreFull,
-# TestChecksum and TestDiskCacheState. Add them once those are owned.
+# Mount fixtures exercise the asynchronous chunk cache under the race detector.
+# Broader chunk race coverage awaits fixes in disk-cache state and test fixtures.
 	$(PLORI_CGO) go test -race -count=1 -timeout 20m \
 		-tags "$(PLORI_TAGS)" ./pkg/plori/...
 
@@ -184,10 +177,7 @@ test.plori.unit:
 test.plori.upstream:
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 25m \
 		./pkg/chunk/... ./pkg/vfs/... ./pkg/fs/... ./pkg/object/... ./pkg/plori/mountspec/...
-# PLO-573: ListAllWithDelimiter walks on one goroutine and lists on ten others,
-# and used to share its error variable with them as a stop flag. The
-# storage-worker purge calls it, so race the package that owns it here, where
-# ./pkg/object is already on the default build. ~12s on top of the run above.
+# Detect concurrent object-listing races in the default SDK build.
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -race -count=1 -timeout 25m ./pkg/object/...
 
 test.plori.security:
