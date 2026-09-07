@@ -26,10 +26,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/compress"
 	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -178,6 +180,78 @@ func TestStoreSmallBuffer(t *testing.T) {
 	conf.BufferSize = 1 << 20
 	store := NewCachedStore(blob, conf, nil)
 	testStore(t, store)
+}
+
+type blockingStageCache struct {
+	CacheManager
+	started chan struct{}
+	release chan struct{}
+	removed chan string
+}
+
+func (c *blockingStageCache) cache(string, *Page, bool, bool) {}
+
+func (c *blockingStageCache) stage(string, []byte, uint8) (string, error) {
+	close(c.started)
+	<-c.release
+	return "late-stage", nil
+}
+
+func (c *blockingStageCache) removeStage(key string) error {
+	c.removed <- key
+	return nil
+}
+
+func TestWritebackStageTimeoutRemovesLateStage(t *testing.T) {
+	// newTestStorage, not CreateStorage("mem"), because the release profile
+	// registers only `s3` and `file` (pkg/object/register_plori.go).
+	blob := newTestStorage(t)
+	cache := &blockingStageCache{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		removed: make(chan string, 1),
+	}
+	conf := defaultConf
+	conf.Compress = "lz4"
+	conf.PutTimeout = 20 * time.Millisecond
+	conf.Writeback = true
+	conf.WritebackThresholdSize = conf.BlockSize + 1
+	store := &cachedStore{
+		storage:       blob,
+		conf:          conf,
+		bcache:        cache,
+		currentUpload: make(chan struct{}, 1),
+		compressor:    compress.NewCompressor(conf.Compress),
+	}
+	store.initMetrics()
+
+	writer := store.NewWriter(123, 0)
+	data := []byte("late")
+	_, err := writer.WriteAt(data, 0)
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() { done <- writer.Finish(len(data)) }()
+
+	select {
+	case <-cache.started:
+	case <-time.After(time.Second):
+		t.Fatal("stage did not start")
+	}
+	timer := time.AfterFunc(5*conf.PutTimeout, func() { close(cache.release) })
+	defer timer.Stop()
+
+	select {
+	case err = <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("direct upload did not finish after stage timeout")
+	}
+	select {
+	case key := <-cache.removed:
+		require.Equal(t, "chunks/0/0/123_0_4", key)
+	case <-time.After(time.Second):
+		t.Fatal("late stage was not removed")
+	}
 }
 
 func TestStoreAsync(t *testing.T) {
@@ -669,4 +743,92 @@ func TestUploadPublishesThePlainBlockToTheCache(t *testing.T) {
 	if verified == 0 {
 		t.Fatalf("no block of %d reached the cache, nothing was checked", slices)
 	}
+}
+
+// lateBody blocks on the first Read, so io.ReadFull stays pending past get-timeout.
+type lateBody struct {
+	data    []byte
+	off     int
+	blocked bool
+}
+
+func (b *lateBody) Read(p []byte) (int, error) {
+	if !b.blocked {
+		b.blocked = true
+		time.Sleep(50 * time.Millisecond)
+	}
+	if b.off >= len(b.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[b.off:])
+	b.off += n
+	return n, nil
+}
+
+func (b *lateBody) Close() error { return nil }
+
+// lateStore completes a GET just after the caller gave up: it ignores cancellation and
+// returns success a hair after get-timeout, with a body that has no bytes ready yet.
+type lateStore struct {
+	object.ObjectStorage
+	data  []byte
+	delay time.Duration
+	seq   atomic.Int64
+}
+
+func (s *lateStore) Get(ctx context.Context, key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
+	time.Sleep(s.delay + time.Duration(s.seq.Add(1)%400)*time.Microsecond)
+	return &lateBody{data: s.data}, nil
+}
+
+// Regression: a fetch abandoned by WithTimeout used to assign load's named return err,
+// so a late `err = nil` could turn the timeout into a success and hand out a pooled page
+// this read never filled - the block that previously occupied it. The page is pre-filled
+// to stand in for that residue: a successful ReadAt must hold the requested block.
+func TestReadAtNeverReportsSuccessWithUnfilledBuffer(t *testing.T) {
+	const (
+		bs          = 64 << 10
+		iterations  = 400
+		concurrency = 16
+	)
+	want := bytes.Repeat([]byte{'b'}, bs)
+	residue := bytes.Repeat([]byte{'a'}, bs) // another block's bytes, left in a pooled page
+
+	conf := defaultConf
+	conf.BlockSize = bs
+	conf.CacheDir = t.TempDir()
+	conf.GetTimeout = 5 * time.Millisecond
+	conf.MaxRetries = 1
+	// newTestStorage, not CreateStorage("mem"), because the release profile
+	// registers only `s3` and `file` (pkg/object/register_plori.go).
+	slow := &lateStore{ObjectStorage: newTestStorage(t), data: want, delay: conf.GetTimeout}
+	store := NewCachedStore(slow, conf, nil)
+
+	var bad, ok, failed atomic.Int64
+	var wg sync.WaitGroup
+	for g := 0; g < concurrency; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				sliceID := uint64(g*iterations + i + 1) // distinct key => one load per read
+				page := NewOffPage(bs)
+				copy(page.Data, residue)
+				n, err := store.NewReader(sliceID, bs).ReadAt(context.Background(), page, 0)
+				switch {
+				case err != nil:
+					failed.Add(1)
+				case !bytes.Equal(page.Data[:n], want[:n]):
+					bad.Add(1)
+				default:
+					ok.Add(1)
+				}
+				page.Release()
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	t.Logf("reads: ok=%d failed=%d CORRUPT=%d", ok.Load(), failed.Load(), bad.Load())
+	require.Zero(t, bad.Load(), "ReadAt reported success but delivered another block's bytes")
 }
