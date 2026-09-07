@@ -32,6 +32,12 @@ import (
 	"time"
 )
 
+type renewResult struct {
+	retry     bool
+	fatal     *Fatal
+	renewedAt time.Time
+}
+
 // Deps are everything the supervisor talks to. Each one is an interface so the
 // whole state machine runs in a unit test without FUSE, an object store or a
 // control-plane.
@@ -1076,7 +1082,7 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	// whole staging run read zero for a volume holding 34 files.
 	s.usage(ctx)
 
-	renew := time.NewTicker(s.Spec.LeaseRenewInterval.D())
+	renew := time.NewTimer(s.Spec.LeaseRenewInterval.D())
 	defer renew.Stop()
 	barrier := time.NewTicker(s.barrierInterval())
 	defer barrier.Stop()
@@ -1100,6 +1106,7 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	defer credential.Stop()
 
 	ticks := 0
+	retrying := false
 	renewedAt := s.now()
 	for {
 		select {
@@ -1152,53 +1159,26 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			}
 
 		case <-renew.C:
-			ticks++
-			before := s.now()
-			s.noteQuotaTrips()
-			resp, err := s.Deps.CP.RenewLease(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, s.renewRequest())
-			// The answer's fencing echo is checked before a single field of
-			// it is used, and a mismatch becomes the same typed refusal a
-			// stale_epoch is, so it takes the branch below rather than one of
-			// its own: an answer nobody can attribute must not extend the
-			// deadline, must not deliver a grant, and must not leave this
-			// worker writing (PLO-520).
-			if err == nil {
-				err = resp.notOurs(s.Spec.StorageVolumeID, s.Spec.FenceEpoch)
+			normalRenew := !retrying
+			if normalRenew {
+				ticks++
 			}
-			if err != nil {
-				var cpErr *CPError
-				if errors.As(err, &cpErr) && cpErr.Fenced() {
-					// Terminal by contract: stale_epoch on renew is never
-					// retried, because a retry is the fenced writer still
-					// believing it holds the volume. It is also the
-					// OUT-OF-BAND case — the epoch was taken away rather than
-					// run out — so the stop skips the barrier and the final
-					// sync entirely (F-1).
-					s.setRenewOK(false)
-					return s.fenceAndStop(fatalf(CodeFenced, ErrCodeFencedOutOfBand, false,
-						"lease lost: %s", cpErr), ReasonFencedOutOfBand)
+			result := s.renew(ctx, ticks, normalRenew)
+			if result.fatal != nil {
+				return result.fatal
+			}
+			if !result.renewedAt.IsZero() {
+				renewedAt = result.renewedAt
+			}
+			if result.retry {
+				if delay, ok := s.renewRetryDelay(s.now()); ok {
+					retrying = true
+					renew.Reset(delay)
+					continue
 				}
-				s.setRenewOK(false)
-				s.log("renew_failed", "error", err.Error())
-				s.writeHealth()
-				continue
 			}
-			s.setRenewOK(true)
-			s.ackDelivered(resp.Grant.AckedEpoch)
-			renewedAt = before
-			s.setLeaseTTL(resp.LeaseExpiresAt.Sub(before.UTC()))
-			s.deadline.Update(resp.LeaseExpiresAt, s.Spec.WriteStopMargin.D(), before)
-			s.publishWriteExpiry()
-			s.retuneBacklog()
-			if resp.Grant.Epoch > s.appliedGrant() {
-				s.applyGrant(ctx, resp.Grant)
-			} else if resp.OverBudget {
-				s.growRefused()
-			}
-			if ticks%DefaultUsageReportEvery == 0 {
-				s.reportUsage(ctx)
-			}
-			s.writeHealth()
+			retrying = false
+			renew.Reset(s.Spec.LeaseRenewInterval.D())
 
 		case <-health.C:
 			// The replication check runs on the health tick and not on its
@@ -1228,6 +1208,75 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			s.runBarrier(ctx)
 		}
 	}
+}
+
+// renew performs one lease renewal. Its request is bounded by the same
+// ordered-stop instant that the guard uses, so a response arriving after that
+// instant cannot revive expired write authority.
+func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool) renewResult {
+	before := s.now()
+	due := s.deadline.StopBy(s.stopEarliness())
+	if !before.Before(due) {
+		return renewResult{fatal: s.deadlineFence()}
+	}
+	renewCtx, cancel := context.WithTimeout(ctx, due.Sub(before))
+	defer cancel()
+	s.noteQuotaTrips()
+	resp, err := s.Deps.CP.RenewLease(renewCtx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, s.renewRequest())
+	if err == nil {
+		err = resp.notOurs(s.Spec.StorageVolumeID, s.Spec.FenceEpoch)
+	}
+	// A terminal refusal is stronger than elapsed time: it must skip the
+	// barrier/final sync even if the response arrived at the stop boundary.
+	var cpErr *CPError
+	if errors.As(err, &cpErr) && cpErr.Fenced() {
+		s.setRenewOK(false)
+		return renewResult{fatal: s.fenceAndStop(fatalf(CodeFenced, ErrCodeFencedOutOfBand, false,
+			"lease lost: %s", cpErr), ReasonFencedOutOfBand)}
+	}
+	if !s.now().Before(due) {
+		return renewResult{fatal: s.deadlineFence()}
+	}
+	if err != nil {
+		s.setRenewOK(false)
+		s.log("renew_failed", "error", err.Error())
+		s.writeHealth()
+		return renewResult{retry: cpErr == nil || cpErr.Retryable()}
+	}
+	s.setRenewOK(true)
+	s.ackDelivered(resp.Grant.AckedEpoch)
+	s.setLeaseTTL(resp.LeaseExpiresAt.Sub(before.UTC()))
+	s.deadline.Update(resp.LeaseExpiresAt, s.Spec.WriteStopMargin.D(), before)
+	s.publishWriteExpiry()
+	s.retuneBacklog()
+	if resp.Grant.Epoch > s.appliedGrant() {
+		s.applyGrant(ctx, resp.Grant)
+	} else if resp.OverBudget {
+		s.growRefused()
+	}
+	if reportUsage && ticks%DefaultUsageReportEvery == 0 {
+		s.reportUsage(ctx)
+	}
+	s.writeHealth()
+	return renewResult{renewedAt: before}
+}
+
+func (s *Supervisor) deadlineFence() *Fatal {
+	return s.fenceAndStop(fatalf(CodeFenced, ErrCodeLeaseLost, false,
+		"lease deadline reached without a successful renewal"), ReasonFenced)
+}
+
+// renewRetryDelay is shorter than the normal interval but never reaches the
+// ordered-stop instant. Typed fencing responses do not call it.
+func (s *Supervisor) renewRetryDelay(now time.Time) (time.Duration, bool) {
+	delay := s.Spec.LeaseRenewInterval.D() / 10
+	if delay <= 0 {
+		return 0, false
+	}
+	if due := s.deadline.StopBy(s.stopEarliness()); !now.Add(delay).Before(due) {
+		return 0, false
+	}
+	return delay, true
 }
 
 // pollCredential re-reads the object key and decides whether this worker can
