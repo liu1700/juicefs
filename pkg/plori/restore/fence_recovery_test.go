@@ -39,8 +39,8 @@ func TestRealAbortResidualRestoresToTheRecordedPointOrRepairsTheLatest(t *testin
 	if err != nil {
 		t.Fatalf("litestream version: %v", err)
 	}
-	if strings.TrimSpace(string(version)) != "v0.5.17" {
-		t.Fatalf("litestream version = %q, want v0.5.17", strings.TrimSpace(string(version)))
+	if got := strings.TrimSpace(string(version)); got != "0.5.17" && got != "v0.5.17" {
+		t.Fatalf("litestream version = %q, want 0.5.17 or v0.5.17", got)
 	}
 
 	const blockSize = 1 << 20
