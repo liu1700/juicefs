@@ -18,7 +18,9 @@ package object
 
 import (
 	"context"
+	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -123,5 +125,126 @@ func TestSplitIPsByVersion(t *testing.T) {
 	}
 	if len(v4) != 2 {
 		t.Errorf("expected 2 IPv4, got %d", len(v4))
+	}
+}
+
+func TestDialFamilies_MixedAnswer_IPv6Disabled(t *testing.T) {
+	ips := []net.IP{
+		net.ParseIP("10.0.0.1"),
+		net.ParseIP("2001:db8::1"),
+		net.ParseIP("10.0.0.2"),
+	}
+	primaries, fallbacks := dialFamilies(ips, false)
+	if len(primaries) != 2 {
+		t.Errorf("expected 2 IPv4 primaries, got %d (%v)", len(primaries), primaries)
+	}
+	for _, ip := range primaries {
+		if ip.To4() == nil {
+			t.Errorf("expected only IPv4 primaries, got %v", ip)
+		}
+	}
+	if len(fallbacks) != 0 {
+		t.Errorf("expected no fallbacks when IPv6 is disabled, got %v", fallbacks)
+	}
+}
+
+func TestDialFamilies_MixedAnswer_IPv6Enabled(t *testing.T) {
+	ips := []net.IP{
+		net.ParseIP("10.0.0.1"),
+		net.ParseIP("2001:db8::1"),
+		net.ParseIP("10.0.0.2"),
+	}
+	primaries, fallbacks := dialFamilies(ips, true)
+	if len(primaries) != 1 {
+		t.Errorf("expected 1 IPv6 primary, got %d (%v)", len(primaries), primaries)
+	}
+	for _, ip := range primaries {
+		if ip.To4() != nil {
+			t.Errorf("expected only IPv6 primaries, got %v", ip)
+		}
+	}
+	if len(fallbacks) != 2 {
+		t.Errorf("expected 2 IPv4 fallbacks, got %d (%v)", len(fallbacks), fallbacks)
+	}
+	for _, ip := range fallbacks {
+		if ip.To4() == nil {
+			t.Errorf("expected only IPv4 fallbacks, got %v", ip)
+		}
+	}
+}
+
+func TestDialFamilies_IPv6OnlyAnswer_Disabled(t *testing.T) {
+	ips := []net.IP{
+		net.ParseIP("2001:db8::1"),
+		net.ParseIP("2001:db8::2"),
+	}
+	primaries, fallbacks := dialFamilies(ips, false)
+	if len(primaries) != 0 {
+		t.Errorf("expected no primaries for an IPv6-only answer with IPv6 disabled, got %v", primaries)
+	}
+	if len(fallbacks) != 0 {
+		t.Errorf("expected no fallbacks for an IPv6-only answer with IPv6 disabled, got %v", fallbacks)
+	}
+}
+
+func TestDialResolved_IPv6OnlyAnswer_Disabled_FailsFast(t *testing.T) {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	start := time.Now()
+	_, err := dialResolved(context.Background(), dialer, "tcp", "ipv6-only.test",
+		[]net.IP{net.ParseIP("2001:db8::1")}, "443", false)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an error for an IPv6-only answer with IPv6 disabled, got nil")
+	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) {
+		t.Fatalf("expected a *net.DNSError, got %T: %v", err, err)
+	}
+	if !dnsErr.IsNotFound {
+		t.Errorf("expected IsNotFound to be true, got false (%v)", dnsErr)
+	}
+	if !strings.Contains(dnsErr.Err, "IPv4") {
+		t.Errorf("expected the error to mention IPv4, got %q", dnsErr.Err)
+	}
+	if elapsed >= time.Second {
+		t.Errorf("expected a fast failure without dialing, took %v", elapsed)
+	}
+}
+
+func TestDialResolved_MixedAnswer_Disabled_DialsIPv4(t *testing.T) {
+	ln := startTCPListener(t, "127.0.0.1:0")
+	defer ln.Close()
+	port := getPort(t, ln)
+
+	dialer := &net.Dialer{Timeout: 2 * time.Second}
+	conn, err := dialResolved(context.Background(), dialer, "tcp", "mixed.test",
+		[]net.IP{net.ParseIP("2001:db8::1"), net.ParseIP("127.0.0.1")}, port, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	conn.Close()
+}
+
+func TestIsIPv6Enabled(t *testing.T) {
+	cases := []struct {
+		val  string
+		want bool
+	}{
+		{"1", true},
+		{"true", true},
+		{"True", true},
+		{"TRUE", true},
+		{"  1  ", true},
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"yes", false},
+		{"2", false},
+	}
+	for _, c := range cases {
+		if got := isIPv6Enabled(c.val); got != c.want {
+			t.Errorf("isIPv6Enabled(%q) = %v, want %v", c.val, got, c.want)
+		}
 	}
 }
