@@ -260,6 +260,36 @@ type fakeCP struct {
 	usages []Usage
 }
 
+// recoveringRenewCP makes one ordinary renewal fail, then makes the
+// control-plane available before the worker's write-stop deadline. Its second
+// call is the observable proof that the supervisor retries before the normal
+// renewal ticker fires again.
+type recoveringRenewCP struct {
+	*fakeCP
+	calls  atomic.Int32
+	failed chan struct{}
+}
+
+type blockingRenewCP struct{ *fakeCP }
+
+func (c blockingRenewCP) RenewLease(ctx context.Context, _ string, _ int64, _ RenewRequest) (LeaseResponse, error) {
+	c.record("renew")
+	<-ctx.Done()
+	return LeaseResponse{}, ctx.Err()
+}
+
+func (c *recoveringRenewCP) RenewLease(ctx context.Context, volumeID string, epoch int64, req RenewRequest) (LeaseResponse, error) {
+	if c.calls.Add(1) == 1 {
+		c.record("renew")
+		c.mu.Lock()
+		c.renews = append(c.renews, req)
+		c.mu.Unlock()
+		close(c.failed)
+		return LeaseResponse{}, context.DeadlineExceeded
+	}
+	return c.fakeCP.RenewLease(ctx, volumeID, epoch, req)
+}
+
 // formatAck is one observed /format-ack call. readyExists is the point of it:
 // the plugin publishes the volume when the ready file appears, so an ack that
 // arrives after it is an ack the Agent did not wait for.
@@ -749,6 +779,73 @@ func TestUnreachableControlPlaneFencesAtTheMargin(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the worker kept running past its write-stop margin")
+	}
+}
+
+func TestTransientRenewFailuresRetryBeforeTheWriteStopMargin(t *testing.T) {
+	vol := healthyVolume()
+	base := &fakeCP{expiry: func() time.Time { return time.Now().UTC().Add(time.Second) }}
+	cp := &recoveringRenewCP{fakeCP: base, failed: make(chan struct{})}
+	spec := testSpec()
+	// The first normal renew fails at 1.1s. Recovery is immediate, but the
+	// next normal tick is 2.2s while the two-second guard fences after the
+	// 1.3s stop due time. A retry at one tenth interval lands at 1.21s.
+	spec.LeaseRenewInterval = Duration(1100 * time.Millisecond)
+	spec.WriteStopMargin = Duration(1700 * time.Millisecond)
+	spec.LeaseExpiresAt = time.Now().UTC().Add(3 * time.Second)
+	sup := newSup(t, spec, &fakeFS{vol: vol}, base, &fakeReplicator{}, &fakeFencer{})
+	sup.Deps.CP = cp
+
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	select {
+	case <-cp.failed:
+	case <-time.After(1500 * time.Millisecond):
+		t.Fatal("transient renew failure did not occur")
+	}
+	select {
+	case got := <-done:
+		t.Fatalf("worker stopped after recovery before the next normal tick: %d/%s (%v), renew calls %d", got.Exit, got.ErrCode, got.Err, cp.calls.Load())
+	case <-time.After(350 * time.Millisecond):
+	}
+	if got := cp.calls.Load(); got < 2 {
+		t.Fatalf("renew calls = %d, want retry after recovery before write-stop margin", got)
+	}
+	stop <- syscall.SIGTERM
+	select {
+	case got := <-done:
+		if got.Exit != CodeOK {
+			t.Fatalf("recovered worker shutdown = %d/%s (%v), want clean stop", got.Exit, got.ErrCode, got.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovered worker did not stop")
+	}
+}
+
+func TestBlockedRenewCannotOutlastTheWriteStopMargin(t *testing.T) {
+	vol := healthyVolume()
+	base := &fakeCP{}
+	spec := testSpec()
+	spec.LeaseRenewInterval = Duration(100 * time.Millisecond)
+	spec.WriteStopMargin = Duration(900 * time.Millisecond)
+	spec.LeaseExpiresAt = time.Now().UTC().Add(1200 * time.Millisecond)
+	sup := newSup(t, spec, &fakeFS{vol: vol}, base, &fakeReplicator{}, &fakeFencer{})
+	sup.Deps.CP = blockingRenewCP{fakeCP: base}
+
+	started := time.Now()
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), make(chan os.Signal)) }()
+	select {
+	case got := <-done:
+		if got.Exit != CodeFenced || got.ErrCode != ErrCodeLeaseLost {
+			t.Fatalf("blocked renew exit = %d/%s (%v), want fenced lease loss", got.Exit, got.ErrCode, got.Err)
+		}
+		if elapsed := time.Since(started); elapsed > 700*time.Millisecond {
+			t.Fatalf("blocked renew stopped after %s, want before the 1s guard tick", elapsed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked renew outlasted the write-stop margin")
 	}
 }
 
