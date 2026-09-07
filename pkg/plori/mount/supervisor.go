@@ -1763,16 +1763,14 @@ func (s *Supervisor) finishUsageObservation(ctx context.Context, observed usageO
 	s.mu.Lock()
 	s.lastUsage = observed.usage
 	s.mu.Unlock()
-	if err := s.Deps.CP.ReportUsage(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, observed.usage, s.now().UTC()); err != nil {
-		s.log("usage_report_failed", "error", err.Error())
-	}
+	s.postUsage(ctx, observed.usage)
 }
 
-func (s *Supervisor) reportUsage(ctx context.Context) {
-	u, ok := s.usageTotals(ctx)
-	if !ok {
-		return
-	}
+// postUsage sends a snapshot the caller has already read. It is separate from
+// usageTotals because the ordered stop reads its final snapshot while the
+// metadata session is still open and posts it several steps later, by which
+// time the engine is closed and no reading is possible (PLO-637).
+func (s *Supervisor) postUsage(ctx context.Context, u Usage) {
 	if err := s.Deps.CP.ReportUsage(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, u, s.now().UTC()); err != nil {
 		s.log("usage_report_failed", "error", err.Error())
 	}
@@ -1906,6 +1904,11 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	var pendingBefore uint64
 	var anchorTxID string
 	var replicaConfirmed bool
+	// The final usage snapshot, read in step 4 before the metadata engine is
+	// closed and posted in step 6. Out of band it stays unread, which is what
+	// step 6 already does there: it skips the report.
+	var finalUsage Usage
+	var finalUsageOK bool
 	if !outOfBand {
 		tBefore := s.now().UTC()
 		// Same ordering as the periodic barrier, and here it also fixes a
@@ -1951,6 +1954,16 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 		// arrive. Everything after this point — Close, the final sync — runs
 		// against a filesystem nothing can mutate.
 		s.vol.FenceWrites()
+		// Read the final usage here, between the seal and the close. The
+		// numbers are final because nothing can change the filesystem any
+		// more, and they are still readable because the metadata session is
+		// still open. After Close they are not: a mount younger than the
+		// engine's first counter refresh (one heartbeat, or 12s with jitter,
+		// pkg/meta/base.go) holds usedSpace and usedInodes at -1, StatFS falls
+		// back to reading them from the engine, that read fails against a
+		// closed engine, and the report becomes 0/0 for a volume holding real
+		// data (PLO-637).
+		finalUsage, finalUsageOK = s.usageTotals(ctx)
 	}
 	if err := s.vol.Close(); err != nil && incomplete == nil {
 		incomplete = fmt.Errorf("close metadata: %w", err)
@@ -1979,11 +1992,18 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// band there is nothing truthful to report: no barrier ran, so no new
 	// durable point exists, and a usage figure for a volume somebody else owns
 	// would overwrite the successor's.
+	//
+	// The usage figure is the snapshot step 4 took before the close, not a
+	// fresh reading: a reading taken here answers from an engine that is gone.
+	// A snapshot that could not be read is not posted at all, and step 4's
+	// usage_read_failed line says why.
 	if incomplete == nil && !outOfBand {
 		if replicaConfirmed {
 			s.reportDurablePoint(context.WithoutCancel(ctx), res, anchorTxID)
 		}
-		s.reportUsage(context.WithoutCancel(ctx))
+		if finalUsageOK {
+			s.postUsage(context.WithoutCancel(ctx), finalUsage)
+		}
 	}
 
 	// 7. release the writer lease, always.
