@@ -575,3 +575,71 @@ func TestProjectedSecretStartupRequiresBothKeys(t *testing.T) {
 		t.Fatalf("FromProjectedSecret missing key error = %v, want ErrNoCredential", err)
 	}
 }
+
+func TestProjectedSecretPinsGenerationAcrossSymlinkSwap(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectedCredential(t, dir, "..old", fixtureKeyID, fixtureSecret)
+	src, err := FromProjectedSecret(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeProjectedCredential(t, dir, "..new", rotatedKeyID, rotatedSecret)
+	if err := os.Remove(filepath.Join(dir, "..data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..old", filepath.Join(dir, "..data")); err != nil {
+		t.Fatal(err)
+	}
+	orig := src.readFile
+	swapped := false
+	src.readFile = func(path string) ([]byte, error) {
+		b, err := orig(path)
+		if !swapped && filepath.Base(path) == "AWS_ACCESS_KEY_ID" {
+			swapped = true
+			link := filepath.Join(dir, "..data")
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("..new", link); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b, err
+	}
+	if rotated, err := src.Reload(); err != nil || rotated {
+		t.Fatalf("pinned reload = (%v,%v), want unchanged old", rotated, err)
+	}
+	if got := src.Current(); got.AccessKeyID != fixtureKeyID || got.SecretAccessKey != fixtureSecret {
+		t.Fatalf("mixed pair: %+v", got)
+	}
+	if rotated, err := src.Reload(); err != nil || !rotated {
+		t.Fatalf("next reload = (%v,%v), want new", rotated, err)
+	}
+}
+
+func TestProjectedSecretRemovedGenerationKeepsLastGood(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectedCredential(t, dir, "..old", fixtureKeyID, fixtureSecret)
+	src, err := FromProjectedSecret(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := src.readFile
+	removed := false
+	src.readFile = func(path string) ([]byte, error) {
+		b, err := orig(path)
+		if !removed && filepath.Base(path) == "AWS_ACCESS_KEY_ID" {
+			removed = true
+			if err := os.Remove(filepath.Join(dir, "..old", "AWS_SECRET_ACCESS_KEY")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b, err
+	}
+	if rotated, err := src.Reload(); err == nil || rotated {
+		t.Fatalf("removed generation reload = (%v,%v), want error", rotated, err)
+	}
+	if got := src.Current(); got.AccessKeyID != fixtureKeyID || got.SecretAccessKey != fixtureSecret {
+		t.Fatalf("last good pair lost: %+v", got)
+	}
+}
