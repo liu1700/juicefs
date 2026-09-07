@@ -694,13 +694,19 @@ func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, 
 	}
 	u := pmount.Usage{Bytes: int64(total - avail), Inodes: int64(iused)}
 	// Not once the stop has begun. The ordered stop detaches the mount and
-	// closes the metadata session (shutdown step 4) BEFORE it posts the final
-	// usage (step 6), and the two halves of this call do not survive that
-	// equally: StatFS answers from counters this process holds in memory, while
-	// the trash walk is a real Readdir against a session that is gone. It
-	// returns EIO, and the error it returns is not a syscall.Errno, so
-	// pkg/meta's errno() logs it with a full Go stack trace (utils.go) — which
-	// is what a staging shutdown printed into the worker log (PLO-468).
+	// closes the metadata session (shutdown step 4), and a trash walk after
+	// that is a real Readdir against a session that is gone. It returns EIO,
+	// and the error it returns is not a syscall.Errno, so pkg/meta's errno()
+	// logs it with a full Go stack trace (utils.go) — which is what a staging
+	// shutdown printed into the worker log (PLO-468).
+	//
+	// The totals above survive the close no better than the walk does. StatFS
+	// answers from in-memory counters only once the engine's refresh goroutine
+	// has loaded them, which happens no earlier than one heartbeat in; before
+	// that it reads them from the engine, and a closed engine fails that read
+	// and leaves 0/0. So the supervisor takes its final snapshot before it
+	// calls Close and posts that snapshot (PLO-637), and this branch serves
+	// callers that read usage after the stop for their own reasons.
 	//
 	// Skipping is the same fail-closed answer a failed walk already gives: the
 	// final report keeps its used_bytes and simply carries no breakdown, and
