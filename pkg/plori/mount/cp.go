@@ -211,14 +211,14 @@ func (r LeaseResponse) notOurs(volumeID string, epoch int64) error {
 // against it from a module that cannot compile behind the `plori` tag.
 var ClientRoutes = mountspec.ClientRoutes
 
-// Client speaks the five follow-up routes of /v1/internal/storage — renew,
-// release, usage, durable-point and format-ack (mountspec.ClientRoutes). It
-// never calls /mount-spec: by the time the worker runs, the plugin has already
+// Client speaks the follow-up routes of /v1/internal/storage (mountspec.ClientRoutes).
+// It never calls /mount-spec: by the time the worker runs, the plugin has already
 // spent that call and the resulting spec is in --spec-file.
 type Client struct {
-	BaseURL   string
-	TokenFile string
-	HTTP      *http.Client
+	BaseURL               string
+	TokenFile             string
+	ReleaseCapabilityFile string
+	HTTP                  *http.Client
 }
 
 // NewClient builds a client with a timeout short enough that a hung
@@ -253,6 +253,10 @@ func (c *Client) post(ctx context.Context, route string, body, out any) error {
 	if err != nil {
 		return err
 	}
+	return c.postToken(ctx, route, tok, body, out)
+}
+
+func (c *Client) postToken(ctx context.Context, route, tok string, body, out any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("encode %s request: %w", route, err)
@@ -316,11 +320,23 @@ func (c *Client) RenewLease(ctx context.Context, volumeID string, epoch int64, r
 }
 
 func (c *Client) ReleaseLease(ctx context.Context, volumeID string, epoch int64, reason string) error {
-	return c.post(ctx, mountspec.RouteLeaseRelease, map[string]any{
+	body := map[string]any{
 		"volume_id":   volumeID,
 		"fence_epoch": epoch,
 		"reason":      reason,
-	}, nil)
+	}
+	if c.ReleaseCapabilityFile == "" {
+		return c.post(ctx, mountspec.RouteLeaseRelease, body, nil)
+	}
+	data, err := os.ReadFile(c.ReleaseCapabilityFile)
+	if err != nil {
+		return fmt.Errorf("read lease release capability file: %w", err)
+	}
+	capability := strings.TrimSpace(string(data))
+	if capability == "" {
+		return errors.New("lease release capability file is empty")
+	}
+	return c.postToken(ctx, mountspec.RouteLeaseReleaseAfterStop, capability, body, nil)
 }
 
 // ReportUsage posts the volume's consumption, with the trash breakdown when there is

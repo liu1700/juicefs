@@ -291,12 +291,17 @@ func TestTheInMemoryFormatCarriesAPlaceholderNotAKey(t *testing.T) {
 func TestNoCommandLineFlagCanCarryACredential(t *testing.T) {
 	var names []string
 	var hasCredentialFile bool
+	var hasReleaseCapabilityFile bool
 	for _, f := range cmdPloriMount().Flags {
 		for _, n := range f.Names() {
 			names = append(names, n)
 			lower := strings.ToLower(n)
 			if lower == "credential-file" {
 				hasCredentialFile = true
+				continue
+			}
+			if lower == "lease-release-capability-file" {
+				hasReleaseCapabilityFile = true
 				continue
 			}
 			for _, banned := range []string{"access-key", "secret-key", "secret-access-key", "session-token", "password"} {
@@ -308,6 +313,9 @@ func TestNoCommandLineFlagCanCarryACredential(t *testing.T) {
 	}
 	if !hasCredentialFile {
 		t.Fatalf("plori-mount must accept --credential-file; flags are %v", names)
+	}
+	if !hasReleaseCapabilityFile {
+		t.Fatalf("plori-mount must accept --lease-release-capability-file; flags are %v", names)
 	}
 }
 

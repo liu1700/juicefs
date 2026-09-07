@@ -276,6 +276,14 @@ func TestTheClientSpeaksEveryRouteItDeclares(t *testing.T) {
 	if err := c.ReleaseLease(ctx, "v", 1, ReasonShutdown); err != nil {
 		t.Fatal(err)
 	}
+	capabilityFile := filepath.Join(t.TempDir(), "release-capability")
+	if err := os.WriteFile(capabilityFile, []byte("release-capability"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c.ReleaseCapabilityFile = capabilityFile
+	if err := c.ReleaseLease(ctx, "v", 2, ReasonShutdown); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.ReportUsage(ctx, "v", 1, Usage{}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
