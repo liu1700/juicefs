@@ -26,7 +26,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	. "github.com/bytedance/mockey"
 	. "github.com/smartystreets/goconvey/convey"
 )
 
@@ -138,29 +137,44 @@ func TestCheckPath(t *testing.T) {
 }
 
 func TestCleanupFullDoesNotBlockLoad(t *testing.T) {
-	PatchConvey("test getDiskUsage", t, func() {
-		conf := defaultConf
-		conf.CacheEviction = EvictionNone
-		s := newTestCacheStore(t.TempDir()+"/", &conf, nil)
-		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
-			time.Sleep(time.Second * 10)
-			return 1, 1, 1, 1
-		}).Build()
+	conf := defaultConf
+	conf.CacheEviction = EvictionNone
+	s := newTestCacheStore(t.TempDir()+"/", &conf, nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseAndJoin := func() {
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("cleanup did not finish after disk usage returned")
+		}
+	}
+	t.Cleanup(releaseAndJoin)
+	s.diskUsage = func(path string) (uint64, uint64, uint64, uint64) {
+		close(entered)
+		<-release
+		return 1, 1, 1, 1
+	}
 
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			s.Lock()
-			wg.Done()
-			s.cleanupFull()
-			s.Unlock()
-		}()
+	go func() {
+		s.Lock()
+		s.cleanupFull()
+		s.Unlock()
+		close(done)
+	}()
 
-		wg.Wait()
-		start := time.Now()
-		_, _ = s.load("1_1_1")
-		So(time.Since(start), ShouldBeLessThan, time.Second*3)
-	})
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup did not start the disk usage read")
+	}
+	start := time.Now()
+	_, _ = s.load("1_1_1")
+	require.Less(t, time.Since(start), time.Second)
+	releaseAndJoin()
 }
 
 func TestAtimeNotLost(t *testing.T) {
@@ -228,23 +242,14 @@ func TestSetLimitByFreeRatioUnknownInodesKeepExplicitMaxItems(t *testing.T) {
 }
 
 func TestUnknownInodeStatsShouldNotMarkCacheAsRawFull(t *testing.T) {
-	PatchConvey("unknown inode stats should not trigger rawFull", t, func() {
-		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
-			return 1 << 30, 1 << 30, 0, 0
-		}).Build()
-
-		conf := defaultConf
-		conf.CacheDir = t.TempDir()
-		m := new(cacheManagerMetrics)
-		m.initMetrics()
-		s := newDiskCache(m, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, nil)
-
-		require.Never(t, func() bool {
-			s.Lock()
-			defer s.Unlock()
-			return s.rawFull.Load()
-		}, 1500*time.Millisecond, 100*time.Millisecond)
-	})
+	conf := defaultConf
+	s := newTestCacheStore(t.TempDir()+"/", &conf, nil)
+	s.diskUsage = func(path string) (uint64, uint64, uint64, uint64) {
+		return 1 << 30, 1 << 30, 0, 0
+	}
+	usage := s.curFreeRatio()
+	require.Equal(t, uint64(0), usage.inodeCap)
+	require.False(t, s.isFull(usage, false))
 }
 
 func Test2RandomEviction(t *testing.T) {
@@ -388,20 +393,23 @@ func TestCooldownAtimeOnWriteFixedOnLoad(t *testing.T) {
 	cache.scanned = true
 	key := "0_0_4"
 
-	PatchConvey("mock time.Now to avoid drift", t, func() {
-		fixedTime := time.Date(2025, 1, 28, 12, 0, 0, 0, time.UTC)
-		Mock(time.Now).Return(fixedTime).Build()
-		path, err := cache.stage(key, []byte("test"), 0)
-		require.NoError(t, err)
-		require.NotEmpty(t, path)
-		expectedCooldownAtime := uint32(fixedTime.Add(-conf.CacheExpire / 2).Unix())
-		require.Equal(t, expectedCooldownAtime, cache.keys.peekAtime(cache.getCacheKey(key)))
-		rc, err := cache.load(key)
-		require.NoError(t, err)
-		require.NotNil(t, rc)
-		defer rc.Close()
-		require.Equal(t, uint32(fixedTime.Unix()), cache.keys.peekAtime(cache.getCacheKey(key)))
-	})
+	beforeStage := time.Now()
+	path, err := cache.stage(key, []byte("test"), 0)
+	afterStage := time.Now()
+	require.NoError(t, err)
+	require.NotEmpty(t, path)
+	stageAtime := cache.keys.peekAtime(cache.getCacheKey(key))
+	require.GreaterOrEqual(t, stageAtime, uint32(beforeStage.Add(-conf.CacheExpire/2).Unix()))
+	require.LessOrEqual(t, stageAtime, uint32(afterStage.Add(-conf.CacheExpire/2).Unix()))
+	beforeLoad := time.Now()
+	rc, err := cache.load(key)
+	afterLoad := time.Now()
+	require.NoError(t, err)
+	require.NotNil(t, rc)
+	defer rc.Close()
+	loadAtime := cache.keys.peekAtime(cache.getCacheKey(key))
+	require.GreaterOrEqual(t, loadAtime, uint32(beforeLoad.Unix()))
+	require.LessOrEqual(t, loadAtime, uint32(afterLoad.Unix()))
 }
 
 func newTestCacheStore(dir string, conf *Config, uploader func(key, path string, force bool) bool) *diskCache {
@@ -423,92 +431,86 @@ func newTestCacheStore(dir string, conf *Config, uploader func(key, path string,
 }
 
 func TestUploadStagingToFreeCalculation(t *testing.T) {
-	PatchConvey("uploadStaging should only upload enough blocks to satisfy freeRatio", t, func() {
-		dir := t.TempDir()
-		conf := defaultConf
-		conf.FreeSpace = 0.10
-		conf.CacheEviction = EvictionNone
+	dir := t.TempDir()
+	conf := defaultConf
+	conf.FreeSpace = 0.10
+	conf.CacheEviction = EvictionNone
 
-		var uploadedKeys []string
-		uploader := func(key, path string, force bool) bool {
-			uploadedKeys = append(uploadedKeys, key)
-			return true
-		}
+	var uploadedKeys []string
+	uploader := func(key, path string, force bool) bool {
+		uploadedKeys = append(uploadedKeys, key)
+		return true
+	}
 
-		s := newTestCacheStore(dir+"/", &conf, uploader)
-		for i := 0; i < 10; i++ {
-			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
-			k := s.getCacheKey(key)
-			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix()) - uint32(i*60)})
-		}
+	s := newTestCacheStore(dir+"/", &conf, uploader)
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+		k := s.getCacheKey(key)
+		s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix()) - uint32(i*60)})
+	}
 
-		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
-			return 100000, 5000, 100000, 100000
-		}).Build()
+	s.diskUsage = func(path string) (uint64, uint64, uint64, uint64) {
+		return 100000, 5000, 100000, 100000
+	}
 
-		s.uploadStaging()
-		uploaded := len(uploadedKeys)
-		require.LessOrEqual(t, uploaded, 5)
-		require.Greater(t, uploaded, 0, "should upload at least some blocks when disk is tight")
-	})
+	s.uploadStaging()
+	uploaded := len(uploadedKeys)
+	require.LessOrEqual(t, uploaded, 5)
+	require.Greater(t, uploaded, 0, "should upload at least some blocks when disk is tight")
 }
 
 func TestUploadStagingInodeToFree(t *testing.T) {
-	PatchConvey("uploadStaging respects inode pressure", t, func() {
-		dir := t.TempDir()
-		conf := defaultConf
-		conf.FreeSpace = 0.10
-		conf.CacheEviction = EvictionNone
+	dir := t.TempDir()
+	conf := defaultConf
+	conf.FreeSpace = 0.10
+	conf.CacheEviction = EvictionNone
 
-		var uploadCount int
-		uploader := func(key, path string, force bool) bool {
-			uploadCount++
-			return true
-		}
-		s := newTestCacheStore(dir+"/", &conf, uploader)
+	var uploadCount int
+	uploader := func(key, path string, force bool) bool {
+		uploadCount++
+		return true
+	}
+	s := newTestCacheStore(dir+"/", &conf, uploader)
 
-		for i := 0; i < 10; i++ {
-			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
-			k := s.getCacheKey(key)
-			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix()) - uint32(i*60)})
-		}
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+		k := s.getCacheKey(key)
+		s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix()) - uint32(i*60)})
+	}
 
-		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
-			return 100000, 20000, 1000, 50
-		}).Build()
-		s.uploadStaging()
-		count := uploadCount
-		require.Greater(t, count, 0, "should upload blocks when inodes are tight")
-	})
+	s.diskUsage = func(path string) (uint64, uint64, uint64, uint64) {
+		return 100000, 20000, 1000, 50
+	}
+	s.uploadStaging()
+	count := uploadCount
+	require.Greater(t, count, 0, "should upload blocks when inodes are tight")
 }
 
 func TestSpaceToFreeNoAction(t *testing.T) {
-	PatchConvey("uploadStaging does nothing when disk has enough space", t, func() {
-		dir := t.TempDir()
-		conf := defaultConf
-		conf.FreeSpace = 0.10
-		conf.CacheEviction = EvictionNone
+	dir := t.TempDir()
+	conf := defaultConf
+	conf.FreeSpace = 0.10
+	conf.CacheEviction = EvictionNone
 
-		var uploadCount int
-		uploader := func(key, path string, force bool) bool {
-			uploadCount++
-			return true
-		}
+	var uploadCount int
+	uploader := func(key, path string, force bool) bool {
+		uploadCount++
+		return true
+	}
 
-		s := newTestCacheStore(dir+"/", &conf, uploader)
+	s := newTestCacheStore(dir+"/", &conf, uploader)
 
-		for i := 0; i < 5; i++ {
-			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
-			k := s.getCacheKey(key)
-			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix())})
-		}
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+		k := s.getCacheKey(key)
+		s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix())})
+	}
 
-		// Mock: 20% free space, 20% free inodes - both above freeRatio (10%)
-		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
-			return 100000, 20000, 100000, 20000
-		}).Build()
+	// Mock: 20% free space, 20% free inodes - both above freeRatio (10%)
+	s.diskUsage = func(path string) (uint64, uint64, uint64, uint64) {
+		return 100000, 20000, 100000, 20000
+	}
 
-		s.uploadStaging()
-		require.Equal(t, 0, uploadCount, "should not upload when disk has enough free space and inodes")
-	})
+	s.uploadStaging()
+	require.Equal(t, 0, uploadCount, "should not upload when disk has enough free space and inodes")
 }
