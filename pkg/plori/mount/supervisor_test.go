@@ -272,6 +272,18 @@ type recoveringRenewCP struct {
 
 type blockingRenewCP struct{ *fakeCP }
 
+type lateRenewCP struct {
+	*fakeCP
+	response LeaseResponse
+	err      error
+}
+
+func (c lateRenewCP) RenewLease(ctx context.Context, _ string, _ int64, _ RenewRequest) (LeaseResponse, error) {
+	c.record("renew")
+	<-ctx.Done()
+	return c.response, c.err
+}
+
 func (c blockingRenewCP) RenewLease(ctx context.Context, _ string, _ int64, _ RenewRequest) (LeaseResponse, error) {
 	c.record("renew")
 	<-ctx.Done()
@@ -784,7 +796,7 @@ func TestUnreachableControlPlaneFencesAtTheMargin(t *testing.T) {
 
 func TestTransientRenewFailuresRetryBeforeTheWriteStopMargin(t *testing.T) {
 	vol := healthyVolume()
-	base := &fakeCP{expiry: func() time.Time { return time.Now().UTC().Add(time.Second) }}
+	base := &fakeCP{expiry: func() time.Time { return time.Now().UTC().Add(4 * time.Second) }}
 	cp := &recoveringRenewCP{fakeCP: base, failed: make(chan struct{})}
 	spec := testSpec()
 	// The first normal renew fails at 1.1s. Recovery is immediate, but the
@@ -798,7 +810,9 @@ func TestTransientRenewFailuresRetryBeforeTheWriteStopMargin(t *testing.T) {
 
 	stop := make(chan os.Signal, 1)
 	done := make(chan *Fatal, 1)
-	go func() { done <- sup.Run(context.Background(), stop) }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { done <- sup.Run(ctx, stop) }()
 	select {
 	case <-cp.failed:
 	case <-time.After(1500 * time.Millisecond):
@@ -807,7 +821,7 @@ func TestTransientRenewFailuresRetryBeforeTheWriteStopMargin(t *testing.T) {
 	select {
 	case got := <-done:
 		t.Fatalf("worker stopped after recovery before the next normal tick: %d/%s (%v), renew calls %d", got.Exit, got.ErrCode, got.Err, cp.calls.Load())
-	case <-time.After(350 * time.Millisecond):
+	case <-time.After(1200 * time.Millisecond):
 	}
 	if got := cp.calls.Load(); got < 2 {
 		t.Fatalf("renew calls = %d, want retry after recovery before write-stop margin", got)
@@ -846,6 +860,52 @@ func TestBlockedRenewCannotOutlastTheWriteStopMargin(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("blocked renew outlasted the write-stop margin")
+	}
+}
+
+func TestLateRenewResponsePreservesFenceSemantics(t *testing.T) {
+	for _, code := range []string{"success", CPCodeStaleEpoch, CPCodeLeaseHeld, CPCodeIdentityMismatch, CPCodeAnswerNotOurs} {
+		t.Run(code, func(t *testing.T) {
+			vol := healthyVolume()
+			base := &fakeCP{}
+			spec := testSpec()
+			spec.LeaseRenewInterval = Duration(50 * time.Millisecond)
+			spec.WriteStopMargin = Duration(time.Second)
+			spec.LeaseExpiresAt = time.Now().UTC().Add(1150 * time.Millisecond)
+			sup := newSup(t, spec, &fakeFS{vol: vol}, base, &fakeReplicator{}, &fakeFencer{})
+			cp := lateRenewCP{fakeCP: base, response: LeaseResponse{
+				StorageVolumeID: spec.StorageVolumeID, FenceEpoch: spec.FenceEpoch,
+				LeaseExpiresAt: time.Now().UTC().Add(time.Minute),
+			}}
+			if code == CPCodeAnswerNotOurs {
+				cp.response.FenceEpoch++
+			} else if code != "success" {
+				cp.err = &CPError{Status: 409, Code: code}
+			}
+			sup.Deps.CP = cp
+			got := sup.Run(context.Background(), make(chan os.Signal))
+			wantCode, wantReason := ErrCodeFencedOutOfBand, ReasonFencedOutOfBand
+			if code == "success" {
+				wantCode, wantReason = ErrCodeLeaseLost, ReasonFenced
+			}
+			if got.Exit != CodeFenced || got.ErrCode != wantCode || base.released != wantReason {
+				t.Fatalf("late %s: exit=%d code=%s release=%s", code, got.Exit, got.ErrCode, base.released)
+			}
+			if code != "success" {
+				fenced := false
+				for _, call := range vol.order() {
+					if call == "fence" {
+						fenced = true
+					}
+					if fenced && call == "barrier" {
+						t.Fatal("late terminal refusal must not run a final barrier")
+					}
+				}
+				if !fenced {
+					t.Fatal("late terminal refusal did not seal the volume")
+				}
+			}
+		})
 	}
 }
 

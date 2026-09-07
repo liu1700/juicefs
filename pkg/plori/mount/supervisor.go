@@ -1084,15 +1084,6 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 
 	renew := time.NewTimer(s.Spec.LeaseRenewInterval.D())
 	defer renew.Stop()
-	resetRenew := func(delay time.Duration) {
-		if !renew.Stop() {
-			select {
-			case <-renew.C:
-			default:
-			}
-		}
-		renew.Reset(delay)
-	}
 	barrier := time.NewTicker(s.barrierInterval())
 	defer barrier.Stop()
 	// The deadline guard runs far more often than the renew interval: it is
@@ -1182,12 +1173,12 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			if result.retry {
 				if delay, ok := s.renewRetryDelay(s.now()); ok {
 					retrying = true
-					resetRenew(delay)
+					renew.Reset(delay)
 					continue
 				}
 			}
 			retrying = false
-			resetRenew(s.Spec.LeaseRenewInterval.D())
+			renew.Reset(s.Spec.LeaseRenewInterval.D())
 
 		case <-health.C:
 			// The replication check runs on the health tick and not on its
@@ -1232,19 +1223,21 @@ func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool) ren
 	defer cancel()
 	s.noteQuotaTrips()
 	resp, err := s.Deps.CP.RenewLease(renewCtx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, s.renewRequest())
-	if !s.now().Before(due) {
-		return renewResult{fatal: s.deadlineFence()}
-	}
 	if err == nil {
 		err = resp.notOurs(s.Spec.StorageVolumeID, s.Spec.FenceEpoch)
 	}
+	// A terminal refusal is stronger than elapsed time: it must skip the
+	// barrier/final sync even if the response arrived at the stop boundary.
+	var cpErr *CPError
+	if errors.As(err, &cpErr) && cpErr.Fenced() {
+		s.setRenewOK(false)
+		return renewResult{fatal: s.fenceAndStop(fatalf(CodeFenced, ErrCodeFencedOutOfBand, false,
+			"lease lost: %s", cpErr), ReasonFencedOutOfBand)}
+	}
+	if !s.now().Before(due) {
+		return renewResult{fatal: s.deadlineFence()}
+	}
 	if err != nil {
-		var cpErr *CPError
-		if errors.As(err, &cpErr) && cpErr.Fenced() {
-			s.setRenewOK(false)
-			return renewResult{fatal: s.fenceAndStop(fatalf(CodeFenced, ErrCodeFencedOutOfBand, false,
-				"lease lost: %s", cpErr), ReasonFencedOutOfBand)}
-		}
 		s.setRenewOK(false)
 		s.log("renew_failed", "error", err.Error())
 		s.writeHealth()
