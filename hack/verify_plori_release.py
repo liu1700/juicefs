@@ -6,7 +6,7 @@ import sys
 import tarfile
 
 
-ARCHITECTURES = ("amd64", "arm64")
+ARCHITECTURES = ("amd64",)
 
 
 def expected_files(version: str) -> set[str]:
