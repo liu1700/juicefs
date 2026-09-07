@@ -450,7 +450,7 @@ func TestRealLitestreamRestoreReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("litestream version: %v", err)
 	}
-	if strings.TrimSpace(string(version)) != "v0.5.17" {
+	if strings.TrimPrefix(strings.TrimSpace(string(version)), "v") != "0.5.17" {
 		t.Fatalf("litestream version = %q, want v0.5.17", strings.TrimSpace(string(version)))
 	}
 	if _, err := exec.LookPath("sqlite3"); err != nil {

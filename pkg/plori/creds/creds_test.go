@@ -491,3 +491,155 @@ func TestRetrieveIsCheapEnoughToBeOnTheRequestPath(t *testing.T) {
 	}
 	_ = path
 }
+
+func writeProjectedCredential(t *testing.T, dir, generation, keyID, secret string) {
+	t.Helper()
+	data := filepath.Join(dir, generation)
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatalf("make generation: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "AWS_ACCESS_KEY_ID"), []byte(keyID), 0o600); err != nil {
+		t.Fatalf("write access key: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "AWS_SECRET_ACCESS_KEY"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("write secret key: %v", err)
+	}
+	link := filepath.Join(dir, "..data")
+	tmp := link + ".next"
+	if err := os.Symlink(generation, tmp); err != nil {
+		t.Fatalf("link generation: %v", err)
+	}
+	if err := os.Rename(tmp, link); err != nil {
+		t.Fatalf("publish generation: %v", err)
+	}
+}
+
+func TestProjectedSecretReloadUsesOneDataGeneration(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectedCredential(t, dir, "..2026_01_01", fixtureKeyID, fixtureSecret)
+	src, err := FromProjectedSecret(dir)
+	if err != nil {
+		t.Fatalf("FromProjectedSecret: %v", err)
+	}
+	if got := src.Current(); got.AccessKeyID != fixtureKeyID || got.SecretAccessKey != fixtureSecret {
+		t.Fatalf("initial pair = %+v", got)
+	}
+	writeProjectedCredential(t, dir, "..2026_01_02", rotatedKeyID, rotatedSecret)
+	rotated, err := src.Reload()
+	if err != nil || !rotated {
+		t.Fatalf("Reload = (%v, %v), want (true, nil)", rotated, err)
+	}
+	if got := src.Current(); got.AccessKeyID != rotatedKeyID || got.SecretAccessKey != rotatedSecret {
+		t.Fatalf("rotated pair = %+v", got)
+	}
+}
+
+func TestProjectedSecretBadRefreshKeepsLastGoodPair(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectedCredential(t, dir, "..good", fixtureKeyID, fixtureSecret)
+	src, err := FromProjectedSecret(dir)
+	if err != nil {
+		t.Fatalf("FromProjectedSecret: %v", err)
+	}
+	bad := filepath.Join(dir, "..bad")
+	if err := os.MkdirAll(bad, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bad, "AWS_ACCESS_KEY_ID"), []byte(rotatedKeyID), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "..data")
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..bad", link); err != nil {
+		t.Fatal(err)
+	}
+	if rotated, err := src.Reload(); err == nil || rotated {
+		t.Fatalf("bad Reload = (%v, %v), want (false, error)", rotated, err)
+	}
+	if got := src.Current(); got.AccessKeyID != fixtureKeyID || got.SecretAccessKey != fixtureSecret {
+		t.Fatalf("last good pair was dropped: %+v", got)
+	}
+}
+
+func TestProjectedSecretStartupRequiresBothKeys(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "..missing"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..missing", filepath.Join(dir, "..data")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FromProjectedSecret(dir); !errors.Is(err, ErrNoCredential) {
+		t.Fatalf("FromProjectedSecret missing key error = %v, want ErrNoCredential", err)
+	}
+}
+
+func TestProjectedSecretPinsGenerationAcrossSymlinkSwap(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectedCredential(t, dir, "..old", fixtureKeyID, fixtureSecret)
+	src, err := FromProjectedSecret(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeProjectedCredential(t, dir, "..new", rotatedKeyID, rotatedSecret)
+	if err := os.Remove(filepath.Join(dir, "..data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("..old", filepath.Join(dir, "..data")); err != nil {
+		t.Fatal(err)
+	}
+	orig := src.readFile
+	swapped := false
+	src.readFile = func(path string) ([]byte, error) {
+		b, err := orig(path)
+		if !swapped && filepath.Base(path) == "AWS_ACCESS_KEY_ID" {
+			swapped = true
+			link := filepath.Join(dir, "..data")
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("..new", link); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b, err
+	}
+	if rotated, err := src.Reload(); err != nil || rotated {
+		t.Fatalf("pinned reload = (%v,%v), want unchanged old", rotated, err)
+	}
+	if got := src.Current(); got.AccessKeyID != fixtureKeyID || got.SecretAccessKey != fixtureSecret {
+		t.Fatalf("mixed pair: %+v", got)
+	}
+	if rotated, err := src.Reload(); err != nil || !rotated {
+		t.Fatalf("next reload = (%v,%v), want new", rotated, err)
+	}
+}
+
+func TestProjectedSecretRemovedGenerationKeepsLastGood(t *testing.T) {
+	dir := t.TempDir()
+	writeProjectedCredential(t, dir, "..old", fixtureKeyID, fixtureSecret)
+	src, err := FromProjectedSecret(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := src.readFile
+	removed := false
+	src.readFile = func(path string) ([]byte, error) {
+		b, err := orig(path)
+		if !removed && filepath.Base(path) == "AWS_ACCESS_KEY_ID" {
+			removed = true
+			if err := os.Remove(filepath.Join(dir, "..old", "AWS_SECRET_ACCESS_KEY")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b, err
+	}
+	if rotated, err := src.Reload(); err == nil || rotated {
+		t.Fatalf("removed generation reload = (%v,%v), want error", rotated, err)
+	}
+	if got := src.Current(); got.AccessKeyID != fixtureKeyID || got.SecretAccessKey != fixtureSecret {
+		t.Fatalf("last good pair lost: %+v", got)
+	}
+}

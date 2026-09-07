@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -246,6 +247,12 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 	walk = func(prefix string, entries []Object) error {
 		var concurrent = 10
 		var err error
+		// err belongs to this goroutine: it is written on the recursion path
+		// without holding any listThread lock. The listing threads only need to
+		// know that this walk stopped consuming, so give them a variable of
+		// their own instead of reading err under ten different locks.
+		var stopped atomic.Bool
+		defer stopped.Store(true)
 		threads := make([]listThread, concurrent)
 		for c := 0; c < concurrent; c++ {
 			t := &threads[c]
@@ -268,7 +275,7 @@ func ListAllWithDelimiter(ctx context.Context, store ObjectStorage, prefix, star
 					t.cond.Signal()
 					for t.ready {
 						t.cond.WaitWithTimeout(time.Second)
-						if err != nil {
+						if stopped.Load() {
 							t.Unlock()
 							return
 						}

@@ -86,6 +86,7 @@ type diskCache struct {
 	rawFull   atomic.Bool
 	checksum  string // checksum level
 	uploader  func(key, path string, force bool) bool
+	diskUsage func(path string) (uint64, uint64, uint64, uint64)
 
 	opTs map[time.Duration]func() error
 	opMu sync.Mutex
@@ -134,6 +135,7 @@ func newDiskCache(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64,
 		pending:             make(chan pendingFile, pendingPages),
 		pages:               make(map[string]*Page),
 		uploader:            uploader,
+		diskUsage:           getDiskUsage,
 		opTs:                make(map[time.Duration]func() error),
 		stagedBlockCooldown: config.CacheExpire / 2,
 	}
@@ -524,8 +526,12 @@ type DiskFreeRatio struct {
 // caller should not hold cache lock
 func (cache *diskCache) curFreeRatio() DiskFreeRatio {
 	var total, free, files, ffree uint64
+	diskUsage := cache.diskUsage
+	if diskUsage == nil {
+		diskUsage = getDiskUsage
+	}
 	_ = cache.checkErr(func() error {
-		total, free, files, ffree = getDiskUsage(cache.dir)
+		total, free, files, ffree = diskUsage(cache.dir)
 		return nil
 	})
 	usage := DiskFreeRatio{

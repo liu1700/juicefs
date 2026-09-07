@@ -589,3 +589,84 @@ func TestBlockIndexes(t *testing.T) {
 		})
 	}
 }
+
+// A block handed to the block cache is flushed to disk by the cache's own
+// goroutine, which owns block.Data -- slice header and bytes -- until it
+// releases the page. upload() used to publish the block before compressing
+// into that same buffer and re-slicing it, so the cache file was written from a
+// buffer the uploader was still rewriting (PLO-414). Under -race this trips on
+// the first partial block; the assertions below cover the bytes that race put
+// at risk, because a cache hit is served raw and never re-checked against the
+// object store.
+func TestUploadPublishesThePlainBlockToTheCache(t *testing.T) {
+	blob := newTestStorage(t)
+	conf := defaultConf
+	conf.CacheDir = t.TempDir()
+	conf.CacheSize = 100 << 20
+	store := NewCachedStore(blob, conf, nil)
+	bcache := store.(*cachedStore).bcache
+
+	// A partial block on the synchronous upload path: that is where upload()
+	// aliases its compression buffer to the block it also caches.
+	const slices = 16
+	blen := conf.BlockSize / 2
+	want := make(map[string][]byte, slices)
+	for id := uint64(1); id <= slices; id++ {
+		data := bytes.Repeat([]byte{byte(id)}, blen)
+		w := store.NewWriter(id, 0)
+		if _, err := w.WriteAt(data, 0); err != nil {
+			t.Fatalf("write slice %d: %s", id, err)
+		}
+		if err := w.Finish(blen); err != nil {
+			t.Fatalf("finish slice %d: %s", id, err)
+		}
+		want[fmt.Sprintf("chunks/0/0/%d_0_%d", id, blen)] = data
+	}
+	defer func() {
+		for id := uint64(1); id <= slices; id++ {
+			_ = store.Remove(id, blen)
+		}
+	}()
+
+	// Let the flush goroutine drain. Caching is best-effort -- the pending queue
+	// holds only BufferSize*2/10/BlockSize pages and cache() drops a block when
+	// it is full -- so wait for the count to settle rather than for all of them.
+	var cached int64
+	deadline := time.Now().Add(30 * time.Second)
+	for settled := 0; settled < 10 && time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+		cnt, _ := bcache.stats()
+		if cnt == cached {
+			settled++
+		} else {
+			cached, settled = cnt, 0
+		}
+	}
+
+	// Whatever survived must be the block that was written: a cache hit is
+	// served raw, so a page the uploader kept writing after publishing it would
+	// be handed straight back to the reader.
+	var verified int
+	for key, data := range want {
+		r, err := bcache.load(key)
+		if err != nil {
+			continue // dropped by the pending queue, not cached
+		}
+		got := make([]byte, len(data)+1)
+		n, err := r.ReadAt(got, 0)
+		_ = r.Close()
+		if err != nil && err != io.EOF {
+			t.Fatalf("read cached %s: %s", key, err)
+		}
+		if n != len(data) {
+			t.Fatalf("cached %s holds %d bytes, want the whole %d-byte block", key, n, len(data))
+		}
+		if !bytes.Equal(got[:n], data) {
+			t.Fatalf("cached %s does not match the block that was written", key)
+		}
+		verified++
+	}
+	if verified == 0 {
+		t.Fatalf("no block of %d reached the cache, nothing was checked", slices)
+	}
+}

@@ -358,7 +358,6 @@ dbs:
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
 	sql := func(stmt string) string {
 		t.Helper()
 		out, err := exec.Command(sqlite, dbPath, stmt).CombinedOutput()
@@ -429,4 +428,183 @@ dbs:
 		t.Skipf("timestamp and TXID agreed here (%q): the LTX file happened to be encoded before T_before, which is the race this issue exists to remove", byTimestamp)
 	}
 	t.Logf("divergence: by-txid=%q by-timestamp=%q (durable point = %q)", byTXID, byTimestamp, wantDigest)
+}
+
+// TestRestoreTimestampFallsBehindAfterRealL0Retention exercises the retention
+// path PLO-417 is about with the pinned external binary and actual SQLite
+// contents. It shortens the production 10m/30m cadence to 3s/2s solely to
+// make a real elapsed-time test practical. The mechanism is unchanged: L1
+// compacts several L0 files and the retention monitor then removes the older
+// compacted L0 file.
+//
+// A durable point at TXID 2 is captured before TXID 3. Once the real L1 file
+// spans 2-3 and L0 2 has expired, TXID 2 is unavailable. Restoring by the
+// recorded timestamp instead selects the earlier snapshot, so the database
+// contains the baseline row but not the durable row. The row result, rather
+// than CLI success, is the assertion.
+func TestRestoreTimestampFallsBehindAfterRealL0Retention(t *testing.T) {
+	bin := os.Getenv("LITESTREAM_BIN")
+	if bin == "" {
+		var err error
+		if bin, err = exec.LookPath("litestream"); err != nil {
+			t.Skip("no litestream binary: set LITESTREAM_BIN to the pinned v0.5.17 binary")
+		}
+	}
+	version, err := exec.Command(bin, "version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("litestream version: %v: %s", err, version)
+	}
+	if got := strings.TrimSpace(string(version)); strings.TrimPrefix(got, "v") != "0.5.17" {
+		t.Fatalf("litestream version = %q, want pinned v0.5.17", got)
+	}
+	sqlite, err := exec.LookPath("sqlite3")
+	if err != nil {
+		t.Skip("no sqlite3 CLI to build the fixture with")
+	}
+
+	root := t.TempDir()
+	dbPath := filepath.Join(root, "meta.db")
+	replica := filepath.Join(root, "replica")
+	cfgPath := filepath.Join(root, "litestream.yml")
+	cfg := fmt.Sprintf(`logging:
+  level: debug
+  type: text
+  stderr: true
+levels:
+  - interval: 3s
+snapshot:
+  interval: 24h
+l0-retention: 2s
+l0-retention-check-interval: 1s
+dbs:
+  - path: %s
+    replica:
+      type: file
+      path: %s
+      sync-interval: 50ms
+`, dbPath, replica)
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stageCfgPath := filepath.Join(root, "stage.yml")
+	stageCfg := strings.Replace(cfg, "- interval: 3s", "- interval: 1h", 1)
+	if err := os.WriteFile(stageCfgPath, []byte(stageCfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sql := func(stmt string) string {
+		t.Helper()
+		out, err := exec.Command(sqlite, dbPath, stmt).CombinedOutput()
+		if err != nil {
+			t.Fatalf("sqlite3 %q: %v: %s", stmt, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	waitFor := func(name string, predicate func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for !predicate() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", name)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	hasLTX := func(level, min, max string) bool {
+		_, err := os.Stat(filepath.Join(replica, "ltx", level, min+"-"+max+".ltx"))
+		return err == nil
+	}
+	straddlesDurable := func() bool {
+		files, err := filepath.Glob(filepath.Join(replica, "ltx", "1", "*.ltx"))
+		if err != nil {
+			t.Fatalf("list L1 files: %v", err)
+		}
+		for _, file := range files {
+			name := strings.TrimSuffix(filepath.Base(file), ".ltx")
+			parts := strings.Split(name, "-")
+			if len(parts) == 2 && parts[0] <= "0000000000000002" && parts[1] > "0000000000000002" {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Create the TXID-1 snapshot before starting the daemon that will compact
+	// TXIDs 2 and 3. It avoids an initial-snapshot scheduling race: the test
+	// requires the snapshot to be older than the durable point.
+	sql(`PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO t VALUES (0, "baseline");`)
+	output, err := exec.Command(bin, "replicate", "-config", cfgPath, "-once", "-force-snapshot").CombinedOutput()
+	if err != nil {
+		t.Fatalf("create baseline snapshot: %v: %s", err, output)
+	}
+	if !hasLTX("9", "0000000000000001", "0000000000000001") {
+		t.Fatal("forced baseline snapshot is missing")
+	}
+
+	startDaemon := func(config string) *exec.Cmd {
+		t.Helper()
+		cmd := exec.Command(bin, "replicate", "-config", config)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start litestream replicate: %v", err)
+		}
+		return cmd
+	}
+	stopDaemon := func(cmd *exec.Cmd) {
+		t.Helper()
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(os.Interrupt)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("stop litestream replicate: %v", err)
+		}
+	}
+
+	// Replicate the two L0 files with compaction held at one hour, then restart
+	// with the accelerated L1 cadence. This removes tick timing from the test:
+	// the first L1 pass must compact the already-replicated 2-3 range.
+	stage := startDaemon(stageCfgPath)
+	t.Cleanup(func() {
+		if stage.ProcessState == nil {
+			_ = stage.Process.Signal(os.Interrupt)
+			_ = stage.Wait()
+		}
+	})
+	sql(`INSERT INTO t VALUES (1, "durable");`)
+	tBefore := time.Now().UTC()
+	waitFor("durable L0 replication", func() bool { return hasLTX("0", "0000000000000002", "0000000000000002") })
+	sql(`INSERT INTO t VALUES (2, "late");`)
+	waitFor("late L0 replication", func() bool { return hasLTX("0", "0000000000000003", "0000000000000003") })
+	stopDaemon(stage)
+
+	cmd := startDaemon(cfgPath)
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(os.Interrupt)
+		}
+		_ = cmd.Wait()
+	})
+	waitFor("L1 compaction that straddles the durable transaction", straddlesDurable)
+	waitFor("retention of the durable transaction's L0 file", func() bool {
+		return !hasLTX("0", "0000000000000002", "0000000000000002")
+	})
+
+	byTXID := filepath.Join(root, "by-txid.db")
+	output, err = exec.Command(bin, restoreArgs(cfgPath, dbPath, byTXID, "0000000000000002", time.Time{})...).CombinedOutput()
+	if err == nil || !strings.Contains(string(output), errTxUnreachable) {
+		t.Fatalf("TXID restore error = %v, output = %s; want %q after real retention", err, output, errTxUnreachable)
+	}
+
+	byTimestamp := filepath.Join(root, "by-timestamp.db")
+	output, err = exec.Command(bin, restoreArgs(cfgPath, dbPath, byTimestamp, "", tBefore)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("timestamp restore: %v: %s", err, output)
+	}
+	rows, err := exec.Command(sqlite, byTimestamp, "SELECT group_concat(id || ':' || value, ',') FROM t ORDER BY id;").CombinedOutput()
+	if err != nil {
+		t.Fatalf("read timestamp restore: %v: %s", err, rows)
+	}
+	got := strings.TrimSpace(string(rows))
+	if got != "0:baseline" {
+		t.Fatalf("timestamp fallback rows = %q, want only the earlier snapshot; durable row must not be silently treated as restored", got)
+	}
 }

@@ -1,6 +1,3 @@
-//go:build !plori
-// +build !plori
-
 /*
  * JuiceFS, Copyright 2026 Juicedata, Inc.
  *
@@ -20,18 +17,51 @@
 package object
 
 import (
+	"sync/atomic"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 )
 
-// s3Credentials is the credential provider the S3 backend signs with.
+// installed is the process-wide S3 credential provider, or nil.
 //
-// The default build returns exactly what the call sites used to construct
-// inline: a static provider when a key was configured, and nil when one was
-// not, so the SDK falls through to its own credential chain. The Plori build
-// replaces this one function (s3_credentials_plori.go) with a provider whose
-// key can be replaced while the process runs.
+// It is process-wide because the credential is: a plori-mount worker runs one
+// volume against one bucket with the one key pair the subscription has
+// (PLO-351 — Vultr issues no second principal), and every S3 client this
+// process builds — the data blob, the blob it rebuilds on a Format reload, and
+// the conditional-PUT fencer — must sign with the same current pair or a
+// rotation would leave half the process on a dead key.
+var installed atomic.Pointer[aws.CredentialsProvider]
+
+// SetS3CredentialsProvider installs the optional provider used by subsequently
+// constructed S3 clients. Plori mount and storage-worker install one at startup;
+// callers that do not install it retain the static/default credential chain.
+//
+// Passing nil restores the static behaviour, which is what the tests of the
+// static path do; production never does.
+func SetS3CredentialsProvider(p aws.CredentialsProvider) {
+	if p == nil {
+		installed.Store(nil)
+		return
+	}
+	installed.Store(&p)
+}
+
+// S3CredentialsProviderInstalled reports whether one is installed. The worker
+// asserts it after setup: with a provider installed, the access key in the
+// in-memory Format is a placeholder (cmd/plori_mount.go credentialPatch), so a
+// path that silently fell back to the static provider would sign every request
+// with a string that is not a credential.
+func S3CredentialsProviderInstalled() bool { return installed.Load() != nil }
+
+// s3Credentials prefers the installed rotating provider over the key the
+// Format carries. The Format's key is not a credential in this build — see
+// SetS3CredentialsProvider — so this is not a precedence choice between two
+// credentials, it is the only credential.
 func s3Credentials(accessKey, secretKey, token string) aws.CredentialsProvider {
+	if p := installed.Load(); p != nil {
+		return *p
+	}
 	if accessKey == "" {
 		return nil
 	}

@@ -137,6 +137,10 @@ test.plori.unit:
 # names its tests rather than running the package.
 	$(PLORI_CGO) go test -count=1 -timeout 5m -tags "$(PLORI_TAGS)" ./cmd/ \
 		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath|TestTheTrashIsNotWalked|TestAFailedTrashWalk'
+# Mount fixtures exercise the asynchronous chunk cache under the race detector.
+# Broader chunk race coverage awaits fixes in disk-cache state and test fixtures.
+	$(PLORI_CGO) go test -race -count=1 -timeout 20m \
+		-tags "$(PLORI_TAGS)" ./pkg/plori/...
 
 # Upstream's own unit tests on the default build. Nothing in the Plori workflow
 # ran a default-build `go test`, which is why pkg/chunk/cached_store_test.go sat
@@ -173,6 +177,8 @@ test.plori.unit:
 test.plori.upstream:
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 25m \
 		./pkg/chunk/... ./pkg/vfs/... ./pkg/fs/... ./pkg/object/... ./pkg/plori/mountspec/...
+# Detect concurrent object-listing races in the default SDK build.
+	SKIP_NON_CORE=true $(PLORI_CGO) go test -race -count=1 -timeout 25m ./pkg/object/...
 
 test.plori.security:
 	python3 hack/verify_plori_security_test.py
