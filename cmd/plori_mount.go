@@ -683,12 +683,12 @@ func (p *ploriVolume) SetStagingBacklogCap(blocks int64) {
 // whole report instead would cost the allocator its only view of this volume for the
 // sake of a sentence in a card.
 //
-// meta.Background() is a uid-0 context, which is what reading `.trash` requires; the
-// supervisor's ctx is not passed down because StatFS and the walk take a meta.Context,
-// and cancelling half a walk would report a floor as if it were the total.
+// The supervisor's context is wrapped as uid 0, which is what reading `.trash` requires.
+// A cancelled observation reports no breakdown rather than a floor as if it were total.
 func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, error) {
+	metaCtx := meta.WrapContext(ctx)
 	var total, avail, iused, iavail uint64
-	if st := p.m.StatFS(meta.Background(), meta.RootInode, &total, &avail, &iused, &iavail); st != 0 {
+	if st := p.m.StatFS(metaCtx, meta.RootInode, &total, &avail, &iused, &iavail); st != 0 {
 		return pmount.Usage{}, st
 	}
 	u := pmount.Usage{Bytes: int64(total - avail), Inodes: int64(iused)}
@@ -715,7 +715,7 @@ func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, 
 	if !withTrash {
 		return u, nil
 	}
-	t, err := meta.PloriMeasureTrash(p.m, meta.Background(), 0)
+	t, err := meta.PloriMeasureTrash(p.m, metaCtx, 0)
 	if err != nil {
 		logger.Warnf("plori: measuring the trash of %s failed, reporting usage without the breakdown: %s", p.identity.Name, err)
 		return u, nil

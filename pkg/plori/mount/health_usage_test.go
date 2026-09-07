@@ -187,6 +187,94 @@ func TestAReadingThatSkippedTheWalkCarriesNoBreakdownRatherThanAnOldOne(t *testi
 	}
 }
 
+func TestSlowTrashObservationDoesNotDelayRenewal(t *testing.T) {
+	vol := healthyVolume()
+	started := make(chan struct{}, 1)
+	unblock := make(chan struct{})
+	vol.usageStarted = started
+	vol.usageBlock = unblock
+	spec := testSpec()
+	cp := &fakeCP{}
+	sup := newSup(t, spec, &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
+	runningSup(t, sup)
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("trash observation never started")
+	}
+	before := len(cp.renewRequests())
+	waitFor(t, 2*time.Second, func() bool { return len(cp.renewRequests()) >= before+3 },
+		"renewal stopped behind a trash observation")
+	close(unblock)
+}
+
+func TestStopCancelsSlowTrashObservation(t *testing.T) {
+	vol := healthyVolume()
+	started, canceled := make(chan struct{}, 1), make(chan struct{}, 1)
+	vol.usageStarted, vol.usageCanceled = started, canceled
+	vol.usageBlock = make(chan struct{})
+	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	stop, done := make(chan os.Signal, 1), make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("trash observation never started")
+	}
+	stop <- syscall.SIGTERM
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not cancel the trash observation")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor did not stop")
+	}
+}
+
+func TestBlockedTrashObservationDoesNotDelayDeadlineFence(t *testing.T) {
+	vol := healthyVolume()
+	started, canceled := make(chan struct{}, 1), make(chan struct{}, 1)
+	vol.usageStarted, vol.usageCanceled = started, canceled
+	vol.usageBlock = make(chan struct{})
+	spec := testSpec()
+	spec.LeaseExpiresAt = time.Now().UTC().Add(1200 * time.Millisecond)
+	spec.WriteStopMargin = Duration(900 * time.Millisecond)
+	spec.LeaseRenewInterval = Duration(30 * time.Millisecond)
+	sup := newSup(t, spec, &fakeFS{vol: vol}, &fakeCP{renewErr: context.DeadlineExceeded}, &fakeReplicator{}, &fakeFencer{})
+	sup.vol = vol
+	observeCtx, cancelObserve := context.WithCancel(context.Background())
+	defer cancelObserve()
+	sup.startUsageObservation(observeCtx, make(chan usageObservation, 1))
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("trash observation never started")
+	}
+	start := time.Now()
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), make(chan os.Signal)) }()
+	f := waitFatal(t, done, 2*time.Second, "deadline guard waited behind trash observation")
+	if f.Exit != CodeFenced && f.Exit != CodeBarrierIncomplete {
+		t.Fatalf("exit = %d (%v), want fenced or incomplete barrier", f.Exit, f.Err)
+	}
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("deadline fence took %s while observation was blocked", elapsed)
+	}
+	if !vol.Fenced() {
+		t.Fatal("deadline guard did not fence the volume")
+	}
+	cancelObserve()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("blocked observation did not stop after cancellation")
+	}
+}
+
 // A volume nobody can measure keeps its last known figure. Zero is a real
 // answer — an Agent that has written nothing — so publishing it for a failed
 // reading would tell the plugin's gauge, and the operator reading it beside

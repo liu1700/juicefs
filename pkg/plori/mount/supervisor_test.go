@@ -35,28 +35,31 @@ import (
 // ------------------------------------------------------------------ fakes ---
 
 type fakeVolume struct {
-	mu          sync.Mutex
-	id          FormatIdentity
-	storedID    string
-	storedErr   error
-	integrity   error
-	purgeErr    error
-	purged      int
-	repair      RepairReport
-	repairErr   error
-	repaired    int
-	barrier     func(context.Context) (BarrierResult, error)
-	usage       Usage
-	usageErr    error
-	usageReads  int
-	trashWalks  int
-	fenced      bool
-	writeExpiry time.Time
-	calls       []string
-	serve       chan error
-	grants      [][2]int64
-	grantErr    error
-	quotaTrips  atomic.Uint64
+	mu            sync.Mutex
+	id            FormatIdentity
+	storedID      string
+	storedErr     error
+	integrity     error
+	purgeErr      error
+	purged        int
+	repair        RepairReport
+	repairErr     error
+	repaired      int
+	barrier       func(context.Context) (BarrierResult, error)
+	usage         Usage
+	usageErr      error
+	usageReads    int
+	trashWalks    int
+	usageStarted  chan struct{}
+	usageCanceled chan struct{}
+	usageBlock    <-chan struct{}
+	fenced        bool
+	writeExpiry   time.Time
+	calls         []string
+	serve         chan error
+	grants        [][2]int64
+	grantErr      error
+	quotaTrips    atomic.Uint64
 	// pending is the writeback backlog the fake reports. A settable number
 	// rather than a constant zero because the whole of PLO-383 is what the
 	// supervisor does when it is NOT zero.
@@ -144,19 +147,41 @@ func (f *fakeVolume) lastCap() int64 {
 // Usage counts its two halves separately, because the whole of PLO-427's
 // second half is that they run at different cadences: the totals on every
 // health tick, the trash walk on the report's interval.
-func (f *fakeVolume) Usage(_ context.Context, withTrash bool) (Usage, error) {
+func (f *fakeVolume) Usage(ctx context.Context, withTrash bool) (Usage, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.usageReads++
 	u := f.usage
 	if !withTrash {
 		// What ploriVolume returns when the caller did not ask for the walk:
 		// totals only, and the "nobody measured it" shape for the rest.
 		u.TrashKnown, u.TrashBytes, u.TrashInodes, u.TrashPartial = false, 0, 0, false
-		return u, f.usageErr
+		err := f.usageErr
+		f.mu.Unlock()
+		return u, err
 	}
 	f.trashWalks++
-	return u, f.usageErr
+	started, block, err := f.usageStarted, f.usageBlock, f.usageErr
+	f.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if block != nil {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			if f.usageCanceled != nil {
+				select {
+				case f.usageCanceled <- struct{}{}:
+				default:
+				}
+			}
+			return Usage{}, ctx.Err()
+		}
+	}
+	return u, err
 }
 
 // usageReads is how many times the totals were read; trashWalks how many of

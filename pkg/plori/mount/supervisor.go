@@ -38,6 +38,11 @@ type renewResult struct {
 	renewedAt time.Time
 }
 
+type usageObservation struct {
+	usage Usage
+	err   error
+}
+
 // Deps are everything the supervisor talks to. Each one is an interface so the
 // whole state machine runs in a unit test without FUSE, an object store or a
 // control-plane.
@@ -84,6 +89,7 @@ type Supervisor struct {
 	pendingAck      int64
 	quotaTrips      uint64
 	restoredUnclean bool
+	usageObserving  bool
 	// mounted is set the instant the `ready` file exists — the one moment this
 	// worker knows its restore is behind it and a filesystem is being served.
 	// It rides every renew from then on so the control-plane can free the
@@ -1080,7 +1086,10 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	// fifteenth renewal, five minutes at the production interval — so a mount
 	// published `used_bytes: 0` until the first report landed, which is how a
 	// whole staging run read zero for a volume holding 34 files.
-	s.usage(ctx)
+	s.usageTotals(ctx)
+	usageCtx, cancelUsage := context.WithCancel(ctx)
+	defer cancelUsage()
+	usageResults := make(chan usageObservation, 1)
 
 	renew := time.NewTimer(s.Spec.LeaseRenewInterval.D())
 	defer renew.Stop()
@@ -1163,7 +1172,7 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			if normalRenew {
 				ticks++
 			}
-			result := s.renew(ctx, ticks, normalRenew)
+			result := s.renew(ctx, ticks, normalRenew, usageCtx, usageResults)
 			if result.fatal != nil {
 				return result.fatal
 			}
@@ -1196,8 +1205,11 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			// mount look stale, and the figures inside the file are no
 			// different: sampling used_bytes at the /usage report's cadence is
 			// what left it at 0 for a whole staging run (PLO-427).
-			s.usage(ctx)
+			s.usageTotals(ctx)
 			s.writeHealth()
+
+		case observed := <-usageResults:
+			s.finishUsageObservation(ctx, observed)
 
 		case <-credential.C:
 			if f := s.pollCredential(ctx); f != nil {
@@ -1213,7 +1225,7 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 // renew performs one lease renewal. Its request is bounded by the same
 // ordered-stop instant that the guard uses, so a response arriving after that
 // instant cannot revive expired write authority.
-func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool) renewResult {
+func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool, usageCtx context.Context, usageResults chan<- usageObservation) renewResult {
 	before := s.now()
 	due := s.deadline.StopBy(s.stopEarliness())
 	if !before.Before(due) {
@@ -1255,7 +1267,7 @@ func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool) ren
 		s.growRefused()
 	}
 	if reportUsage && ticks%DefaultUsageReportEvery == 0 {
-		s.reportUsage(ctx)
+		s.startUsageObservation(usageCtx, usageResults)
 	}
 	s.writeHealth()
 	return renewResult{renewedAt: before}
@@ -1741,12 +1753,26 @@ func (s *Supervisor) usageReportInterval() time.Duration {
 // zero. "Nobody could measure this volume" is not the same fact as "this volume
 // is empty", and health.json is what an operator reads to tell an idle Agent
 // from one stuck against a ceiling (PLO-406).
+func (s *Supervisor) usageTotals(ctx context.Context) (Usage, bool) {
+	u, err := s.vol.Usage(ctx, false)
+	if err != nil {
+		s.log("usage_read_failed", "error", err.Error())
+		return Usage{}, false
+	}
+	s.mu.Lock()
+	s.lastUsage = u
+	s.mu.Unlock()
+	return u, true
+}
+
+// usage is retained for direct callers that need a same-sample trash figure.
+// The run loop deliberately uses usageTotals and startUsageObservation instead:
+// a trash walk must never hold the lease-renewal and deadline owner.
 func (s *Supervisor) usage(ctx context.Context) (Usage, bool) {
 	now := s.now()
 	s.mu.Lock()
 	walkTrash := s.lastTrashAt.IsZero() || now.Sub(s.lastTrashAt) >= s.usageReportInterval()
 	s.mu.Unlock()
-
 	u, err := s.vol.Usage(ctx, walkTrash)
 	if err != nil {
 		s.log("usage_read_failed", "error", err.Error())
@@ -1761,8 +1787,42 @@ func (s *Supervisor) usage(ctx context.Context) (Usage, bool) {
 	return u, true
 }
 
+func (s *Supervisor) startUsageObservation(ctx context.Context, results chan<- usageObservation) {
+	s.mu.Lock()
+	if s.usageObserving {
+		s.mu.Unlock()
+		return
+	}
+	s.usageObserving = true
+	s.mu.Unlock()
+	go func() {
+		u, err := s.vol.Usage(ctx, true)
+		select {
+		case results <- usageObservation{usage: u, err: err}:
+		case <-ctx.Done():
+		}
+	}()
+}
+
+func (s *Supervisor) finishUsageObservation(ctx context.Context, observed usageObservation) {
+	s.mu.Lock()
+	s.usageObserving = false
+	s.mu.Unlock()
+	if observed.err != nil {
+		s.log("usage_read_failed", "error", observed.err.Error())
+		return
+	}
+	s.mu.Lock()
+	s.lastUsage = observed.usage
+	s.lastTrashAt = s.now()
+	s.mu.Unlock()
+	if err := s.Deps.CP.ReportUsage(ctx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, observed.usage, s.now().UTC()); err != nil {
+		s.log("usage_report_failed", "error", err.Error())
+	}
+}
+
 func (s *Supervisor) reportUsage(ctx context.Context) {
-	u, ok := s.usage(ctx)
+	u, ok := s.usageTotals(ctx)
 	if !ok {
 		return
 	}
