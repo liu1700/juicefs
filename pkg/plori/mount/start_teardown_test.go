@@ -23,10 +23,15 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/juicedata/juicefs/pkg/plori/mountspec"
 )
 
 // PLO-438. A startup that fails after the replicator is up has to put the
@@ -188,6 +193,19 @@ type tracedCP struct {
 	tl *timeline
 }
 
+// capabilityReleaseCP keeps the startup harness's ordinary calls in memory but
+// sends the release through the real Client. That is the precise boundary PLO-624
+// changes: Supervisor ordering stays unchanged while its final request can outlive
+// the projected Pod token.
+type capabilityReleaseCP struct {
+	*fakeCP
+	client *Client
+}
+
+func (c *capabilityReleaseCP) ReleaseLease(ctx context.Context, volumeID string, epoch int64, reason string) error {
+	return c.client.ReleaseLease(ctx, volumeID, epoch, reason)
+}
+
 func (c *tracedCP) ReleaseLease(ctx context.Context, volumeID string, epoch int64, reason string) error {
 	c.tl.add(evLeaseRelease)
 	return c.fakeCP.ReleaseLease(ctx, volumeID, epoch, reason)
@@ -253,6 +271,48 @@ func TestAFailedSeedSyncStopsTheReplicatorBeforeItReleasesTheLease(t *testing.T)
 	if readyExists(t, sup) {
 		t.Error("a mount that never seeded its replica must never be published to the Agent")
 	}
+}
+
+func TestAbandonedStartReleasesWithCapabilityOnlyAfterTeardown(t *testing.T) {
+	cp := &fakeCP{}
+	sup, tl, _, _ := tracedSup(t, bootstrapSpec(),
+		&fakeReplicator{restoreErr: ErrReplicaEmpty, syncErr: errors.New("PUT: connection refused")}, cp)
+	var releaseCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != mountspec.RouteLeaseReleaseAfterStop {
+			t.Errorf("route = %s, want %s", r.URL.Path, mountspec.RouteLeaseReleaseAfterStop)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer release-capability" {
+			t.Errorf("authorization = %q, want capability", got)
+		}
+		releaseCalls++
+		tl.add(evLeaseRelease)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "revoked-pod-token")
+	capabilityFile := filepath.Join(dir, "release-capability")
+	if err := os.WriteFile(tokenFile, []byte("revoked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(capabilityFile, []byte("release-capability"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(srv.URL, tokenFile, time.Second)
+	client.ReleaseCapabilityFile = capabilityFile
+	sup.Deps.CP = &capabilityReleaseCP{fakeCP: cp, client: client}
+
+	got := sup.Run(context.Background(), make(chan os.Signal))
+	if got.Exit != CodeObjectStore || got.ErrCode != ErrCodeObjectStoreUnreachable {
+		t.Fatalf("got exit %d / %s, want %d / %s (%v)", got.Exit, got.ErrCode, CodeObjectStore, ErrCodeObjectStoreUnreachable, got.Err)
+	}
+	if releaseCalls != 1 {
+		t.Fatalf("capability release calls = %d, want 1", releaseCalls)
+	}
+	tl.requireOrder(t, evReplicatorStart, evReplicatorSync, evReplicatorAbort, evVolumeClose, evLeaseRelease)
+	tl.requireOrderlyTeardown(t)
 }
 
 // The same invariant on the ack path (fork #50 / PLO-420). It already held —

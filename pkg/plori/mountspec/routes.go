@@ -32,9 +32,12 @@ const (
 	RouteMountSpec    = "/v1/internal/storage/mount-spec"
 	RouteLeaseRenew   = "/v1/internal/storage/lease/renew"
 	RouteLeaseRelease = "/v1/internal/storage/lease/release"
-	RouteUsage        = "/v1/internal/storage/usage"
-	RouteDurablePoint = "/v1/internal/storage/durable-point"
-	RouteFormatAck    = "/v1/internal/storage/format-ack"
+	// RouteLeaseReleaseAfterStop accepts the one-generation release capability
+	// the worker uses when its projected Pod token was revoked during shutdown.
+	RouteLeaseReleaseAfterStop = "/v1/internal/storage/lease/release-after-stop"
+	RouteUsage                 = "/v1/internal/storage/usage"
+	RouteDurablePoint          = "/v1/internal/storage/durable-point"
+	RouteFormatAck             = "/v1/internal/storage/format-ack"
 )
 
 // ClientRoutes is every route pkg/plori/mount's Client speaks, and it is a
@@ -50,6 +53,7 @@ func ClientRoutes() []string {
 	return []string{
 		RouteLeaseRenew,
 		RouteLeaseRelease,
+		RouteLeaseReleaseAfterStop,
 		RouteUsage,
 		RouteDurablePoint,
 		RouteFormatAck,

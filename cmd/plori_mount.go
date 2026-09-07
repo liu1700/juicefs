@@ -73,6 +73,7 @@ machine.`,
 			&cli.StringFlag{Name: "cache-dir", Required: true, Usage: "JuiceFS writeback cache directory, one per volume"},
 			&cli.StringFlag{Name: "control-plane-url", Required: true, Usage: "base URL of the control-plane"},
 			&cli.StringFlag{Name: "token-file", Required: true, Usage: "projected ServiceAccount token, re-read on every call"},
+			&cli.StringFlag{Name: "lease-release-capability-file", Usage: "private one-generation lease-release capability file, used only during shutdown"},
 			&cli.StringFlag{Name: "credential-file", EnvVars: []string{"PLORI_OBJECT_CREDENTIAL_FILE"}, Usage: "JSON object credential, re-read while the worker runs; without it the AWS_* environment is used and the key cannot rotate"},
 			&cli.StringFlag{Name: "litestream-bin", Value: "litestream", Usage: "path to the pinned litestream binary"},
 			&cli.StringFlag{Name: "replicator", Usage: "control socket of the node-level litestream; without it this worker execs its own litestream child"},
@@ -177,13 +178,15 @@ func ploriMount(c *cli.Context) error {
 	stop := make(chan os.Signal, 2)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 
+	cp := pmount.NewClient(c.String("control-plane-url"), paths.TokenFile, 10*time.Second)
+	cp.ReleaseCapabilityFile = c.String("lease-release-capability-file")
 	sup := &pmount.Supervisor{
 		Spec:    spec,
 		Paths:   paths,
 		Options: opts,
 		Deps: pmount.Deps{
 			FS:                   &ploriFS{paths: paths, opts: opts, credentials: credentials},
-			CP:                   pmount.NewClient(c.String("control-plane-url"), paths.TokenFile, 10*time.Second),
+			CP:                   cp,
 			Replicator:           replicator,
 			Fencer:               fencer,
 			Credentials:          credentials,
