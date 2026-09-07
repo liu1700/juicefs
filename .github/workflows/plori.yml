@@ -245,7 +245,7 @@ jobs:
           # the sqlite3 CLI is missing.
           LITESTREAM_BIN="$RUNNER_TEMP/litestream" CGO_ENABLED=1 \
             go test -count=1 -tags "$(make -s plori.tags)" \
-            -run '^(TestRestoreByTXIDMatchesTheDurablePointWhereATimestampDoesNot|TestRealAbortResidualRestoresToTheRecordedPointOrRepairsTheLatest)$' \
+            -run '^(TestRestoreByTXIDMatchesTheDurablePointWhereATimestampDoesNot|TestRestoreTimestampFallsBehindAfterRealL0Retention|TestRealAbortResidualRestoresToTheRecordedPointOrRepairsTheLatest)$' \
             ./pkg/plori/mount/ ./pkg/plori/restore/
 
       - name: Clean up the plori-mount lifecycle test

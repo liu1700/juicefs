@@ -454,7 +454,7 @@ func TestRestoreTimestampFallsBehindAfterRealL0Retention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("litestream version: %v: %s", err, version)
 	}
-	if got := strings.TrimSpace(string(version)); got != "v0.5.17" {
+	if got := strings.TrimSpace(string(version)); strings.TrimPrefix(got, "v") != "0.5.17" {
 		t.Fatalf("litestream version = %q, want pinned v0.5.17", got)
 	}
 	sqlite, err := exec.LookPath("sqlite3")
@@ -563,6 +563,12 @@ dbs:
 	// with the accelerated L1 cadence. This removes tick timing from the test:
 	// the first L1 pass must compact the already-replicated 2-3 range.
 	stage := startDaemon(stageCfgPath)
+	t.Cleanup(func() {
+		if stage.ProcessState == nil {
+			_ = stage.Process.Signal(os.Interrupt)
+			_ = stage.Wait()
+		}
+	})
 	sql(`INSERT INTO t VALUES (1, "durable");`)
 	tBefore := time.Now().UTC()
 	waitFor("durable L0 replication", func() bool { return hasLTX("0", "0000000000000002", "0000000000000002") })
