@@ -20,6 +20,7 @@
 package meta
 
 import (
+	"fmt"
 	"path"
 	"strings"
 	"testing"
@@ -94,5 +95,39 @@ func TestSQLitePragmaOverride(t *testing.T) {
 				t.Errorf("with %q: PRAGMA %s = %q, want %q", c.query, c.pragma, got, c.want)
 			}
 		})
+	}
+}
+
+// TestSQLiteWALResetFixVersion qualifies the amalgamation linked by the SQLite
+// driver. SQLite fixed the concurrent WAL reset issue in 3.51.3; the metadata
+// database uses this bundled driver rather than a system libsqlite3.
+func TestSQLiteWALResetFixVersion(t *testing.T) {
+	m, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "sqlite-version.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	defer func() { _ = m.Shutdown() }()
+
+	db, ok := m.(*dbMeta)
+	if !ok {
+		t.Fatalf("meta is %T, want *dbMeta", m)
+	}
+	rows, err := db.db.QueryString("SELECT sqlite_version()")
+	if err != nil {
+		t.Fatalf("query SQLite version: %s", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("query SQLite version: got %d rows, want 1", len(rows))
+	}
+	var version string
+	for _, value := range rows[0] {
+		version = value
+	}
+	var major, minor, patch int
+	if _, err := fmt.Sscanf(version, "%d.%d.%d", &major, &minor, &patch); err != nil {
+		t.Fatalf("parse SQLite version %q: %s", version, err)
+	}
+	if major < 3 || (major == 3 && (minor < 51 || (minor == 51 && patch < 3))) {
+		t.Fatalf("SQLite version %q does not include the 3.51.3 WAL reset fix", version)
 	}
 }
