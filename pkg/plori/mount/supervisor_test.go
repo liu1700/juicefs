@@ -982,7 +982,10 @@ func TestLateRenewResponsePreservesFenceSemantics(t *testing.T) {
 			spec := testSpec()
 			spec.LeaseRenewInterval = Duration(50 * time.Millisecond)
 			spec.WriteStopMargin = Duration(time.Second)
-			spec.LeaseExpiresAt = time.Now().UTC().Add(1150 * time.Millisecond)
+			// Keep a 500 ms window before the deliberate late response. The old
+			// 150 ms window could be consumed by race-instrumented startup, so the
+			// deadline fence won before this fixture sent its terminal response.
+			spec.LeaseExpiresAt = time.Now().UTC().Add(1500 * time.Millisecond)
 			sup := newSup(t, spec, &fakeFS{vol: vol}, base, &fakeReplicator{}, &fakeFencer{})
 			cp := lateRenewCP{fakeCP: base, response: LeaseResponse{
 				StorageVolumeID: spec.StorageVolumeID, FenceEpoch: spec.FenceEpoch,
