@@ -1,5 +1,5 @@
-//go:build nowebdav
-// +build nowebdav
+//go:build nowebdav || plori
+// +build nowebdav plori
 
 /*
  * JuiceFS, Copyright 2022 Juicedata, Inc.
@@ -27,10 +27,14 @@ import (
 
 func cmdWebDav() *cli.Command {
 	return &cli.Command{
-		Name:        "webdav",
-		Category:    "SERVICE",
-		Usage:       "Start a WebDAV server (not included)",
-		Description: `This feature is not included. If you want it, recompile juicefs without "nowebdav" flag`,
+		Name:     "webdav",
+		Category: "SERVICE",
+		Usage:    "Start a WebDAV server (not included)",
+		// The `plori` tag also selects this stub: pkg/fs/http.go, which holds
+		// StartHTTPServer and WebdavConfig, is `//go:build !plori`, so the
+		// real command cannot compile in that profile (PLO-445). The Plori
+		// release build sets both tags.
+		Description: `This feature is not included. If you want it, recompile juicefs without the "nowebdav" or "plori" flag`,
 		Action: func(*cli.Context) error {
 			return errors.New("not supported")
 		},

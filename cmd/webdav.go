@@ -1,5 +1,5 @@
-//go:build !nowebdav
-// +build !nowebdav
+//go:build !nowebdav && !plori
+// +build !nowebdav,!plori
 
 /*
  *  * JuiceFS, Copyright 2022 Juicedata, Inc.
