@@ -385,14 +385,14 @@ func (f *ploriFS) Format(ctx context.Context, spec *pmount.MountSpec) error {
 	defer m.Shutdown() //nolint:errcheck
 	blob, err := NewReloadableStorage(format, m, f.credentialPatch())
 	if err != nil {
-		return fmt.Errorf("object storage: %w", err)
+		return &pmount.Fatal{Exit: pmount.CodeObjectStore, ErrCode: pmount.ErrCodeObjectStoreUnreachable, Retryable: true, Err: fmt.Errorf("object storage: %w", err)}
 	}
 	defer object.Shutdown(blob)
 	if err := test(ctx, blob); err != nil {
-		return fmt.Errorf("object storage is not usable: %w", err)
+		return &pmount.Fatal{Exit: pmount.CodeObjectStore, ErrCode: pmount.ErrCodeObjectStoreUnreachable, Retryable: true, Err: fmt.Errorf("object storage is not usable: %w", err)}
 	}
 	if err := blob.Put(ctx, "juicefs_uuid", strings.NewReader(format.UUID)); err != nil {
-		return fmt.Errorf("write juicefs_uuid: %w", err)
+		return &pmount.Fatal{Exit: pmount.CodeObjectStore, ErrCode: pmount.ErrCodeObjectStoreUnreachable, Retryable: true, Err: fmt.Errorf("write juicefs_uuid: %w", err)}
 	}
 	// Init persists the format. The pointer handed to it is the one the patch
 	// mutated, so the credential is stripped back out first; the assertion

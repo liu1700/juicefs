@@ -448,3 +448,35 @@ func assertNoCredential(t *testing.T, surface, content string) {
 		t.Errorf("%s contains the access key id", surface)
 	}
 }
+
+func TestCredentialFormatObjectStoreFailureIsRetryable(t *testing.T) {
+	for _, failure := range []string{"storage test", "uuid write"} {
+		t.Run(failure, func(t *testing.T) {
+			store := newTinyS3(t)
+			failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if failure == "storage test" || strings.HasSuffix(r.URL.Path, "/juicefs_uuid") {
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = io.WriteString(w, "<Error><Code>AccessDenied</Code><Message>fixture rejection</Message></Error>")
+					return
+				}
+				store.srv.Config.Handler.ServeHTTP(w, r)
+			}))
+			defer failing.Close()
+			source := hygieneSource(t)
+			object.SetS3CredentialsProvider(source.Provider())
+			t.Cleanup(func() { object.SetS3CredentialsProvider(nil) })
+			dir := t.TempDir()
+			fs := &ploriFS{paths: pmount.Paths{StateDir: dir}, credentials: pmount.NewCredentialWatcher(source, func(string, ...any) {})}
+			spec := &mountspec.MountSpec{StorageVolumeID: "550e8400-e29b-41d4-a716-446655440000", FenceEpoch: 1,
+				Format: mountspec.FormatSpec{Bucket: failing.URL + "/plorifs", TrashDays: 1}}
+			err := fs.Format(context.Background(), spec)
+			if err == nil {
+				t.Fatal("format succeeded despite object-store rejection")
+			}
+			got := pmount.Classify(err)
+			if got.Exit != pmount.CodeObjectStore || got.ErrCode != pmount.ErrCodeObjectStoreUnreachable || !got.Retryable {
+				t.Fatalf("format failure misclassified: %+v", got)
+			}
+		})
+	}
+}

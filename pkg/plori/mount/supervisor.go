@@ -821,6 +821,10 @@ func (s *Supervisor) formatFirstBoot(ctx context.Context) error {
 			s.Spec.FormatUUID)
 	}
 	if err := s.Deps.FS.Format(ctx, s.Spec); err != nil {
+		var fatal *Fatal
+		if errors.As(err, &fatal) {
+			return &Fatal{Exit: fatal.Exit, ErrCode: fatal.ErrCode, Retryable: fatal.Retryable, Err: fmt.Errorf("format volume: %w", err)}
+		}
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "format volume: %s", err)
 	}
 	s.formattedHere = true

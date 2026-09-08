@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -1222,5 +1223,32 @@ func TestTheMarkerReclaimProceedsWhenBothProofsHold(t *testing.T) {
 	// reclaim leaves no second control-plane call to review.
 	if order := cp.order(); len(order) == 0 || order[0] != "renew" {
 		t.Errorf("control-plane call order %v must open with the renew that proves the holder", order)
+	}
+}
+
+func TestFirstFormatFailureClassification(t *testing.T) {
+	dnsErr := &net.DNSError{Err: "no IPv4 address found", Name: "storage.test", IsNotFound: true}
+	for _, tc := range []struct {
+		name      string
+		err       error
+		exit      int
+		retryable bool
+	}{
+		{"object store", &Fatal{Exit: CodeObjectStore, ErrCode: ErrCodeObjectStoreUnreachable, Retryable: true, Err: dnsErr}, CodeObjectStore, true},
+		{"metadata", errors.New("init metadata: disk full"), CodeRestoreFailed, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sup := newSup(t, bootstrapSpec(), &fakeFS{vol: healthyVolume(), formatErr: tc.err}, &fakeCP{}, &fakeReplicator{restoreErr: ErrReplicaEmpty}, &fakeFencer{})
+			got := sup.Run(context.Background(), make(chan os.Signal))
+			if got.Exit != tc.exit || got.Retryable != tc.retryable {
+				t.Fatalf("classification = %+v", got)
+			}
+			if tc.retryable && (got.ErrCode != ErrCodeObjectStoreUnreachable || !errors.Is(got.Err, dnsErr)) {
+				t.Fatalf("lost typed object-store cause: %+v", got)
+			}
+			if sup.formattedHere {
+				t.Fatal("failed format marked complete")
+			}
+		})
 	}
 }

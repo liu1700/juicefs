@@ -248,3 +248,109 @@ func TestIsIPv6Enabled(t *testing.T) {
 		}
 	}
 }
+
+func TestObjectResolverPartialAnswerRecoversBeforeDial(t *testing.T) {
+	ln := startTCPListener(t, "127.0.0.1:0")
+	defer ln.Close()
+	var queries []string
+	r := &objectResolver{lookup: func(ctx context.Context, network, host string) ([]net.IP, error) {
+		queries = append(queries, network+":"+host)
+		if host == "storage.test" {
+			return []net.IP{net.ParseIP("2001:db8::1")}, nil
+		}
+		if host != "storage.test." || network != "ip4" {
+			t.Fatalf("unexpected lookup %s %s", network, host)
+		}
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}}
+	for i := 0; i < 3; i++ {
+		ips, err := r.fetch(context.Background(), "storage.test", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, err := dialResolved(context.Background(), &net.Dialer{Timeout: time.Second}, "tcp", "storage.test", ips, getPort(t, ln), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+	}
+	if got := strings.Join(queries, ","); got != "ip:storage.test,ip4:storage.test." {
+		t.Fatalf("lookups = %s", got)
+	}
+}
+
+func TestObjectResolverDoesNotCacheUnusableAnswers(t *testing.T) {
+	for _, kind := range []string{"AAAA", "empty", "error", "absolute"} {
+		t.Run(kind, func(t *testing.T) {
+			calls, healthy := 0, false
+			host := "storage.test"
+			if kind == "absolute" {
+				host += "."
+			}
+			r := &objectResolver{lookup: func(context.Context, string, string) ([]net.IP, error) {
+				calls++
+				if healthy {
+					return []net.IP{net.ParseIP("127.0.0.1")}, nil
+				}
+				switch kind {
+				case "error":
+					return nil, &net.DNSError{Err: "temporary DNS failure", IsTemporary: true}
+				case "empty":
+					return nil, nil
+				default:
+					return []net.IP{net.ParseIP("2001:db8::1")}, nil
+				}
+			}}
+			if _, err := r.fetch(context.Background(), host, false); err == nil {
+				t.Fatal("unusable answer succeeded")
+			}
+			wantCalls := 2
+			if kind == "error" || kind == "absolute" {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Fatalf("lookup count = %d, want %d", calls, wantCalls)
+			}
+			healthy = true
+			if _, err := r.fetch(context.Background(), host, false); err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			if calls != wantCalls+1 {
+				t.Fatal("retry did not resolve again")
+			}
+		})
+	}
+}
+
+func TestObjectResolverCachePolicyAndExpiry(t *testing.T) {
+	for _, ipv6 := range []bool{false, true} {
+		calls := 0
+		r := &objectResolver{lookup: func(context.Context, string, string) ([]net.IP, error) {
+			calls++
+			if ipv6 {
+				return []net.IP{net.ParseIP("2001:db8::1")}, nil
+			}
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		}}
+		for i := 0; i < 2; i++ {
+			if _, err := r.fetch(context.Background(), "storage.test", ipv6); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if calls != 1 {
+			t.Fatalf("usable answer was not cached: %d", calls)
+		}
+		r.cache.Range(func(key, value any) bool {
+			answer := value.(objectDNSAnswer)
+			answer.expires = time.Now().Add(-time.Second)
+			r.cache.Store(key, answer)
+			return true
+		})
+		if _, err := r.fetch(context.Background(), "storage.test", ipv6); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 2 {
+			t.Fatalf("expired answer was reused: %d", calls)
+		}
+	}
+}
