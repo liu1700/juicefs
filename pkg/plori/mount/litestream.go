@@ -101,8 +101,9 @@ type Litestream struct {
 	// which is what the tests that do not assert on it want.
 	Log func(event string, kv ...any)
 
-	cmd  *exec.Cmd
-	done chan error
+	cmd                 *exec.Cmd
+	done                chan error
+	lastRestoreAttempts []string
 
 	spec *MountSpec
 	opts MountOptions
@@ -311,8 +312,10 @@ func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, opt Resto
 		err = l.restoreAt(ctx, "", opt.Timestamp)
 	}
 	if err != nil {
+		l.lastRestoreAttempts = append([]string(nil), attempts...)
 		return &RestoreFailure{Err: err, Attempts: attempts}
 	}
+	l.lastRestoreAttempts = append([]string(nil), attempts...)
 	if _, err := os.Stat(l.DBPath); err != nil {
 		if os.IsNotExist(err) {
 			return ErrReplicaEmpty
@@ -320,6 +323,11 @@ func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, opt Resto
 		return fmt.Errorf("stat restored database: %w", err)
 	}
 	return nil
+}
+
+// RestoreAttempts is the ordered chain from the most recent restore call.
+func (l *Litestream) RestoreAttempts() []string {
+	return append([]string(nil), l.lastRestoreAttempts...)
 }
 
 // restoreAt runs one `litestream restore` with at most one anchor.

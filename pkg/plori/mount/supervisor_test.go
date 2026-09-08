@@ -496,17 +496,17 @@ func TestRestoreFailureEventIsBoundedAndRedacted(t *testing.T) {
 			got[kv[i].(string)] = kv[i+1]
 		}
 	}
-	sup.restoreFailure("integrity", "durable_point", 6,
-		time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC),
+	sup.restoreFailure("integrity", restoreContext{source: "durable_point", selectedEpoch: "6",
+		anchor: "2026-09-08T12:00:00Z", txid: "0000000000000009", attempts: []string{"txid", "timestamp"}},
 		&RestoreFailure{Err: errors.New("s3://private-bucket/object-key?token=secret"), Attempts: []string{"txid", "timestamp"}})
 
 	if got == nil {
 		t.Fatal("restore_failure event was not emitted")
 	}
 	for key, want := range map[string]any{
-		"volume": "550e8400-e29b-41d4-a716-446655440000", "current_epoch": int64(3), "selected_epoch": int64(6),
+		"volume": "550e8400-e29b-41d4-a716-446655440000", "current_epoch": int64(3), "selected_epoch": "6",
 		"source": "durable_point", "anchor": "2026-09-08T12:00:00Z",
-		"reason": "integrity", "detail": "integrity", "litestream_version": "v0.5.17",
+		"durable_txid": "0000000000000009", "reason": "integrity", "litestream_version": "configured_pinned_v0.5.17",
 	} {
 		if value := got[key]; value != want {
 			t.Errorf("%s = %v, want %v", key, value, want)

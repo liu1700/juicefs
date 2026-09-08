@@ -92,6 +92,13 @@ type NodeReplicator struct {
 	spec *MountSpec
 }
 
+func (n *NodeReplicator) RestoreAttempts() []string {
+	if n.Restorer == nil {
+		return nil
+	}
+	return n.Restorer.RestoreAttempts()
+}
+
 // ProbeTimeout bounds one replication probe. It is short because the probe
 // runs on the health tick and a replicator that cannot answer in this long is
 // already the condition the probe exists to find.

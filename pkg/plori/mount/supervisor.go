@@ -27,6 +27,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -134,7 +135,16 @@ type Supervisor struct {
 	// replRestarted records that the one repair attempt for the current
 	// failure has been made, so a replicator that cannot be revived is not
 	// restarted every health tick until the stop trips.
-	replRestarted bool
+	replRestarted  bool
+	restoreContext restoreContext
+}
+
+type restoreContext struct {
+	source        string
+	selectedEpoch string
+	anchor        string
+	txid          string
+	attempts      []string
 }
 
 func (s *Supervisor) now() time.Time {
@@ -429,13 +439,13 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 
 	vol, err := s.Deps.FS.Open(ctx, s.Spec)
 	if err != nil {
-		s.restoreFailure("other", "opened", s.Spec.FenceEpoch, time.Time{}, err)
+		s.restoreFailure("other", s.restoreContext, err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "open restored metadata: %s", err)
 	}
 	s.vol = vol
 
 	if err := vol.IntegrityCheck(ctx); err != nil {
-		s.restoreFailure("integrity", "opened", s.Spec.FenceEpoch, time.Time{}, err)
+		s.restoreFailure("integrity", s.restoreContext, err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreIntegrity, false, "metadata integrity: %s", err)
 	}
 	if err := s.identityMatches(ctx); err != nil {
@@ -787,6 +797,7 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	err := s.Deps.Replicator.Restore(ctx, source, RestoreOptions{TXID: txid, Timestamp: anchor})
 	switch {
 	case err == nil:
+		s.restoreContext = s.newRestoreContext(sourceKind, from, anchor, txid)
 		if s.restoredUnclean {
 			s.log("unclean_generation", "error", ErrCodeRestoredToBarrier,
 				"restored_to", anchor, "repair", "pending")
@@ -795,10 +806,10 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	case errors.Is(err, ErrReplicaEmpty):
 		return s.formatFirstBoot(ctx)
 	case errors.Is(err, ErrReplicaIntegrity):
-		s.restoreFailure("integrity", sourceKind, from, anchor, err)
+		s.restoreFailure("integrity", s.newRestoreContext(sourceKind, from, anchor, txid), err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreIntegrity, false, "restore metadata replica: %s", err)
 	default:
-		s.restoreFailure("other", sourceKind, from, anchor, err)
+		s.restoreFailure("other", s.newRestoreContext(sourceKind, from, anchor, txid), err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "restore metadata replica: %s", err)
 	}
 }
@@ -806,26 +817,35 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 // restoreFailure writes one bounded event to the worker logger. The CSI plugin
 // follows that logger to its own stderr, which is the retained Loki stream.
 // Do not add command output, paths, endpoint names, credentials, or object keys.
-func (s *Supervisor) restoreFailure(reason, source string, selectedEpoch int64, anchor time.Time, err error) {
-	attempts := []string{"unknown"}
+func (s *Supervisor) newRestoreContext(source string, selectedEpoch int64, anchor time.Time, txid string) restoreContext {
+	ctx := restoreContext{source: source, selectedEpoch: "unknown", anchor: "none", txid: txid, attempts: []string{"unknown"}}
+	if source == "durable_point" && selectedEpoch > 0 {
+		ctx.selectedEpoch = strconv.FormatInt(selectedEpoch, 10)
+	}
+	if !anchor.IsZero() {
+		ctx.anchor = anchor.UTC().Format(time.RFC3339Nano)
+	}
+	if r, ok := s.Deps.Replicator.(interface{ RestoreAttempts() []string }); ok && len(r.RestoreAttempts()) > 0 {
+		ctx.attempts = r.RestoreAttempts()
+	}
+	return ctx
+}
+
+func (s *Supervisor) restoreFailure(reason string, ctx restoreContext, err error) {
 	var restoreErr *RestoreFailure
 	if errors.As(err, &restoreErr) && len(restoreErr.Attempts) > 0 {
-		attempts = restoreErr.Attempts
-	}
-	anchorValue := "none"
-	if !anchor.IsZero() {
-		anchorValue = anchor.UTC().Format(time.RFC3339Nano)
+		ctx.attempts = restoreErr.Attempts
 	}
 	s.log("restore_failure",
 		"volume", s.Spec.StorageVolumeID,
 		"current_epoch", s.Spec.FenceEpoch,
-		"selected_epoch", selectedEpoch,
-		"source", source,
-		"anchor", anchorValue,
-		"attempt_chain", attempts,
+		"selected_epoch", ctx.selectedEpoch,
+		"source", ctx.source,
+		"anchor", ctx.anchor,
+		"durable_txid", ctx.txid,
+		"attempt_chain", ctx.attempts,
 		"reason", reason,
-		"detail", reason,
-		"litestream_version", "v0.5.17")
+		"litestream_version", "configured_pinned_v0.5.17")
 }
 
 // formatFirstBoot is the only path that creates a filesystem, and it is
