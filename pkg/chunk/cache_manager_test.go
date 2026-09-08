@@ -70,6 +70,10 @@ func toFloat64(c prometheus.Collector) float64 {
 
 func TestMetrics(t *testing.T) {
 	conf := testConf()
+	// The assertions below need the disk cache to accept the block and the
+	// staged file; with the default FreeSpace it accepts neither on a host
+	// under 10% free (PLO-412).
+	skipIfHostDiskIsTooFull(t, conf.CacheDir)
 	defer os.RemoveAll(conf.CacheDir)
 	m := newCacheManager(&conf, nil, nil)
 	metrics := m.(*cacheManager).metrics

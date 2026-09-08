@@ -127,6 +127,11 @@ test.plori.meta:
 # PLORI_TEST_META_URL and PLORI_TEST_BLOB_URL are set; test.plori.backup is the
 # step that sets them.
 test.plori.unit:
+# PLO-412: a disk cache built with the default FreeSpace keeps 10% of the
+# filesystem free and holds nothing below that, so the tests that need it to
+# accept data skip themselves. Print the ratio this host has, so a run with
+# those skips in it says why.
+	@df -Pk "$${TMPDIR:-/tmp}" | awk 'NR==2 {printf "disk cache tmp free ratio: %.1f%% of %s\n", 100*$$4/$$2, $$6}'
 	$(PLORI_CGO) go test -count=1 -timeout 20m \
 		-tags "$(PLORI_TAGS)" ./pkg/chunk/... ./pkg/vfs/... ./pkg/plori/...
 # PLO-322: the object-credential hygiene audit has to live in ./cmd, because the

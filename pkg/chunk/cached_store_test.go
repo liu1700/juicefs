@@ -354,6 +354,10 @@ func newDurabilityTestStore(t *testing.T, blob object.ObjectStorage) ChunkStore 
 	t.Helper()
 	config := defaultConf
 	config.CacheDir = t.TempDir()
+	// Every test on this store asserts against a block the writeback cache is
+	// holding, and a disk cache with the default FreeSpace stages nothing on a
+	// host under 10% free (PLO-412).
+	skipIfHostDiskIsTooFull(t, config.CacheDir)
 	config.Writeback = true
 	config.WritebackThresholdSize = config.BlockSize + 1
 	config.UploadDelay = time.Hour
