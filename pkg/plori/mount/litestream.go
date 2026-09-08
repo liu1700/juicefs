@@ -101,8 +101,9 @@ type Litestream struct {
 	// which is what the tests that do not assert on it want.
 	Log func(event string, kv ...any)
 
-	cmd  *exec.Cmd
-	done chan error
+	cmd                 *exec.Cmd
+	done                chan error
+	lastRestoreAttempts []string
 
 	spec *MountSpec
 	opts MountOptions
@@ -111,6 +112,24 @@ type Litestream struct {
 // ErrReplicaEmpty means the metadata prefix holds no restorable generation.
 // It is the first-boot signal, not a failure.
 var ErrReplicaEmpty = errors.New("metadata replica is empty")
+
+// ErrReplicaIntegrity is the bounded diagnostic emitted by the pinned
+// Litestream v0.5.17 restore path when its requested full SQLite check fails.
+// It is deliberately narrower than a substring such as "integrity": other
+// command failures remain unknown to the caller rather than guessed at.
+var ErrReplicaIntegrity = errors.New("metadata replica failed Litestream integrity check")
+
+const litestreamIntegrityDiagnostic = "post-restore integrity check:"
+
+// RestoreFailure retains only the ordered modes an attempted restore used.
+// Its underlying command error is deliberately not a logging contract.
+type RestoreFailure struct {
+	Err      error
+	Attempts []string
+}
+
+func (e *RestoreFailure) Error() string { return e.Err.Error() }
+func (e *RestoreFailure) Unwrap() error { return e.Err }
 
 // litestreamConfig is the subset of the v0.5.17 config schema the worker
 // writes. It is generated rather than templated so every knob is a typed
@@ -280,14 +299,23 @@ func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, opt Resto
 	}
 	defer os.Remove(l.restoreConfigPath())
 
+	attempts := []string{"latest"}
+	if opt.TXID != "" {
+		attempts = []string{"txid"}
+	} else if !opt.Timestamp.IsZero() {
+		attempts = []string{"timestamp"}
+	}
 	err := l.restoreAt(ctx, opt.TXID, opt.Timestamp)
 	if err != nil && opt.TXID != "" && !opt.Timestamp.IsZero() && strings.Contains(err.Error(), errTxUnreachable) {
 		l.logf("restore_txid_unreachable", "txid", opt.TXID, "falling_back_to", opt.Timestamp.UTC().Format(time.RFC3339Nano))
+		attempts = append(attempts, "timestamp")
 		err = l.restoreAt(ctx, "", opt.Timestamp)
 	}
 	if err != nil {
-		return err
+		l.lastRestoreAttempts = append([]string(nil), attempts...)
+		return &RestoreFailure{Err: err, Attempts: attempts}
 	}
+	l.lastRestoreAttempts = append([]string(nil), attempts...)
 	if _, err := os.Stat(l.DBPath); err != nil {
 		if os.IsNotExist(err) {
 			return ErrReplicaEmpty
@@ -297,9 +325,17 @@ func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, opt Resto
 	return nil
 }
 
+// RestoreAttempts is the ordered chain from the most recent restore call.
+func (l *Litestream) RestoreAttempts() []string {
+	return append([]string(nil), l.lastRestoreAttempts...)
+}
+
 // restoreAt runs one `litestream restore` with at most one anchor.
 func (l *Litestream) restoreAt(ctx context.Context, txid string, timestamp time.Time) error {
 	if out, err := l.run(ctx, restoreArgs(l.restoreConfigPath(), l.DBPath, l.DBPath, txid, timestamp)...); err != nil {
+		if strings.Contains(out, litestreamIntegrityDiagnostic) {
+			return fmt.Errorf("litestream restore: %w", ErrReplicaIntegrity)
+		}
 		return fmt.Errorf("litestream restore: %w: %s", err, lastLine(out))
 	}
 	return nil

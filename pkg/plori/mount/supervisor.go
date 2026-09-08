@@ -27,6 +27,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -134,7 +135,16 @@ type Supervisor struct {
 	// replRestarted records that the one repair attempt for the current
 	// failure has been made, so a replicator that cannot be revived is not
 	// restarted every health tick until the stop trips.
-	replRestarted bool
+	replRestarted  bool
+	restoreContext restoreContext
+}
+
+type restoreContext struct {
+	source        string
+	selectedEpoch string
+	anchor        string
+	txid          string
+	attempts      []string
 }
 
 func (s *Supervisor) now() time.Time {
@@ -429,11 +439,13 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 
 	vol, err := s.Deps.FS.Open(ctx, s.Spec)
 	if err != nil {
+		s.restoreFailure("other", s.restoreContext, err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "open restored metadata: %s", err)
 	}
 	s.vol = vol
 
 	if err := vol.IntegrityCheck(ctx); err != nil {
+		s.restoreFailure("integrity", s.restoreContext, err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreIntegrity, false, "metadata integrity: %s", err)
 	}
 	if err := s.identityMatches(ctx); err != nil {
@@ -685,10 +697,11 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// With neither, the restore takes the replica's latest transaction, which
 	// is what every mount did before the server carried a point (PLO-391).
 	var (
-		anchor time.Time
-		txid   string
-		source string
-		from   int64
+		anchor     time.Time
+		txid       string
+		source     string
+		sourceKind = "unknown"
+		from       int64
 	)
 	if dp := s.Spec.DurablePoint; dp != nil {
 		anchor, txid, from, source = dp.DurableAt, dp.ReplicaTxID, dp.FenceEpoch, s.Spec.RestoreFromPrefix
@@ -763,6 +776,7 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// epoch N and died before posting its first durable point comes back at N,
 	// and `g<N>/` is by then the newest history there is (PLO-323 F-6c).
 	if source != "" {
+		sourceKind = "durable_point"
 		s.log("restore_source", "prefix", source, "discovery", "durable_point")
 	} else {
 		var err error
@@ -771,6 +785,7 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 				"find the metadata generation to restore from: %s", err)
 		}
 		if source != "" {
+			sourceKind = "list"
 			s.log("restore_source", "prefix", source, "discovery", "list")
 		}
 	}
@@ -782,6 +797,7 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	err := s.Deps.Replicator.Restore(ctx, source, RestoreOptions{TXID: txid, Timestamp: anchor})
 	switch {
 	case err == nil:
+		s.restoreContext = s.newRestoreContext(sourceKind, from, anchor, txid)
 		if s.restoredUnclean {
 			s.log("unclean_generation", "error", ErrCodeRestoredToBarrier,
 				"restored_to", anchor, "repair", "pending")
@@ -789,9 +805,48 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 		return nil
 	case errors.Is(err, ErrReplicaEmpty):
 		return s.formatFirstBoot(ctx)
+	case errors.Is(err, ErrReplicaIntegrity):
+		s.restoreFailure("integrity", s.newRestoreContext(sourceKind, from, anchor, txid), err)
+		return fatalf(CodeRestoreFailed, ErrCodeRestoreIntegrity, false, "restore metadata replica: %s", err)
 	default:
+		s.restoreFailure("other", s.newRestoreContext(sourceKind, from, anchor, txid), err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "restore metadata replica: %s", err)
 	}
+}
+
+// newRestoreContext retains only known restore inputs and attempted modes.
+func (s *Supervisor) newRestoreContext(source string, selectedEpoch int64, anchor time.Time, txid string) restoreContext {
+	ctx := restoreContext{source: source, selectedEpoch: "unknown", anchor: "none", txid: txid, attempts: []string{"unknown"}}
+	if source == "durable_point" && selectedEpoch > 0 {
+		ctx.selectedEpoch = strconv.FormatInt(selectedEpoch, 10)
+	}
+	if !anchor.IsZero() {
+		ctx.anchor = anchor.UTC().Format(time.RFC3339Nano)
+	}
+	if r, ok := s.Deps.Replicator.(interface{ RestoreAttempts() []string }); ok {
+		if attempts := r.RestoreAttempts(); len(attempts) > 0 {
+			ctx.attempts = attempts
+		}
+	}
+	return ctx
+}
+
+// restoreFailure sends safe restore facts through the existing worker log collector.
+func (s *Supervisor) restoreFailure(reason string, ctx restoreContext, err error) {
+	var restoreErr *RestoreFailure
+	if errors.As(err, &restoreErr) && len(restoreErr.Attempts) > 0 {
+		ctx.attempts = restoreErr.Attempts
+	}
+	s.log("restore_failure",
+		"volume", s.Spec.StorageVolumeID,
+		"current_epoch", s.Spec.FenceEpoch,
+		"selected_epoch", ctx.selectedEpoch,
+		"source", ctx.source,
+		"anchor", ctx.anchor,
+		"durable_txid", ctx.txid,
+		"attempt_chain", ctx.attempts,
+		"reason", reason,
+		"litestream_version", "configured_pinned_v0.5.17")
 }
 
 // formatFirstBoot is the only path that creates a filesystem, and it is

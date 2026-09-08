@@ -23,9 +23,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -472,6 +474,89 @@ func (r *fakeReplicator) TxID(context.Context) (string, error) {
 func (r *fakeReplicator) Stop(context.Context) error  { r.record("stop"); return nil }
 func (r *fakeReplicator) Abort(context.Context) error { r.record("abort"); return nil }
 
+func TestSupervisorPreservesLitestreamIntegrityFailure(t *testing.T) {
+	sup := newSup(t, bootstrapSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{},
+		&fakeReplicator{restoreErr: ErrReplicaIntegrity}, &fakeFencer{})
+	err := sup.restoreOrFormat(context.Background())
+	f := Classify(err)
+	if f.Exit != CodeRestoreFailed || f.ErrCode != ErrCodeRestoreIntegrity {
+		t.Fatalf("restore failure = exit %d / %s, want %d / %s (%v)", f.Exit, f.ErrCode, CodeRestoreFailed, ErrCodeRestoreIntegrity, err)
+	}
+}
+
+func TestRestoreFailureEventIsBoundedAndRedacted(t *testing.T) {
+	sup := newSup(t, bootstrapSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	var got map[string]any
+	sup.Deps.Log = func(event string, kv ...any) {
+		if event != "restore_failure" {
+			return
+		}
+		got = map[string]any{}
+		for i := 0; i+1 < len(kv); i += 2 {
+			got[kv[i].(string)] = kv[i+1]
+		}
+	}
+	sup.restoreFailure("integrity", restoreContext{source: "durable_point", selectedEpoch: "6",
+		anchor: "2026-09-08T12:00:00Z", txid: "0000000000000009", attempts: []string{"txid", "timestamp"}},
+		&RestoreFailure{Err: errors.New("s3://private-bucket/object-key?token=secret"), Attempts: []string{"txid", "timestamp"}})
+
+	if got == nil {
+		t.Fatal("restore_failure event was not emitted")
+	}
+	for key, want := range map[string]any{
+		"volume": "550e8400-e29b-41d4-a716-446655440000", "current_epoch": int64(3), "selected_epoch": "6",
+		"source": "durable_point", "anchor": "2026-09-08T12:00:00Z",
+		"durable_txid": "0000000000000009", "reason": "integrity", "litestream_version": "configured_pinned_v0.5.17",
+	} {
+		if value := got[key]; value != want {
+			t.Errorf("%s = %v, want %v", key, value, want)
+		}
+	}
+	if chain, ok := got["attempt_chain"].([]string); !ok || strings.Join(chain, ",") != "txid,timestamp" {
+		t.Errorf("attempt_chain = %#v, want ordered txid,timestamp", got["attempt_chain"])
+	}
+	for _, value := range got {
+		if strings.Contains(fmt.Sprint(value), "private-bucket") || strings.Contains(fmt.Sprint(value), "secret") {
+			t.Errorf("restore_failure leaked raw error data: %#v", got)
+		}
+	}
+}
+
+func TestRestoreFailureEventPreservesActualFallbackChain(t *testing.T) {
+	bin, _ := fakeLitestream(t, `case "$*" in
+  *-txid*) echo "ERROR no matching backup files available" >&2; exit 1;;
+esac
+echo "ERROR post-restore integrity check: integrity check failed: malformed" >&2
+exit 1`)
+	ls := newTestLitestream(t, bin)
+	anchor := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	err := ls.Restore(context.Background(), "agents-meta/v1/g2/", RestoreOptions{TXID: "0000000000000009", Timestamp: anchor})
+	if !errors.Is(err, ErrReplicaIntegrity) {
+		t.Fatalf("Restore error = %v, want integrity failure", err)
+	}
+	sup := newSup(t, bootstrapSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{restoreErr: err}, &fakeFencer{})
+	var events []map[string]any
+	sup.Deps.Log = func(event string, kv ...any) {
+		if event != "restore_failure" {
+			return
+		}
+		line := map[string]any{}
+		for i := 0; i+1 < len(kv); i += 2 {
+			line[kv[i].(string)] = kv[i+1]
+		}
+		events = append(events, line)
+	}
+	if got := Classify(sup.restoreOrFormat(context.Background())); got.ErrCode != ErrCodeRestoreIntegrity {
+		t.Fatalf("terminal error = %s, want %s", got.ErrCode, ErrCodeRestoreIntegrity)
+	}
+	if len(events) != 1 {
+		t.Fatalf("restore_failure events = %d, want one", len(events))
+	}
+	if chain, ok := events[0]["attempt_chain"].([]string); !ok || strings.Join(chain, ",") != "txid,timestamp" {
+		t.Fatalf("attempt_chain = %#v, want txid,timestamp", events[0]["attempt_chain"])
+	}
+}
+
 type fakeFencer struct {
 	err    error
 	prior  string
@@ -897,7 +982,10 @@ func TestLateRenewResponsePreservesFenceSemantics(t *testing.T) {
 			spec := testSpec()
 			spec.LeaseRenewInterval = Duration(50 * time.Millisecond)
 			spec.WriteStopMargin = Duration(time.Second)
-			spec.LeaseExpiresAt = time.Now().UTC().Add(1150 * time.Millisecond)
+			// Keep a 500 ms window before the deliberate late response. The old
+			// 150 ms window could be consumed by race-instrumented startup, so the
+			// deadline fence won before this fixture sent its terminal response.
+			spec.LeaseExpiresAt = time.Now().UTC().Add(1500 * time.Millisecond)
 			sup := newSup(t, spec, &fakeFS{vol: vol}, base, &fakeReplicator{}, &fakeFencer{})
 			cp := lateRenewCP{fakeCP: base, response: LeaseResponse{
 				StorageVolumeID: spec.StorageVolumeID, FenceEpoch: spec.FenceEpoch,
