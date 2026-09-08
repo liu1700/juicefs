@@ -112,6 +112,14 @@ type Litestream struct {
 // It is the first-boot signal, not a failure.
 var ErrReplicaEmpty = errors.New("metadata replica is empty")
 
+// ErrReplicaIntegrity is the bounded diagnostic emitted by the pinned
+// Litestream v0.5.17 restore path when its requested full SQLite check fails.
+// It is deliberately narrower than a substring such as "integrity": other
+// command failures remain unknown to the caller rather than guessed at.
+var ErrReplicaIntegrity = errors.New("metadata replica failed Litestream integrity check")
+
+const litestreamIntegrityDiagnostic = "post-restore integrity check:"
+
 // litestreamConfig is the subset of the v0.5.17 config schema the worker
 // writes. It is generated rather than templated so every knob is a typed
 // field, and it is written 0600 into the state directory, which the Agent
@@ -300,6 +308,9 @@ func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, opt Resto
 // restoreAt runs one `litestream restore` with at most one anchor.
 func (l *Litestream) restoreAt(ctx context.Context, txid string, timestamp time.Time) error {
 	if out, err := l.run(ctx, restoreArgs(l.restoreConfigPath(), l.DBPath, l.DBPath, txid, timestamp)...); err != nil {
+		if strings.Contains(out, litestreamIntegrityDiagnostic) {
+			return fmt.Errorf("litestream restore: %w", ErrReplicaIntegrity)
+		}
 		return fmt.Errorf("litestream restore: %w: %s", err, lastLine(out))
 	}
 	return nil

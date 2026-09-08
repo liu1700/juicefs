@@ -789,6 +789,8 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 		return nil
 	case errors.Is(err, ErrReplicaEmpty):
 		return s.formatFirstBoot(ctx)
+	case errors.Is(err, ErrReplicaIntegrity):
+		return fatalf(CodeRestoreFailed, ErrCodeRestoreIntegrity, false, "restore metadata replica: %s", err)
 	default:
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "restore metadata replica: %s", err)
 	}

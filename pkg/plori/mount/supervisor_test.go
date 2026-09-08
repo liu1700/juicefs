@@ -472,6 +472,16 @@ func (r *fakeReplicator) TxID(context.Context) (string, error) {
 func (r *fakeReplicator) Stop(context.Context) error  { r.record("stop"); return nil }
 func (r *fakeReplicator) Abort(context.Context) error { r.record("abort"); return nil }
 
+func TestSupervisorPreservesLitestreamIntegrityFailure(t *testing.T) {
+	sup := newSup(t, bootstrapSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{},
+		&fakeReplicator{restoreErr: ErrReplicaIntegrity}, &fakeFencer{})
+	err := sup.restoreOrFormat(context.Background())
+	f := Classify(err)
+	if f.Exit != CodeRestoreFailed || f.ErrCode != ErrCodeRestoreIntegrity {
+		t.Fatalf("restore failure = exit %d / %s, want %d / %s (%v)", f.Exit, f.ErrCode, CodeRestoreFailed, ErrCodeRestoreIntegrity, err)
+	}
+}
+
 type fakeFencer struct {
 	err    error
 	prior  string

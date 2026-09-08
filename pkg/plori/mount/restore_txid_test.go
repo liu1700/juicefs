@@ -22,6 +22,7 @@ package mount
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -254,6 +255,29 @@ func TestRestoreDoesNotRetryOtherFailures(t *testing.T) {
 	}
 	if got := calls(t, argvLog); len(got) != 1 {
 		t.Errorf("want exactly one attempt, got %v", got)
+	}
+}
+
+func TestRestoreClassifiesPinnedLitestreamIntegrityFailure(t *testing.T) {
+	bin, argvLog := fakeLitestream(t, `echo "ERROR post-restore integrity check: integrity check failed: malformed database schema" >&2; exit 1`)
+	ls := newTestLitestream(t, bin)
+
+	err := ls.Restore(context.Background(), "agents-meta/v1/g2/", RestoreOptions{})
+	if !errors.Is(err, ErrReplicaIntegrity) {
+		t.Fatalf("Restore error = %v, want ErrReplicaIntegrity", err)
+	}
+	if got := calls(t, argvLog); len(got) != 1 {
+		t.Fatalf("want one restore attempt, got %v", got)
+	}
+}
+
+func TestRestoreLeavesUnrecognisedCommandFailureUntyped(t *testing.T) {
+	bin, _ := fakeLitestream(t, `echo "ERROR remote refused restore" >&2; exit 1`)
+	ls := newTestLitestream(t, bin)
+
+	err := ls.Restore(context.Background(), "agents-meta/v1/g2/", RestoreOptions{})
+	if err == nil || errors.Is(err, ErrReplicaIntegrity) {
+		t.Fatalf("Restore error = %v, want an untyped command failure", err)
 	}
 }
 
