@@ -28,12 +28,59 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/viki-org/dnscache"
 )
 
-var resolver = dnscache.New(time.Minute)
+var resolver = &objectResolver{lookup: net.DefaultResolver.LookupIP}
+
+// Cache only answers usable by this client's address-family policy. A partial
+// search-path answer must not poison every storage retry in this process.
+type objectResolver struct {
+	lookup func(context.Context, string, string) ([]net.IP, error)
+	cache  sync.Map
+}
+
+type objectDNSAnswer struct {
+	ips     []net.IP
+	expires time.Time
+}
+
+func (r *objectResolver) fetch(ctx context.Context, host string, ipv6 bool) ([]net.IP, error) {
+	network := "ip4"
+	if ipv6 {
+		network = "ip"
+	}
+	key := network + ":" + host
+	if v, ok := r.cache.Load(key); ok {
+		answer := v.(objectDNSAnswer)
+		if time.Now().Before(answer.expires) {
+			return answer.ips, nil
+		}
+		r.cache.Delete(key)
+	}
+	// Resolve both families to preserve search-name behavior. In IPv4-only mode
+	// an AAAA-only answer gets one fresh absolute-name lookup, bypassing ndots
+	// and cached search-qualified responses without changing the HTTP/TLS host.
+	ips, err := r.lookup(ctx, "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	primaries, fallbacks := dialFamilies(ips, ipv6)
+	if len(primaries) == 0 && len(fallbacks) == 0 && !ipv6 && !strings.HasSuffix(host, ".") {
+		ips, err = r.lookup(ctx, "ip4", host+".")
+		if err != nil {
+			return nil, err
+		}
+		primaries, fallbacks = dialFamilies(ips, ipv6)
+	}
+	if len(primaries) == 0 && len(fallbacks) == 0 {
+		return nil, &net.DNSError{Err: "no IPv4 address found", Name: host, IsNotFound: true}
+	}
+	r.cache.Store(key, objectDNSAnswer{ips: ips, expires: time.Now().Add(time.Minute)})
+	return ips, nil
+}
+
 var httpClient *http.Client
 
 // Dialing IPv6 as the primary address family and IPv4 as a fallback costs 300 milliseconds on
@@ -207,7 +254,7 @@ func init() {
 				if ip := net.ParseIP(host); ip != nil {
 					return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
 				}
-				ips, err := resolver.Fetch(host)
+				ips, err := resolver.fetch(ctx, host, enableIPv6)
 				if err != nil {
 					return nil, err
 				}

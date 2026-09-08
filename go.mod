@@ -84,7 +84,6 @@ require (
 	github.com/twmb/murmur3 v1.1.8
 	github.com/urfave/cli/v2 v2.19.3
 	github.com/vbauerster/mpb/v7 v7.0.3
-	github.com/viki-org/dnscache v0.0.0-20130720023526-c70c1f23c5d8
 	github.com/vimeo/go-util v1.4.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/vmware/go-nfs-client v0.0.0-20190605212624-d43b92724c1b
