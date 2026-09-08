@@ -23,9 +23,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -479,6 +481,44 @@ func TestSupervisorPreservesLitestreamIntegrityFailure(t *testing.T) {
 	f := Classify(err)
 	if f.Exit != CodeRestoreFailed || f.ErrCode != ErrCodeRestoreIntegrity {
 		t.Fatalf("restore failure = exit %d / %s, want %d / %s (%v)", f.Exit, f.ErrCode, CodeRestoreFailed, ErrCodeRestoreIntegrity, err)
+	}
+}
+
+func TestRestoreFailureEventIsBoundedAndRedacted(t *testing.T) {
+	sup := newSup(t, bootstrapSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	var got map[string]any
+	sup.Deps.Log = func(event string, kv ...any) {
+		if event != "restore_failure" {
+			return
+		}
+		got = map[string]any{}
+		for i := 0; i+1 < len(kv); i += 2 {
+			got[kv[i].(string)] = kv[i+1]
+		}
+	}
+	sup.restoreFailure("integrity", "durable_point", 6,
+		time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC),
+		&RestoreFailure{Err: errors.New("s3://private-bucket/object-key?token=secret"), Attempts: []string{"txid", "timestamp"}})
+
+	if got == nil {
+		t.Fatal("restore_failure event was not emitted")
+	}
+	for key, want := range map[string]any{
+		"volume": "550e8400-e29b-41d4-a716-446655440000", "current_epoch": int64(3), "selected_epoch": int64(6),
+		"source": "durable_point", "anchor": "2026-09-08T12:00:00Z",
+		"reason": "integrity", "detail": "integrity", "litestream_version": "v0.5.17",
+	} {
+		if value := got[key]; value != want {
+			t.Errorf("%s = %v, want %v", key, value, want)
+		}
+	}
+	if chain, ok := got["attempt_chain"].([]string); !ok || strings.Join(chain, ",") != "txid,timestamp" {
+		t.Errorf("attempt_chain = %#v, want ordered txid,timestamp", got["attempt_chain"])
+	}
+	for _, value := range got {
+		if strings.Contains(fmt.Sprint(value), "private-bucket") || strings.Contains(fmt.Sprint(value), "secret") {
+			t.Errorf("restore_failure leaked raw error data: %#v", got)
+		}
 	}
 }
 

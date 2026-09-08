@@ -429,11 +429,13 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 
 	vol, err := s.Deps.FS.Open(ctx, s.Spec)
 	if err != nil {
+		s.restoreFailure("other", "opened", s.Spec.FenceEpoch, time.Time{}, err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "open restored metadata: %s", err)
 	}
 	s.vol = vol
 
 	if err := vol.IntegrityCheck(ctx); err != nil {
+		s.restoreFailure("integrity", "opened", s.Spec.FenceEpoch, time.Time{}, err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreIntegrity, false, "metadata integrity: %s", err)
 	}
 	if err := s.identityMatches(ctx); err != nil {
@@ -685,10 +687,11 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// With neither, the restore takes the replica's latest transaction, which
 	// is what every mount did before the server carried a point (PLO-391).
 	var (
-		anchor time.Time
-		txid   string
-		source string
-		from   int64
+		anchor     time.Time
+		txid       string
+		source     string
+		sourceKind = "unknown"
+		from       int64
 	)
 	if dp := s.Spec.DurablePoint; dp != nil {
 		anchor, txid, from, source = dp.DurableAt, dp.ReplicaTxID, dp.FenceEpoch, s.Spec.RestoreFromPrefix
@@ -763,6 +766,7 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	// epoch N and died before posting its first durable point comes back at N,
 	// and `g<N>/` is by then the newest history there is (PLO-323 F-6c).
 	if source != "" {
+		sourceKind = "durable_point"
 		s.log("restore_source", "prefix", source, "discovery", "durable_point")
 	} else {
 		var err error
@@ -771,6 +775,7 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 				"find the metadata generation to restore from: %s", err)
 		}
 		if source != "" {
+			sourceKind = "list"
 			s.log("restore_source", "prefix", source, "discovery", "list")
 		}
 	}
@@ -790,10 +795,37 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	case errors.Is(err, ErrReplicaEmpty):
 		return s.formatFirstBoot(ctx)
 	case errors.Is(err, ErrReplicaIntegrity):
+		s.restoreFailure("integrity", sourceKind, from, anchor, err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreIntegrity, false, "restore metadata replica: %s", err)
 	default:
+		s.restoreFailure("other", sourceKind, from, anchor, err)
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "restore metadata replica: %s", err)
 	}
+}
+
+// restoreFailure writes one bounded event to the worker logger. The CSI plugin
+// follows that logger to its own stderr, which is the retained Loki stream.
+// Do not add command output, paths, endpoint names, credentials, or object keys.
+func (s *Supervisor) restoreFailure(reason, source string, selectedEpoch int64, anchor time.Time, err error) {
+	attempts := []string{"unknown"}
+	var restoreErr *RestoreFailure
+	if errors.As(err, &restoreErr) && len(restoreErr.Attempts) > 0 {
+		attempts = restoreErr.Attempts
+	}
+	anchorValue := "none"
+	if !anchor.IsZero() {
+		anchorValue = anchor.UTC().Format(time.RFC3339Nano)
+	}
+	s.log("restore_failure",
+		"volume", s.Spec.StorageVolumeID,
+		"current_epoch", s.Spec.FenceEpoch,
+		"selected_epoch", selectedEpoch,
+		"source", source,
+		"anchor", anchorValue,
+		"attempt_chain", attempts,
+		"reason", reason,
+		"detail", reason,
+		"litestream_version", "v0.5.17")
 }
 
 // formatFirstBoot is the only path that creates a filesystem, and it is

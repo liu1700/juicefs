@@ -120,6 +120,16 @@ var ErrReplicaIntegrity = errors.New("metadata replica failed Litestream integri
 
 const litestreamIntegrityDiagnostic = "post-restore integrity check:"
 
+// RestoreFailure retains only the ordered modes an attempted restore used.
+// Its underlying command error is deliberately not a logging contract.
+type RestoreFailure struct {
+	Err      error
+	Attempts []string
+}
+
+func (e *RestoreFailure) Error() string { return e.Err.Error() }
+func (e *RestoreFailure) Unwrap() error { return e.Err }
+
 // litestreamConfig is the subset of the v0.5.17 config schema the worker
 // writes. It is generated rather than templated so every knob is a typed
 // field, and it is written 0600 into the state directory, which the Agent
@@ -288,13 +298,20 @@ func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, opt Resto
 	}
 	defer os.Remove(l.restoreConfigPath())
 
+	attempts := []string{"latest"}
+	if opt.TXID != "" {
+		attempts = []string{"txid"}
+	} else if !opt.Timestamp.IsZero() {
+		attempts = []string{"timestamp"}
+	}
 	err := l.restoreAt(ctx, opt.TXID, opt.Timestamp)
 	if err != nil && opt.TXID != "" && !opt.Timestamp.IsZero() && strings.Contains(err.Error(), errTxUnreachable) {
 		l.logf("restore_txid_unreachable", "txid", opt.TXID, "falling_back_to", opt.Timestamp.UTC().Format(time.RFC3339Nano))
+		attempts = append(attempts, "timestamp")
 		err = l.restoreAt(ctx, "", opt.Timestamp)
 	}
 	if err != nil {
-		return err
+		return &RestoreFailure{Err: err, Attempts: attempts}
 	}
 	if _, err := os.Stat(l.DBPath); err != nil {
 		if os.IsNotExist(err) {
