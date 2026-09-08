@@ -814,9 +814,7 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	}
 }
 
-// restoreFailure writes one bounded event to the worker logger. The CSI plugin
-// follows that logger to its own stderr, which is the retained Loki stream.
-// Do not add command output, paths, endpoint names, credentials, or object keys.
+// newRestoreContext retains only known restore inputs and attempted modes.
 func (s *Supervisor) newRestoreContext(source string, selectedEpoch int64, anchor time.Time, txid string) restoreContext {
 	ctx := restoreContext{source: source, selectedEpoch: "unknown", anchor: "none", txid: txid, attempts: []string{"unknown"}}
 	if source == "durable_point" && selectedEpoch > 0 {
@@ -825,12 +823,15 @@ func (s *Supervisor) newRestoreContext(source string, selectedEpoch int64, ancho
 	if !anchor.IsZero() {
 		ctx.anchor = anchor.UTC().Format(time.RFC3339Nano)
 	}
-	if r, ok := s.Deps.Replicator.(interface{ RestoreAttempts() []string }); ok && len(r.RestoreAttempts()) > 0 {
-		ctx.attempts = r.RestoreAttempts()
+	if r, ok := s.Deps.Replicator.(interface{ RestoreAttempts() []string }); ok {
+		if attempts := r.RestoreAttempts(); len(attempts) > 0 {
+			ctx.attempts = attempts
+		}
 	}
 	return ctx
 }
 
+// restoreFailure sends safe restore facts through the existing worker log collector.
 func (s *Supervisor) restoreFailure(reason string, ctx restoreContext, err error) {
 	var restoreErr *RestoreFailure
 	if errors.As(err, &restoreErr) && len(restoreErr.Attempts) > 0 {
