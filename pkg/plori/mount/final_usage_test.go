@@ -127,3 +127,90 @@ func TestAFailedPreCloseUsageReadPostsNoFinalReport(t *testing.T) {
 		t.Error("a failed usage reading cost the stop its clean marker")
 	}
 }
+
+// PLO-498. The final usage figure went to the control-plane and health.json
+// kept whatever the last periodic loop iteration had read, so the file an
+// operator (and the CSI plugin) reads after a stop disagreed with the report
+// the volume's usage was billed from. The stop now republishes health.json from
+// the same snapshot it posted.
+
+// unmountingVolume answers Usage with one figure while the mount is serving and
+// another once Unmount has run. The ordered stop takes its final snapshot
+// between the unmount and the close, so the two figures separate the final
+// reading from every reading the periodic loop took.
+type unmountingVolume struct {
+	*fakeVolume
+	unmounted bool
+	after     Usage
+}
+
+func newUnmountingVolume() *unmountingVolume {
+	return &unmountingVolume{fakeVolume: healthyVolume()}
+}
+
+func (v *unmountingVolume) Unmount(ctx context.Context) error {
+	v.mu.Lock()
+	v.unmounted = true
+	v.mu.Unlock()
+	return v.fakeVolume.Unmount(ctx)
+}
+
+func (v *unmountingVolume) Usage(ctx context.Context, withTrash bool) (Usage, error) {
+	v.mu.Lock()
+	unmounted, after := v.unmounted, v.after
+	v.mu.Unlock()
+	if unmounted {
+		return after, nil
+	}
+	return v.fakeVolume.Usage(ctx, withTrash)
+}
+
+func TestHealthJSONEndsTheStopWithTheReportedUsage(t *testing.T) {
+	serving := Usage{Bytes: 4096, Inodes: 3}
+	final := Usage{Bytes: 81465344, Inodes: 1572}
+	vol := newUnmountingVolume()
+	vol.setUsage(serving, nil)
+	vol.after = final
+	cp := &fakeCP{}
+	sup := newCloseoutSup(t, testSpec(), vol, cp, &fakeReplicator{}, newSharedFencer())
+
+	f := sup.Run(context.Background(), stopAfter(120*time.Millisecond))
+	if f.Exit != CodeOK {
+		t.Fatalf("exit = %d (%v), want a clean stop", f.Exit, f.Err)
+	}
+	reported := cp.reportedUsages()
+	if len(reported) == 0 {
+		t.Fatal("a clean stop posted no final usage report")
+	}
+	last := reported[len(reported)-1]
+	if last.Bytes != final.Bytes || last.Inodes != final.Inodes {
+		t.Fatalf("final report = %d bytes / %d inodes, want %d / %d",
+			last.Bytes, last.Inodes, final.Bytes, final.Inodes)
+	}
+	h := readHealth(t, sup)
+	if h.UsedBytes != last.Bytes || h.UsedInodes != last.Inodes {
+		t.Errorf("health.json = %d bytes / %d inodes, final usage report = %d / %d: the file was not rewritten from the posted snapshot",
+			h.UsedBytes, h.UsedInodes, last.Bytes, last.Inodes)
+	}
+}
+
+// A stop whose final usage reading failed posts nothing, so there is no posted
+// snapshot to republish and health.json keeps the last figure the loop read.
+// The stop is still clean.
+func TestAFailedFinalUsageReadLeavesHealthAlone(t *testing.T) {
+	vol := newClosingVolume()
+	vol.setUsage(Usage{}, errors.New("metadata counters unavailable"))
+	cp := &fakeCP{}
+	sup := newCloseoutSup(t, testSpec(), vol, cp, &fakeReplicator{}, newSharedFencer())
+
+	f := sup.Run(context.Background(), stopAfter(120*time.Millisecond))
+	if f.Exit != CodeOK {
+		t.Fatalf("exit = %d (%v), want a clean stop", f.Exit, f.Err)
+	}
+	if got := cp.reportedUsages(); len(got) != 0 {
+		t.Fatalf("usage reports = %+v, want none", got)
+	}
+	if h := readHealth(t, sup); h.UsedBytes != 0 || h.UsedInodes != 0 {
+		t.Errorf("health.json = %d bytes / %d inodes, want the unchanged 0 / 0", h.UsedBytes, h.UsedInodes)
+	}
+}
