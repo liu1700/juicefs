@@ -2007,6 +2007,16 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 		}
 		if finalUsageOK {
 			s.postUsage(context.WithoutCancel(ctx), finalUsage)
+			// health.json must not end the stop disagreeing with the figure the
+			// control-plane was given (PLO-427). Every other writeHealth call
+			// is in the periodic loop, so before this the file kept whatever
+			// the last loop iteration read, which is older than the snapshot
+			// step 4 took. writeHealth reads the same cached snapshot
+			// usageTotals stored, so this republishes the file from the posted
+			// numbers rather than from a second reading, and it runs whether or
+			// not the POST itself succeeded — postUsage logs a failure and
+			// returns.
+			s.writeHealth()
 		}
 	}
 

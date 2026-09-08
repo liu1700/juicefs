@@ -53,13 +53,17 @@ var (
 )
 
 type pendingItem struct {
-	key       string
-	fpath     string    // full path of local file corresponding to the key
-	ts        time.Time // timestamp when this item is added
-	seq       uint64
-	size      uint64
-	failures  uint64
-	lastError string
+	key      string
+	fpath    string    // full path of local file corresponding to the key
+	ts       time.Time // timestamp when this item is added
+	seq      uint64
+	size     uint64
+	failures uint64
+	// lastError is the error value, not its text: the remote durability fence
+	// wraps it with %w so the supervisor can classify what stopped the upload
+	// (a full bucket, a rejected credential, a network failure) with errors.Is
+	// and errors.As instead of matching a string (PLO-458).
+	lastError error
 	uploading atomic.Bool
 	forced    atomic.Bool
 }
@@ -398,7 +402,12 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 		logger.Debugf("Upload %s: %s (try %d)", key, err, try+1)
 	}
 	if err != nil && try >= max {
-		err = fmt.Errorf("(max tries) upload block %s: %s (after %d tries)", key, err, try)
+		// %w, not %s: this is the one place every object-store failure passes
+		// through on its way to the pending item, and the fence's caller has to
+		// be able to tell them apart (PLO-458). The sibling "(cancelled)" case
+		// above keeps %s because its err is nil when the slice was cancelled
+		// before the first attempt.
+		err = fmt.Errorf("(max tries) upload block %s: %w (after %d tries)", key, err, try)
 	}
 	return err
 }
@@ -1255,9 +1264,10 @@ func (store *cachedStore) recordPendingError(item *pendingItem, err error) {
 	store.pendingMutex.Lock()
 	if store.pendingKeys[item.key] == item {
 		item.failures++
-		item.lastError = err.Error()
+		item.lastError = err
 		store.failedUploads++
-		store.lastUploadError = item.lastError
+		// DurabilityStatus.LastError is a JSON wire field, so this stays text.
+		store.lastUploadError = err.Error()
 		store.signalPendingLocked()
 	}
 	store.pendingMutex.Unlock()
@@ -1433,7 +1443,7 @@ func (store *cachedStore) RemoteDurability(ctx context.Context) (DurabilityStatu
 		}
 		if failed != nil {
 			status := store.durabilityStatusLocked(fence)
-			err := fmt.Errorf("remote durability fence %d failed for %s: %s", fence, failed.key, failed.lastError)
+			err := fmt.Errorf("remote durability fence %d failed for %s: %w", fence, failed.key, failed.lastError)
 			store.pendingMutex.Unlock()
 			return status, err
 		}
