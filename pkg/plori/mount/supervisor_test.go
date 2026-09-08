@@ -522,6 +522,41 @@ func TestRestoreFailureEventIsBoundedAndRedacted(t *testing.T) {
 	}
 }
 
+func TestRestoreFailureEventPreservesActualFallbackChain(t *testing.T) {
+	bin, _ := fakeLitestream(t, `case "$*" in
+  *-txid*) echo "ERROR no matching backup files available" >&2; exit 1;;
+esac
+echo "ERROR post-restore integrity check: integrity check failed: malformed" >&2
+exit 1`)
+	ls := newTestLitestream(t, bin)
+	anchor := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	err := ls.Restore(context.Background(), "agents-meta/v1/g2/", RestoreOptions{TXID: "0000000000000009", Timestamp: anchor})
+	if !errors.Is(err, ErrReplicaIntegrity) {
+		t.Fatalf("Restore error = %v, want integrity failure", err)
+	}
+	sup := newSup(t, bootstrapSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{restoreErr: err}, &fakeFencer{})
+	var events []map[string]any
+	sup.Deps.Log = func(event string, kv ...any) {
+		if event != "restore_failure" {
+			return
+		}
+		line := map[string]any{}
+		for i := 0; i+1 < len(kv); i += 2 {
+			line[kv[i].(string)] = kv[i+1]
+		}
+		events = append(events, line)
+	}
+	if got := Classify(sup.restoreOrFormat(context.Background())); got.ErrCode != ErrCodeRestoreIntegrity {
+		t.Fatalf("terminal error = %s, want %s", got.ErrCode, ErrCodeRestoreIntegrity)
+	}
+	if len(events) != 1 {
+		t.Fatalf("restore_failure events = %d, want one", len(events))
+	}
+	if chain, ok := events[0]["attempt_chain"].([]string); !ok || strings.Join(chain, ",") != "txid,timestamp" {
+		t.Fatalf("attempt_chain = %#v, want txid,timestamp", events[0]["attempt_chain"])
+	}
+}
+
 type fakeFencer struct {
 	err    error
 	prior  string
