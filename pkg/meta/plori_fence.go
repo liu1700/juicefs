@@ -20,6 +20,7 @@
 package meta
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"sync/atomic"
@@ -118,6 +119,23 @@ type ploriSessionCleaner interface {
 	doCleanStaleSession(sid uint64) error
 }
 
+// ploriFormatHolder reads the client's cached Format. Every engine that
+// satisfies ploriSessionCleaner embeds *baseMeta, so every engine the sweep can
+// drive also satisfies this.
+type ploriFormatHolder interface {
+	getFormat() *Format
+}
+
+// ErrPloriNoFormat is the sweep's refusal on a client whose Format was never
+// loaded. doCleanStaleSession reaches genLog, which reads getFormat().ChangeLog
+// (sql.go:1130), so without a Format the sweep panics instead of returning. A
+// panic exits 2, which is outside the plugin's exit-code table (64-70), so the
+// refusal the design intends would reach fuse-csi-node as an unclassified
+// crash. The sweep is a fail-closed gate, so it refuses with this error and the
+// supervisor turns it into exit 67 like any other purge failure
+// (pkg/plori/mount/supervisor.go:465-468).
+var ErrPloriNoFormat = errors.New("metadata client has no loaded format")
+
 // PloriPurgeAllSessions deletes every recorded client session, releasing the
 // POSIX locks and sustained inodes each one holds.
 //
@@ -130,10 +148,15 @@ type ploriSessionCleaner interface {
 //
 // It must be called BEFORE the caller opens its own session, and it fails
 // closed: a caller that cannot prove the sweep happened must refuse to mount.
+// It also requires a loaded Format and returns ErrPloriNoFormat without one.
 func PloriPurgeAllSessions(m Meta) (int, error) {
 	cleaner, ok := m.(ploriSessionCleaner)
 	if !ok {
 		return 0, fmt.Errorf("metadata engine %T cannot purge sessions", m)
+	}
+	holder, ok := cleaner.(ploriFormatHolder)
+	if !ok || holder.getFormat() == nil {
+		return 0, fmt.Errorf("%w: %T", ErrPloriNoFormat, m)
 	}
 	sessions, err := m.ListSessions()
 	if err != nil {

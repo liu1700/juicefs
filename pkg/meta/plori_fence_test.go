@@ -20,6 +20,7 @@
 package meta
 
 import (
+	"errors"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -40,12 +41,12 @@ import (
 // its only legitimate writer.
 //
 // The Load is not optional. PloriPurgeAllSessions reaches doCleanStaleSession,
-// which calls genLog, which dereferences the cached Format (sql.go:1131) — on a
-// client that never loaded it that is a nil dereference, not an error. The
-// production caller loads the Format inside FS.Open before the supervisor asks
-// for the sweep (cmd/plori_mount.go:277, supervisor.go:155 then :177), so the
-// order is right there; TestPloriPurgeAllSessionsNeedsALoadedFormat below pins
-// the precondition so nobody reorders it by accident.
+// which calls genLog, which reads the cached Format (sql.go:1130); a client
+// that never loaded it is refused with ErrPloriNoFormat. The production caller
+// loads the Format inside FS.Open before the supervisor asks for the sweep
+// (cmd/plori_mount.go:277, supervisor.go:155 then :177), so the order is right
+// there; TestPloriPurgeAllSessionsNeedsALoadedFormat below pins the
+// precondition so nobody reorders it by accident.
 func openRestoredMeta(t *testing.T, dbPath string) Meta {
 	t.Helper()
 	m, err := newSQLMeta("sqlite3", dbPath, testConfig())
@@ -205,21 +206,18 @@ func TestPloriPurgeAllSessionsRefusesAnEngineItCannotSweep(t *testing.T) {
 }
 
 // TestPloriPurgeAllSessionsNeedsALoadedFormat pins the one precondition the
-// sweep has and does not state.
+// sweep has.
 //
 // The sweep is a fail-closed gate: the supervisor turns its error into exit 67
-// and refuses to mount (supervisor.go:177-181). But on a client whose Format
-// was never loaded it does not return an error at all — doCleanStaleSession
-// reaches genLog, which dereferences the nil cached Format (sql.go:1131) and
-// panics. A panic exits 2, which is not in the plugin's exit-code table
-// (64-70), so the refusal the design intends would reach fuse-csi-node as an
-// unclassified crash.
+// and refuses to mount (supervisor.go:465-468). On a client whose Format was
+// never loaded it used to return no error at all — doCleanStaleSession reaches
+// genLog, which read the nil cached Format (sql.go:1130) and panicked. A panic
+// exits 2, which is not in the plugin's exit-code table (64-70), so the refusal
+// the design intends reached fuse-csi-node as an unclassified crash.
 //
-// The production order is correct today (FS.Open loads the Format before the
-// supervisor calls PurgeSessions), so this is a latent trap rather than a live
-// defect. The test states the requirement so a future caller cannot violate it
-// silently, and documents the one-line fix: PloriPurgeAllSessions should refuse
-// a client with no Format instead of relying on its caller.
+// PloriPurgeAllSessions now checks the Format itself and returns
+// ErrPloriNoFormat, so the precondition is enforced where it belongs rather
+// than left to the caller's ordering.
 func TestPloriPurgeAllSessionsNeedsALoadedFormat(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "unloaded.db")
 	seed, err := newSQLMeta("sqlite3", dbPath, testConfig())
@@ -242,20 +240,21 @@ func TestPloriPurgeAllSessionsNeedsALoadedFormat(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = unloaded.Shutdown() })
 
-	var panicked bool
 	func() {
 		defer func() {
-			if recover() != nil {
-				panicked = true
+			if r := recover(); r != nil {
+				t.Fatalf("sweep without a loaded format panicked instead of refusing: %v", r)
 			}
 		}()
-		_, _ = PloriPurgeAllSessions(unloaded)
+		n, err := PloriPurgeAllSessions(unloaded)
+		if !errors.Is(err, ErrPloriNoFormat) {
+			t.Fatalf("sweep without a loaded format = (%d, %v), want ErrPloriNoFormat", n, err)
+		}
+		if n != 0 {
+			t.Fatalf("refusal reported %d swept sessions, want 0", n)
+		}
 	}()
-	if !panicked {
-		t.Log("PloriPurgeAllSessions no longer needs a loaded Format — the latent trap is fixed; " +
-			"drop this test or invert it to assert the typed refusal")
-		return
-	}
+
 	// Same client, Format loaded: the sweep works. That is the contract the
 	// production caller already satisfies.
 	if _, err := unloaded.Load(true); err != nil {
