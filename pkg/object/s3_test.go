@@ -20,8 +20,14 @@
 package object
 
 import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/aws/smithy-go"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -97,4 +103,72 @@ func TestS3OCIRegion(t *testing.T) {
 			assert.Equal(t, tt.wantPathStyle, client.s3.Options().UsePathStyle)
 		})
 	}
+}
+
+// A refused PUT has to reach the writeback durability barrier with its class
+// intact: the barrier tells a full bucket from a rotated-out credential with
+// errors.Is, not by matching the SDK's message (PLO-458).
+func TestS3PutClassifiesRefusals(t *testing.T) {
+	const accessDenied = `<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`
+	const quotaExceeded = `<?xml version="1.0" encoding="UTF-8"?><Error><Code>QuotaExceeded</Code><Message>User quota exceeded</Message></Error>`
+
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		want    error
+		notWant error
+	}{
+		{"507 without an error code", http.StatusInsufficientStorage, "", ErrInsufficientStorage, ErrAccessDenied},
+		{"403 AccessDenied", http.StatusForbidden, accessDenied, ErrAccessDenied, ErrInsufficientStorage},
+		// Ceph RGW reports a quota it cannot satisfy as 403, so the error code
+		// has to win over the status.
+		{"403 QuotaExceeded", http.StatusForbidden, quotaExceeded, ErrInsufficientStorage, ErrAccessDenied},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("JFS_S3_VHOST_STYLE", "0")
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(c.status)
+				_, _ = io.WriteString(w, c.body)
+			}))
+			defer srv.Close()
+
+			s, err := newS3(srv.URL+"/bucket", "ak", "sk", "")
+			if err != nil {
+				t.Fatalf("newS3() error = %v", err)
+			}
+			err = s.Put(context.Background(), "key", bytes.NewReader([]byte("payload")))
+			if err == nil {
+				t.Fatalf("Put should have failed with %d", c.status)
+			}
+			assert.ErrorIs(t, err, c.want)
+			assert.NotErrorIs(t, err, c.notWant)
+			// The class is attached to the SDK's error, not substituted for it.
+			var apiErr smithy.APIError
+			assert.ErrorAs(t, err, &apiErr)
+		})
+	}
+}
+
+func TestS3PutLeavesOtherFailuresUnclassified(t *testing.T) {
+	t.Setenv("JFS_S3_VHOST_STYLE", "0")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	s, err := newS3(srv.URL+"/bucket", "ak", "sk", "")
+	if err != nil {
+		t.Fatalf("newS3() error = %v", err)
+	}
+	err = s.Put(context.Background(), "key", bytes.NewReader([]byte("payload")))
+	if err == nil {
+		t.Fatal("Put should have failed with 500")
+	}
+	assert.NotErrorIs(t, err, ErrInsufficientStorage)
+	assert.NotErrorIs(t, err, ErrAccessDenied)
 }

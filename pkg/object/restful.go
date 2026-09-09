@@ -323,7 +323,10 @@ func parseError(resp *http.Response) error {
 	if err != nil {
 		return fmt.Errorf("request failed: %s", err)
 	}
-	return fmt.Errorf("status: %v, message: %s", resp.StatusCode, string(data))
+	// The status is the only classifier this backend has, and the message stays
+	// as it was: classify only adds the failure class (PLO-458).
+	return classify(classFromStatus(resp.StatusCode),
+		fmt.Errorf("status: %v, message: %s", resp.StatusCode, string(data)))
 }
 
 func (s *RestfulStorage) Head(ctx context.Context, key string) (Object, error) {
