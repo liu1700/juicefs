@@ -93,6 +93,30 @@ func (s *s3client) Create(ctx context.Context) error {
 	return err
 }
 
+// classifyS3Error marks err with the failure class its S3 error code names, or
+// failing that the class of the HTTP status the store answered with. The SDK's
+// own error value stays reachable through errors.As and the message is
+// unchanged; what this adds is an errors.Is-able class for callers that have to
+// tell a full bucket from a rejected credential (PLO-458).
+func classifyS3Error(err error) error {
+	if err == nil {
+		return nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		if class := classFromCode(apiErr.ErrorCode()); class != nil {
+			return classify(class, err)
+		}
+	}
+	var respErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &respErr) {
+		if class := classFromStatus(respErr.HTTPStatusCode()); class != nil {
+			return classify(class, err)
+		}
+	}
+	return err
+}
+
 func (s *s3client) Head(ctx context.Context, key string) (Object, error) {
 	param := s3.HeadObjectInput{
 		Bucket: &s.bucket,
@@ -102,9 +126,9 @@ func (s *s3client) Head(ctx context.Context, key string) (Object, error) {
 	if err != nil {
 		var notFound *types.NotFound
 		if errors.As(err, &notFound) {
-			err = os.ErrNotExist
+			return nil, os.ErrNotExist
 		}
-		return nil, err
+		return nil, classifyS3Error(err)
 	}
 	return &obj{
 		key,
@@ -134,7 +158,7 @@ func (s *s3client) Get(ctx context.Context, key string, off, limit int64, getter
 		if errors.As(err, &re) {
 			attrs.SetRequestID(re.ServiceRequestID())
 		}
-		return nil, err
+		return nil, classifyS3Error(err)
 	}
 	if reqID, ok := middleware.GetRequestIDMetadata(resp.ResultMetadata); ok {
 		attrs.SetRequestID(reqID)
@@ -185,7 +209,7 @@ func (s *s3client) Put(ctx context.Context, key string, in io.Reader, getters ..
 		if errors.As(err, &re) {
 			attrs.SetRequestID(re.ServiceRequestID())
 		}
-		return err
+		return classifyS3Error(err)
 	}
 	if reqID, ok := middleware.GetRequestIDMetadata(resp.ResultMetadata); ok {
 		attrs.SetRequestID(reqID)

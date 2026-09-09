@@ -19,6 +19,7 @@ package chunk
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -27,14 +28,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// errUploadRefused stands for the class of object-store refusal the mount
-// supervisor has to be able to tell apart: a 507 from a full bucket, a 403 on a
-// rotated credential, a connection failure. pkg/object defines no sentinel for
-// any of them — the S3 backend returns the SDK's error unchanged
-// (pkg/object/s3.go:182-188) — so what this test pins is the property that
-// makes such a distinction possible at all: whatever the backend returned
-// reaches the fence's caller as a value rather than as text (PLO-458).
-var errUploadRefused = errors.New("insufficient storage")
+// errUploadRefused stands for any object-store refusal. What this test pins is
+// the property that makes the classes below distinguishable at all: whatever
+// the backend returned reaches the fence's caller as a value rather than as
+// text (PLO-458).
+var errUploadRefused = errors.New("upload refused")
 
 // erroringPutStore refuses every upload with one error value.
 type erroringPutStore struct {
@@ -60,4 +58,34 @@ func TestRemoteDurabilityFenceKeepsTheUploadErrorType(t *testing.T) {
 	// The text half of the report is unchanged: DurabilityStatus.LastError is a
 	// JSON wire field and stays a string.
 	require.Contains(t, status.LastError, errUploadRefused.Error())
+}
+
+// The classes themselves: a backend that refuses the upload with a classified
+// error (pkg/object attaches the class in the S3 and restful backends) reaches
+// the fence's caller with the class intact, through the retry wrap in upload()
+// and the fence's own wrap. This is what lets the mount supervisor answer "the
+// bucket is full" rather than "upload failed" (PLO-458).
+func TestRemoteDurabilityFenceKeepsTheObjectStoreClass(t *testing.T) {
+	cases := []struct {
+		class   error
+		refused error
+	}{
+		{object.ErrInsufficientStorage, fmt.Errorf("status: 507, message: over quota: %w", object.ErrInsufficientStorage)},
+		{object.ErrAccessDenied, fmt.Errorf("status: 403, message: signature mismatch: %w", object.ErrAccessDenied)},
+	}
+	for _, c := range cases {
+		class := c.class
+		t.Run(class.Error(), func(t *testing.T) {
+			blob := &erroringPutStore{ObjectStorage: newTestStorage(t), err: c.refused}
+			store := newDurabilityTestStore(t, blob)
+			durable := store.(RemoteDurabilityStore)
+			writeDurabilityTestSlice(t, store, 108, []byte("classified"))
+
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			_, err := durable.RemoteDurability(ctx)
+			require.Error(t, err)
+			require.ErrorIs(t, err, class)
+		})
+	}
 }
