@@ -21,6 +21,8 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -33,6 +35,153 @@ func TestSQLiteClient(t *testing.T) {
 		t.Fatalf("create meta: %s", err)
 	}
 	testMeta(t, m)
+}
+
+func TestSQLiteSessionLoadsUsageBeforeQuotaChecks(t *testing.T) {
+	t.Run("bytes", func(t *testing.T) {
+		m, inode, used, _ := reopenSQLiteQuotaVolume(t)
+		ctx := Background()
+		var sliceID uint64
+		if st := m.NewSlice(ctx, &sliceID); st != 0 {
+			t.Fatalf("new slice: %s", st)
+		}
+		if st := m.Write(ctx, inode, 0, 8192, Slice{Id: sliceID, Size: 8192, Len: 8192}, time.Now()); st != syscall.ENOSPC {
+			t.Fatalf("grow existing file beyond remaining quota = %s, want ENOSPC", st)
+		}
+		if got := atomic.LoadInt64(&m.usedSpace); got != used {
+			t.Errorf("used bytes after refused write = %d, want persisted %d", got, used)
+		}
+	})
+	t.Run("inodes", func(t *testing.T) {
+		m, _, _, _ := reopenSQLiteQuotaVolume(t)
+		ctx := Background()
+		var inode Ino
+		if st := m.Mknod(ctx, RootInode, "one-remaining", TypeFile, 0644, 022, 0, "", &inode, nil); st != 0 {
+			t.Fatalf("create within remaining inode quota: %s", st)
+		}
+		if st := m.Mknod(ctx, RootInode, "over-remaining", TypeFile, 0644, 022, 0, "", &inode, nil); st != syscall.ENOSPC {
+			t.Fatalf("create beyond remaining inode quota = %s, want ENOSPC", st)
+		}
+	})
+}
+
+func reopenSQLiteQuotaVolume(t *testing.T) (*dbMeta, Ino, int64, int64) {
+	t.Helper()
+	dbPath := path.Join(t.TempDir(), "quota-reopen.db")
+	firstMeta, err := newSQLMeta("sqlite3", dbPath, testConfig())
+	if err != nil {
+		t.Fatalf("create first meta: %s", err)
+	}
+	first := firstMeta.(*dbMeta)
+	format := testFormat()
+	format.Capacity = 1 << 20
+	format.Inodes = 1 << 20
+	if err := first.Init(format, true); err != nil {
+		t.Fatalf("init first meta: %s", err)
+	}
+	if _, err := first.Load(false); err != nil {
+		t.Fatalf("load first format: %s", err)
+	}
+	if err := first.NewSession(true); err != nil {
+		t.Fatalf("open first session: %s", err)
+	}
+	ctx := Background()
+	var inode Ino
+	var attr Attr
+	if st := first.Mknod(ctx, RootInode, "existing", TypeFile, 0644, 022, 0, "", &inode, &attr); st != 0 {
+		t.Fatalf("create existing file: %s", st)
+	}
+	var sliceID uint64
+	if st := first.NewSlice(ctx, &sliceID); st != 0 {
+		t.Fatalf("new slice: %s", st)
+	}
+	if st := first.Write(ctx, inode, 0, 0, Slice{Id: sliceID, Size: 8192, Len: 8192}, time.Now()); st != 0 {
+		t.Fatalf("write existing file: %s", st)
+	}
+	first.FlushSession()
+	used, err := first.en.getCounter(usedSpace)
+	if err != nil {
+		t.Fatalf("read persisted used bytes: %s", err)
+	}
+	inodes, err := first.en.getCounter(totalInodes)
+	if err != nil {
+		t.Fatalf("read persisted used inodes: %s", err)
+	}
+	ceiling := first.GetFormat()
+	ceiling.Capacity = uint64(used + 4096)
+	ceiling.Inodes = uint64(inodes + 1)
+	if err := first.Init(&ceiling, false); err != nil {
+		t.Fatalf("set remaining quota: %s", err)
+	}
+	if err := first.CloseSession(); err != nil {
+		t.Fatalf("close first session: %s", err)
+	}
+	if err := first.Shutdown(); err != nil {
+		t.Fatalf("shutdown first meta: %s", err)
+	}
+
+	conf := testConfig()
+	conf.Heartbeat = time.Hour
+	secondMeta, err := newSQLMeta("sqlite3", dbPath, conf)
+	if err != nil {
+		t.Fatalf("reopen meta: %s", err)
+	}
+	second := secondMeta.(*dbMeta)
+	t.Cleanup(func() { _ = second.Shutdown() })
+	if _, err := second.Load(false); err != nil {
+		t.Fatalf("load reopened format: %s", err)
+	}
+	if err := second.NewSession(true); err != nil {
+		t.Fatalf("open reopened session: %s", err)
+	}
+	return second, inode, used, inodes
+}
+
+func TestSQLiteSessionLoadsUsageForFreshVolume(t *testing.T) {
+	m, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "fresh-quota.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	db := m.(*dbMeta)
+	t.Cleanup(func() { _ = db.Shutdown() })
+	if err := db.Init(testFormat(), true); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+	if _, err := db.Load(false); err != nil {
+		t.Fatalf("load format: %s", err)
+	}
+	if err := db.NewSession(true); err != nil {
+		t.Fatalf("open session: %s", err)
+	}
+	wantBytes, err := db.en.getCounter(usedSpace)
+	if err != nil {
+		t.Fatalf("read fresh used bytes: %s", err)
+	}
+	wantInodes, err := db.en.getCounter(totalInodes)
+	if err != nil {
+		t.Fatalf("read fresh used inodes: %s", err)
+	}
+	if got := atomic.LoadInt64(&db.usedSpace); got != wantBytes {
+		t.Errorf("fresh used bytes = %d, want %d", got, wantBytes)
+	}
+	if got := atomic.LoadInt64(&db.usedInodes); got != wantInodes {
+		t.Errorf("fresh used inodes = %d, want %d", got, wantInodes)
+	}
+}
+
+func TestSQLiteSessionUsageInitializationFailsBeforeStartingSession(t *testing.T) {
+	metaClient, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "unformatted.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	m := metaClient.(*dbMeta)
+	t.Cleanup(func() { _ = m.Shutdown() })
+	if err := m.NewSession(true); err == nil {
+		t.Fatal("open unformatted session succeeded")
+	}
+	if m.sessCtx != nil {
+		t.Fatal("failed session initialization left a session context")
+	}
 }
 
 type commitOnSQLiteBusyLogger struct {

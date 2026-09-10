@@ -774,6 +774,17 @@ func (m *baseMeta) currentSessionInfo() []byte {
 }
 
 func (m *baseMeta) NewSession(record bool) error {
+	used, err := m.en.getCounter(usedSpace)
+	if err != nil {
+		return fmt.Errorf("get counter %s: %w", usedSpace, err)
+	}
+	inodes, err := m.en.getCounter(totalInodes)
+	if err != nil {
+		return fmt.Errorf("get counter %s: %w", totalInodes, err)
+	}
+	atomic.StoreInt64(&m.usedSpace, used)
+	atomic.StoreInt64(&m.usedInodes, inodes)
+
 	m.sessCtx = Background()
 	ctx := m.sessCtx
 	go m.refresh(ctx)
