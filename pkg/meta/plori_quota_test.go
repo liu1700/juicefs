@@ -43,12 +43,7 @@ import (
 //     grant silently reverts within one heartbeat — 300 s on the Plori profile.
 
 // openQuotaVolume creates a fresh SQLite volume with an explicit ceiling and an
-// open session, and zeroes the usage counters.
-//
-// The zeroing is not cosmetic. A fresh baseMeta starts at usedSpace ==
-// usedInodes == unknownUsage (-1, base.go), and the loop that reads the real
-// counters runs on the heartbeat ticker, so a test that did not do this would
-// be measuring an off-by-one against a value production never has.
+// open session.
 func openQuotaVolume(t *testing.T, capacity, inodes uint64) (*dbMeta, string) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "quota.db")
@@ -70,8 +65,6 @@ func openQuotaVolume(t *testing.T, capacity, inodes uint64) (*dbMeta, string) {
 	if !ok {
 		t.Fatalf("meta is %T, want *dbMeta", m)
 	}
-	atomic.StoreInt64(&db.usedSpace, 0)
-	atomic.StoreInt64(&db.usedInodes, 0)
 	return db, dbPath
 }
 
