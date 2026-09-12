@@ -450,8 +450,11 @@ func TestRealLitestreamRestoreReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("litestream version: %v", err)
 	}
-	if strings.TrimPrefix(strings.TrimSpace(string(version)), "v") != "0.5.17" {
-		t.Fatalf("litestream version = %q, want v0.5.17", strings.TrimSpace(string(version)))
+	// The production pin is a fork build of v0.5.17 (`v0.5.17-plori.3` in
+	// deploy/docker/storage-worker.Dockerfile), so the gate is the base
+	// version, not an exact string.
+	if !strings.HasPrefix(strings.TrimSpace(string(version)), "v0.5.17") {
+		t.Fatalf("litestream version = %q, want the pinned v0.5.17 line", strings.TrimSpace(string(version)))
 	}
 	if _, err := exec.LookPath("sqlite3"); err != nil {
 		t.Skip("sqlite3 is required for the real Litestream fixture")

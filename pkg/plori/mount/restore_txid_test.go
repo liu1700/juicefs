@@ -22,6 +22,7 @@ package mount
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -57,6 +58,30 @@ func fakeLitestream(t *testing.T, body string) (bin, argvLog string) {
 }
 
 const fakeRestoreOK = ": > \"$out\"\nexit 0"
+
+// restoreCalls is calls() narrowed to the restore invocations. The forward
+// recovery also runs `litestream ltx` to find its target, and that listing is
+// not a restore attempt.
+func restoreCalls(t *testing.T, argvLog string) []string {
+	t.Helper()
+	var out []string
+	for _, c := range calls(t, argvLog) {
+		if strings.HasPrefix(c, "restore ") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// fakeLTXListing is a `litestream ltx -json` answer a fake binary can print.
+// After compaction and retention the durable transaction's own L0 file is
+// gone and the merged L1 file ends at a LATER transaction, which is the
+// nearest transaction a restore can still reach.
+const fakeLTXListing = `[
+  {"level":0,"min_txid":"000000000000007c","max_txid":"000000000000007c","size":602,"timestamp":"2026-09-02T17:55:31Z"},
+  {"level":1,"min_txid":"0000000000000001","max_txid":"000000000000007c","size":602,"timestamp":"2026-09-02T17:55:31Z"},
+  {"level":9,"min_txid":"0000000000000001","max_txid":"0000000000000001","size":578,"timestamp":"2026-09-02T17:55:20Z"}
+]`
 
 func calls(t *testing.T, argvLog string) []string {
 	t.Helper()
@@ -125,7 +150,7 @@ func TestRestorePassesTheTXIDAndNotTheTimestamp(t *testing.T) {
 	}
 }
 
-func TestRestoreFallsBackToTheTimestampAtFullPrecision(t *testing.T) {
+func TestRestoreUsesTheTimestampAtFullPrecisionWhenThereIsNoTXID(t *testing.T) {
 	bin, argvLog := fakeLitestream(t, fakeRestoreOK)
 	ls := newTestLitestream(t, bin)
 	// A durable point recorded before the fork read a TXID at all.
@@ -192,9 +217,20 @@ func TestRestoreRefusesAnUnparseableTXID(t *testing.T) {
 // file that straddles it; `l0-retention` then deletes the originals. From that
 // moment `-txid` on the swallowed value fails permanently — reproduced against
 // the real binary — while the data itself is still there.
-func TestRestoreRetriesTheTimestampWhenTheTXIDIsUnreachable(t *testing.T) {
-	bin, argvLog := fakeLitestream(t, `case "$*" in
-  *-txid*) echo "Error: no matching backup files available" >&2; exit 1;;
+//
+// The recovery goes FORWARD, to the nearest transaction the replica can still
+// be restored to. It must not go back to the durable point's timestamp: that
+// restore can land on a much older file and drop rows the durable point had
+// already promised (PLO-417).
+func TestRestoreMovesForwardToTheNearestReachableTXID(t *testing.T) {
+	bin, argvLog := fakeLitestream(t, `case "$1" in
+  ltx) cat <<'JSON'
+`+fakeLTXListing+`
+JSON
+    exit 0;;
+esac
+case "$*" in
+  *-txid\ 000000000000007b*) echo "Error: no matching backup files available" >&2; exit 1;;
 esac
 : > "$out"
 exit 0`)
@@ -209,22 +245,119 @@ exit 0`)
 		t.Fatalf("Restore: %v", err)
 	}
 
-	got := calls(t, argvLog)
+	got := restoreCalls(t, argvLog)
 	if len(got) != 2 {
-		t.Fatalf("want the txid attempt and then the timestamp, got %v", got)
+		t.Fatalf("want the durable txid and then the forward txid, got %v", got)
 	}
-	if !strings.Contains(got[0], "-txid") {
-		t.Errorf("first attempt was not the txid: %s", got[0])
+	if !strings.Contains(got[0], "-txid 000000000000007b") {
+		t.Errorf("first attempt was not the durable point's txid: %s", got[0])
 	}
-	if !strings.Contains(got[1], "-timestamp 2026-09-02T17:55:30.123456789Z") || strings.Contains(got[1], "-txid") {
-		t.Errorf("second attempt is not the timestamp of the same point: %s", got[1])
+	// 7c is the merged L1 file's last transaction: the smallest transaction at
+	// or after the durable 7b that any remaining file ends at.
+	if !strings.Contains(got[1], "-txid 000000000000007c") {
+		t.Errorf("second attempt is not the nearest forward transaction: %s", got[1])
+	}
+	if strings.Contains(got[1], "-timestamp") {
+		t.Errorf("the recovery restored BACKWARD to the timestamp: %s", got[1])
+	}
+	if want := []string{"txid", restoreTxidForward}; !equalStrings(ls.RestoreAttempts(), want) {
+		t.Errorf("attempt chain = %v, want %v", ls.RestoreAttempts(), want)
 	}
 	if len(events) != 1 || events[0] != "restore_txid_unreachable" {
-		t.Errorf("a silent fallback is indistinguishable from a working anchor; events = %v", events)
+		t.Errorf("a silent change of restore point is indistinguishable from a working anchor; events = %v", events)
 	}
 }
 
-func TestRestoreKeepsTheFailureWhenThereIsNoTimestampToFallBackTo(t *testing.T) {
+// With no usable listing there is no boundary to aim at, so the restore takes
+// the replica's newest transaction: further forward, same kind of point, same
+// repair. It must not carry `-if-replica-exists` — a silent success with no
+// output on a replica that demonstrably holds files would be read as a
+// brand-new volume and answered with a format.
+func TestRestoreMovesForwardToLatestWhenTheListingHasNoCandidate(t *testing.T) {
+	bin, argvLog := fakeLitestream(t, `case "$1" in
+  ltx) echo "[]"; exit 0;;
+esac
+case "$*" in
+  *-txid*) echo "Error: no matching backup files available" >&2; exit 1;;
+esac
+: > "$out"
+exit 0`)
+	ls := newTestLitestream(t, bin)
+
+	if err := ls.Restore(context.Background(), "agents-meta/v1/g2/", RestoreOptions{
+		TXID: "000000000000007b", Timestamp: time.Date(2026, 9, 2, 17, 55, 30, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	got := restoreCalls(t, argvLog)
+	if len(got) != 2 {
+		t.Fatalf("want the durable txid and then the latest restore, got %v", got)
+	}
+	for _, flag := range []string{"-txid", "-timestamp", "-if-replica-exists"} {
+		if strings.Contains(got[1], flag) {
+			t.Errorf("the forward-to-latest restore carried %s: %s", flag, got[1])
+		}
+	}
+	if want := []string{"txid", restoreLatestForward}; !equalStrings(ls.RestoreAttempts(), want) {
+		t.Errorf("attempt chain = %v, want %v", ls.RestoreAttempts(), want)
+	}
+}
+
+// The listing and the restore are two commands with the retention monitor
+// running between them, so the boundary `ltx` named can be gone by the time
+// the restore plans for it. That is the same condition one step further out,
+// and it resolves the same way: the replica's latest transaction, which needs
+// no boundary to be reachable.
+func TestRestoreFallsThroughToLatestWhenTheForwardTXIDIsAlsoUnreachable(t *testing.T) {
+	bin, argvLog := fakeLitestream(t, `case "$1" in
+  ltx) cat <<'JSON'
+`+fakeLTXListing+`
+JSON
+    exit 0;;
+esac
+case "$*" in
+  *-txid*) echo "Error: no matching backup files available" >&2; exit 1;;
+esac
+: > "$out"
+exit 0`)
+	ls := newTestLitestream(t, bin)
+	var events []string
+	ls.Log = func(event string, _ ...any) { events = append(events, event) }
+
+	if err := ls.Restore(context.Background(), "agents-meta/v1/g2/", RestoreOptions{
+		TXID: "000000000000007b", Timestamp: time.Date(2026, 9, 2, 17, 55, 30, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	got := restoreCalls(t, argvLog)
+	if len(got) != 3 {
+		t.Fatalf("want the durable txid, the forward txid and then latest, got %v", got)
+	}
+	if !strings.Contains(got[0], "-txid 000000000000007b") {
+		t.Errorf("first attempt was not the durable point's txid: %s", got[0])
+	}
+	if !strings.Contains(got[1], "-txid 000000000000007c") {
+		t.Errorf("second attempt was not the listed forward boundary: %s", got[1])
+	}
+	for _, flag := range []string{"-txid", "-timestamp", "-if-replica-exists"} {
+		if strings.Contains(got[2], flag) {
+			t.Errorf("the forward-to-latest restore carried %s: %s", flag, got[2])
+		}
+	}
+	if want := []string{"txid", restoreTxidForward, restoreLatestForward}; !equalStrings(ls.RestoreAttempts(), want) {
+		t.Errorf("attempt chain = %v, want %v", ls.RestoreAttempts(), want)
+	}
+	if want := []string{"restore_txid_unreachable", "restore_txid_unreachable"}; !equalStrings(events, want) {
+		t.Errorf("events = %v, want one line per change of restore point %v", events, want)
+	}
+}
+
+// A forward restore that fails for any OTHER reason is a failure, not a reason
+// to keep trying points. The reason and the chain both have to reach the
+// caller.
+func TestRestoreSurfacesTheFailureWhenTheForwardRestoreAlsoFails(t *testing.T) {
 	bin, argvLog := fakeLitestream(t, `echo "Error: no matching backup files available" >&2; exit 1`)
 	ls := newTestLitestream(t, bin)
 
@@ -235,9 +368,57 @@ func TestRestoreKeepsTheFailureWhenThereIsNoTimestampToFallBackTo(t *testing.T) 
 	if !strings.Contains(err.Error(), errTxUnreachable) {
 		t.Errorf("error lost the reason: %v", err)
 	}
-	if got := calls(t, argvLog); len(got) != 1 {
-		t.Errorf("want exactly one attempt, got %v", got)
+	var failure *RestoreFailure
+	if !errors.As(err, &failure) {
+		t.Fatalf("error is not a *RestoreFailure: %v", err)
 	}
+	// The listing runs on the same failing fake, so there is no candidate and
+	// the forward attempt is the replica's latest transaction.
+	if want := []string{"txid", restoreLatestForward}; !equalStrings(failure.Attempts, want) {
+		t.Errorf("attempt chain = %v, want %v", failure.Attempts, want)
+	}
+	if got := restoreCalls(t, argvLog); len(got) != 2 {
+		t.Errorf("want the durable txid and one forward attempt, got %v", got)
+	}
+}
+
+// nearestForwardTXID is the choice the forward recovery makes, and the real
+// binary's listing is what it makes it from.
+func TestNearestForwardTXIDTakesTheSmallestBoundaryAtOrAfterTheDurablePoint(t *testing.T) {
+	var files []ltxFile
+	if err := json.Unmarshal([]byte(fakeLTXListing), &files); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		txid string
+		want string
+		ok   bool
+	}{
+		{"compacted away", "000000000000007b", "000000000000007c", true},
+		{"still an exact boundary", "000000000000007c", "000000000000007c", true},
+		{"ahead of everything replicated", "00000000000000ff", "", false},
+		{"older than everything", "0000000000000000", "0000000000000001", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := nearestForwardTXID(files, tc.txid)
+			if got != tc.want || ok != tc.ok {
+				t.Errorf("nearestForwardTXID(%s) = %q, %v; want %q, %v", tc.txid, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Any other failure is not a stale anchor and must not be retried at an older
@@ -455,19 +636,25 @@ dbs:
 	t.Logf("divergence: by-txid=%q by-timestamp=%q (durable point = %q)", byTXID, byTimestamp, wantDigest)
 }
 
-// TestRestoreTimestampFallsBehindAfterRealL0Retention exercises the retention
-// path PLO-417 is about with the pinned external binary and actual SQLite
-// contents. It shortens the production 10m/30m cadence to 3s/2s solely to
-// make a real elapsed-time test practical. The mechanism is unchanged: L1
+// TestRestoreForwardAfterRealL0RetentionKeepsDurableRows exercises the
+// retention path PLO-417 is about with the pinned external binary and actual
+// SQLite contents. It shortens the production 10m/30m cadence to 3s/2s solely
+// to make a real elapsed-time test practical. The mechanism is unchanged: L1
 // compacts several L0 files and the retention monitor then removes the older
 // compacted L0 file.
 //
 // A durable point at TXID 2 is captured before TXID 3. Once the real L1 file
-// spans 2-3 and L0 2 has expired, TXID 2 is unavailable. Restoring by the
-// recorded timestamp instead selects the earlier snapshot, so the database
-// contains the baseline row but not the durable row. The row result, rather
-// than CLI success, is the assertion.
-func TestRestoreTimestampFallsBehindAfterRealL0Retention(t *testing.T) {
+// spans 2-3 and L0 2 has expired, `-txid 2` is unavailable. Three facts are
+// then checked against the binary, on rows rather than CLI success:
+//
+//   - `litestream ltx` lists the remaining files, and nearestForwardTXID picks
+//     TXID 3 from that listing — the smallest transaction at or after the
+//     durable point that any remaining file ends at.
+//   - restoring to TXID 3 produces a database holding the durable row AND the
+//     later row. Nothing the durable point covered is lost.
+//   - restoring to the recorded timestamp, which is what this path did before
+//     PLO-417, produces the baseline image without the durable row.
+func TestRestoreForwardAfterRealL0RetentionKeepsDurableRows(t *testing.T) {
 	bin := os.Getenv("LITESTREAM_BIN")
 	if bin == "" {
 		var err error
@@ -479,8 +666,11 @@ func TestRestoreTimestampFallsBehindAfterRealL0Retention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("litestream version: %v: %s", err, version)
 	}
-	if got := strings.TrimSpace(string(version)); strings.TrimPrefix(got, "v") != "0.5.17" {
-		t.Fatalf("litestream version = %q, want pinned v0.5.17", got)
+	// The production pin is a fork build of v0.5.17 (`v0.5.17-plori.3` in
+	// deploy/docker/storage-worker.Dockerfile), so the gate is the base
+	// version, not an exact string.
+	if got := strings.TrimSpace(string(version)); !strings.HasPrefix(got, "v0.5.17") {
+		t.Fatalf("litestream version = %q, want the pinned v0.5.17 line", got)
 	}
 	sqlite, err := exec.LookPath("sqlite3")
 	if err != nil {
@@ -619,23 +809,60 @@ dbs:
 		return !hasLTX("0", "0000000000000002", "0000000000000002")
 	})
 
+	rowsOf := func(path string) string {
+		t.Helper()
+		rows, err := exec.Command(sqlite, path, "SELECT group_concat(id || ':' || value, ',') FROM t ORDER BY id;").CombinedOutput()
+		if err != nil {
+			t.Fatalf("read %s: %v: %s", path, err, rows)
+		}
+		return strings.TrimSpace(string(rows))
+	}
+
+	const durablePointTxID = "0000000000000002"
 	byTXID := filepath.Join(root, "by-txid.db")
-	output, err = exec.Command(bin, restoreArgs(cfgPath, dbPath, byTXID, "0000000000000002", time.Time{})...).CombinedOutput()
+	output, err = exec.Command(bin, restoreArgs(cfgPath, dbPath, byTXID, durablePointTxID, time.Time{})...).CombinedOutput()
 	if err == nil || !strings.Contains(string(output), errTxUnreachable) {
 		t.Fatalf("TXID restore error = %v, output = %s; want %q after real retention", err, output, errTxUnreachable)
 	}
 
+	// The forward target, chosen by the worker's own function from the real
+	// binary's listing. Only stdout is read, because the daemon config logs to
+	// stderr.
+	listing, err := exec.Command(bin, "ltx", "-config", cfgPath, "-level", "all", "-json", dbPath).Output()
+	if err != nil {
+		t.Fatalf("litestream ltx: %v", err)
+	}
+	var files []ltxFile
+	if err := json.Unmarshal(listing, &files); err != nil {
+		t.Fatalf("parse ltx listing %s: %v", listing, err)
+	}
+	target, ok := nearestForwardTXID(files, durablePointTxID)
+	if !ok {
+		t.Fatalf("no forward target in %s", listing)
+	}
+	if target != "0000000000000003" {
+		t.Fatalf("forward target = %q, want the merged L1 file's last transaction 0000000000000003 (listing %s)", target, listing)
+	}
+
+	forward := filepath.Join(root, "forward.db")
+	output, err = exec.Command(bin, restoreArgs(cfgPath, dbPath, forward, target, time.Time{})...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("forward restore to %s: %v: %s", target, err, output)
+	}
+	if got, want := rowsOf(forward), "0:baseline,1:durable,2:late"; got != want {
+		t.Fatalf("forward restore rows = %q, want %q: the durable row must survive a compacted-away txid", got, want)
+	}
+
+	// What the removed backward fallback produced from the same replica, and
+	// the reason it was removed: the durable row is not in it.
 	byTimestamp := filepath.Join(root, "by-timestamp.db")
 	output, err = exec.Command(bin, restoreArgs(cfgPath, dbPath, byTimestamp, "", tBefore)...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("timestamp restore: %v: %s", err, output)
 	}
-	rows, err := exec.Command(sqlite, byTimestamp, "SELECT group_concat(id || ':' || value, ',') FROM t ORDER BY id;").CombinedOutput()
-	if err != nil {
-		t.Fatalf("read timestamp restore: %v: %s", err, rows)
-	}
-	got := strings.TrimSpace(string(rows))
-	if got != "0:baseline" {
-		t.Fatalf("timestamp fallback rows = %q, want only the earlier snapshot; durable row must not be silently treated as restored", got)
+	if got := rowsOf(byTimestamp); got != "0:baseline" {
+		t.Logf("timestamp restore rows = %q; on this run the removed fallback did not fall behind, and the forward restore above is the contract either way", got)
+	} else {
+		t.Logf("timestamp restore rows = %q: the removed fallback lost the durable row", got)
 	}
 }
