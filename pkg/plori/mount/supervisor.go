@@ -799,8 +799,14 @@ func (s *Supervisor) restoreOrFormat(ctx context.Context) error {
 	case err == nil:
 		s.restoreContext = s.newRestoreContext(sourceKind, from, anchor, txid)
 		if s.restoredUnclean {
+			// The attempt chain rides this line as well as `restore_failure`
+			// because a SUCCESSFUL restore can still not be at the point the
+			// durable point named: a compacted-away TXID is restored forward
+			// (Litestream.Restore), and `txid-forward` or `latest-forward`
+			// here is what says the repair below is scanning transactions the
+			// durable point did not cover.
 			s.log("unclean_generation", "error", ErrCodeRestoredToBarrier,
-				"restored_to", anchor, "repair", "pending")
+				"restored_to", anchor, "attempt_chain", s.restoreContext.attempts, "repair", "pending")
 		}
 		return nil
 	case errors.Is(err, ErrReplicaEmpty):

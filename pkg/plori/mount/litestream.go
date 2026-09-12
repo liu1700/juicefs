@@ -95,10 +95,10 @@ type Litestream struct {
 	Env func() []string
 
 	// Log is the worker's structured logger. It carries the one decision this
-	// type makes on its own — falling back from an unreachable restore TXID to
-	// the timestamp of the same durable point — because a silent fallback
-	// would be indistinguishable from the anchor having worked. Nil is silent,
-	// which is what the tests that do not assert on it want.
+	// type makes on its own — restoring forward when the durable point's TXID
+	// is no longer reachable — because a silent change of restore point would
+	// be indistinguishable from the anchor having worked. Nil is silent, which
+	// is what the tests that do not assert on it want.
 	Log func(event string, kv ...any)
 
 	cmd                 *exec.Cmd
@@ -252,6 +252,16 @@ var txidPattern = regexp.MustCompile(`^[0-9a-f]{16}$`)
 // failure the TXID path recovers from — see Restore.
 const errTxUnreachable = "no matching backup files available"
 
+// The names RestoreAttempts reports for the two forward recoveries, so a
+// reader of `restore_failure` or `restore_repair` can tell which point the
+// restored image is at: restoreTxidForward is a transaction boundary at or
+// after the durable point, restoreLatestForward is the replica's newest
+// transaction.
+const (
+	restoreTxidForward   = "txid-forward"
+	restoreLatestForward = "latest-forward"
+)
+
 // Restore materialises the metadata database at the point `opt` names.
 //
 // Precedence is TXID, then timestamp, then the replica's latest transaction,
@@ -266,22 +276,41 @@ const errTxUnreachable = "no matching backup files available"
 // restore point look like a brand-new volume and be answered with a format,
 // which is total data loss.
 //
-// One recovery, and only one: a TXID the restore plan cannot reach falls back
-// to the timestamp of the same durable point. That is not defensive
-// scaffolding, it is a mechanism that was reproduced — compaction merges the
-// L0 files a recorded TXID was the boundary of into one file that STRADDLES
-// it, `l0-retention` (30 m) then deletes the L0 originals, and from that
-// moment `-txid` on the swallowed value fails permanently while the data is
-// still there. Without the fallback, an Agent whose last durable point was
-// mid-run and whose Pod comes back an hour later would exit 67 forever.
-// Falling back cannot overshoot the durable point (a file is included iff it
-// was encoded before `T_before`, and encoding follows every commit it
-// carries), so the worst case is an older crash-consistent image, which is
-// exactly what the unclean-generation repair already handles. The retry is
-// safe to run in place because this failure happens while the restore PLAN is
-// being calculated, before any output exists — verified: the failing run
-// leaves no database behind, so the second attempt still meets litestream's
-// "output path must not exist" precondition.
+// One recovery, and only one: a TXID the restore plan cannot reach is
+// restored FORWARD, to the nearest transaction at or after it that the
+// replica can still be restored to. The unreachable TXID does not mean the
+// data is gone — compaction merges the L0 files a recorded TXID was the
+// boundary of into one file that STRADDLES it, `l0-retention` (30 m) then
+// deletes the L0 originals, and from that moment `-txid` on the swallowed
+// value fails permanently while the data is still there. With no recovery at
+// all, an Agent whose last durable point was mid-run and whose Pod comes back
+// an hour later would exit 67 forever.
+//
+// Forward, not backward, because the two directions lose different things.
+// Restoring to the durable point's TIMESTAMP — what this path did until
+// PLO-417 — takes the newest file encoded before `T_before`, and once
+// compaction and retention have removed the files around the durable point
+// that can be a much older file: the restore then drops rows the durable
+// point had already promised, with no proven bound on how many and nothing in
+// the restored image recording it. Restoring forward keeps every row that was
+// committed and durable, and adds the transactions between the durable point
+// and the boundary it lands on. Those extra transactions can reference blocks
+// the writeback cache never uploaded, which is the same condition every
+// unclean generation already has, and the same mechanism answers it: a
+// durable-point restore is unclean, so `repairAfterUncleanStop` scans the
+// restored metadata against the object store and quarantines each file whose
+// blocks are not there, typed E_BLOCK_MISSING_AFTER_RESTORE and reported. The
+// loss is therefore bounded to files written after the durable point, and it
+// is visible.
+//
+// The boundary comes from `litestream ltx` (forwardTarget). With no listing,
+// no candidate, or a listed boundary that turns out to be unreachable itself,
+// the target is the replica's latest transaction, which is further forward but
+// the same kind of point and gets the same repair. The retries are safe to run
+// in place because this failure happens while the restore PLAN is being
+// calculated, before any output exists — verified: the failing run leaves no
+// database behind, so the next attempt still meets litestream's "output path
+// must not exist" precondition.
 func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, opt RestoreOptions) error {
 	if _, err := os.Stat(l.DBPath); err == nil {
 		return fmt.Errorf("refusing to restore over an existing %s", l.DBPath)
@@ -306,10 +335,25 @@ func (l *Litestream) Restore(ctx context.Context, sourcePrefix string, opt Resto
 		attempts = []string{"timestamp"}
 	}
 	err := l.restoreAt(ctx, opt.TXID, opt.Timestamp)
-	if err != nil && opt.TXID != "" && !opt.Timestamp.IsZero() && strings.Contains(err.Error(), errTxUnreachable) {
-		l.logf("restore_txid_unreachable", "txid", opt.TXID, "falling_back_to", opt.Timestamp.UTC().Format(time.RFC3339Nano))
-		attempts = append(attempts, "timestamp")
-		err = l.restoreAt(ctx, "", opt.Timestamp)
+	if err != nil && opt.TXID != "" && strings.Contains(err.Error(), errTxUnreachable) {
+		if target, ok := l.forwardTarget(ctx, opt.TXID); ok {
+			l.logf("restore_txid_unreachable", "txid", opt.TXID, "restoring_forward_to", target, "mode", restoreTxidForward)
+			attempts = append(attempts, restoreTxidForward)
+			err = l.restoreAt(ctx, target, time.Time{})
+		}
+		// Same condition, one step further out: the boundary the listing
+		// named can itself be unreachable — the listing and the restore are
+		// two separate commands, and the retention monitor runs between them
+		// — and a listing that could not be read or held no candidate leaves
+		// the original unreachable error here. Both land on the replica's
+		// latest transaction, which needs no boundary to be reachable. Any
+		// OTHER failure of the forward attempt is not a stale boundary and
+		// stops here.
+		if err != nil && strings.Contains(err.Error(), errTxUnreachable) {
+			l.logf("restore_txid_unreachable", "txid", opt.TXID, "restoring_forward_to", "latest", "mode", restoreLatestForward)
+			attempts = append(attempts, restoreLatestForward)
+			err = l.restoreLatest(ctx)
+		}
 	}
 	if err != nil {
 		l.lastRestoreAttempts = append([]string(nil), attempts...)
@@ -332,13 +376,87 @@ func (l *Litestream) RestoreAttempts() []string {
 
 // restoreAt runs one `litestream restore` with at most one anchor.
 func (l *Litestream) restoreAt(ctx context.Context, txid string, timestamp time.Time) error {
-	if out, err := l.run(ctx, restoreArgs(l.restoreConfigPath(), l.DBPath, l.DBPath, txid, timestamp)...); err != nil {
+	return l.restoreWith(ctx, restoreArgs(l.restoreConfigPath(), l.DBPath, l.DBPath, txid, timestamp))
+}
+
+// restoreLatest runs one `litestream restore` at the replica's newest
+// transaction, with no anchor and WITHOUT `-if-replica-exists`.
+//
+// The probe flag is deliberately absent. It is correct on the no-anchor path
+// in Restore, where an empty replica is the first-boot answer; here the
+// replica is known to hold files — an unreachable TXID is a plan that found
+// files and could not end on the requested transaction — so a silent success
+// with no output would be read as a brand-new volume and answered with a
+// format.
+func (l *Litestream) restoreLatest(ctx context.Context) error {
+	return l.restoreWith(ctx, restoreLatestArgs(l.restoreConfigPath(), l.DBPath, l.DBPath))
+}
+
+func (l *Litestream) restoreWith(ctx context.Context, args []string) error {
+	if out, err := l.run(ctx, args...); err != nil {
 		if strings.Contains(out, litestreamIntegrityDiagnostic) {
 			return fmt.Errorf("litestream restore: %w", ErrReplicaIntegrity)
 		}
 		return fmt.Errorf("litestream restore: %w: %s", err, lastLine(out))
 	}
 	return nil
+}
+
+// ltxFile is one row of `litestream ltx -json`: the transaction range one
+// replicated LTX file covers, at one compaction level.
+type ltxFile struct {
+	Level   int    `json:"level"`
+	MinTXID string `json:"min_txid"`
+	MaxTXID string `json:"max_txid"`
+}
+
+// forwardTarget names the transaction to restore to when the durable point's
+// own transaction is no longer reachable.
+//
+// `litestream restore -txid` only accepts a value some still-present file
+// ENDS at: the plan is a chain of files and its last file has to finish
+// exactly there. After compaction the durable transaction sits inside a merged
+// file rather than at its end, so the reachable transactions nearest to it are
+// the `max_txid` values of the files that remain. This returns the smallest
+// one at or after the durable transaction, which is the least extra history a
+// restore can take.
+//
+// The listing is `litestream ltx -level all -json` against the same restore
+// config and the same positional database path the restore uses, so it
+// enumerates the same replica the restore would plan over. Only stdout is
+// read, because the child also logs to stderr. A listing that fails, does not
+// parse, or holds no candidate returns false, and the caller restores the
+// replica's latest transaction instead — still forward, just further.
+//
+// TXIDs are fixed-width lowercase hex (txidPattern), so comparing them as
+// strings compares them as numbers.
+func (l *Litestream) forwardTarget(ctx context.Context, txid string) (string, bool) {
+	out, err := l.runStdout(ctx, "ltx", "-config", l.restoreConfigPath(), "-level", "all", "-json", l.DBPath)
+	if err != nil {
+		l.logf("restore_ltx_list_failed", "error", err.Error())
+		return "", false
+	}
+	var files []ltxFile
+	if err := json.Unmarshal(out, &files); err != nil {
+		l.logf("restore_ltx_list_unparseable", "error", err.Error())
+		return "", false
+	}
+	return nearestForwardTXID(files, txid)
+}
+
+// nearestForwardTXID is forwardTarget's choice, separated from the command so
+// the test that runs the real binary makes the same choice the worker does.
+func nearestForwardTXID(files []ltxFile, txid string) (string, bool) {
+	best := ""
+	for _, f := range files {
+		if !txidPattern.MatchString(f.MaxTXID) || f.MaxTXID < txid {
+			continue
+		}
+		if best == "" || f.MaxTXID < best {
+			best = f.MaxTXID
+		}
+	}
+	return best, best != ""
 }
 
 // restoreArgs is the argv of one restore. It is a function of its own so the
@@ -366,6 +484,14 @@ func restoreArgs(configPath, dbPath, outPath, txid string, timestamp time.Time) 
 		args = append(args, "-if-replica-exists")
 	}
 	return append(args, dbPath)
+}
+
+// restoreLatestArgs is the argv of an unanchored restore that is NOT an
+// empty-replica probe: no `-txid`, no `-timestamp`, no `-if-replica-exists`.
+// v0.5.17 then restores the replica's newest transaction and fails loudly if
+// there is nothing to restore.
+func restoreLatestArgs(configPath, dbPath, outPath string) []string {
+	return []string{"restore", "-config", configPath, "-o", outPath, "-integrity-check", "full", dbPath}
 }
 
 // Start launches continuous replication and waits for the control socket.
@@ -653,6 +779,14 @@ func (l *Litestream) run(ctx context.Context, args ...string) (string, error) {
 	cmd.Env = l.env()
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// runStdout captures only stdout, so a structured listing is not mixed with
+// whatever the child logs to stderr.
+func (l *Litestream) runStdout(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, l.Bin, args...)
+	cmd.Env = l.env()
+	return cmd.Output()
 }
 
 func (l *Litestream) env() []string {

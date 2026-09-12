@@ -497,8 +497,8 @@ func TestRestoreFailureEventIsBoundedAndRedacted(t *testing.T) {
 		}
 	}
 	sup.restoreFailure("integrity", restoreContext{source: "durable_point", selectedEpoch: "6",
-		anchor: "2026-09-08T12:00:00Z", txid: "0000000000000009", attempts: []string{"txid", "timestamp"}},
-		&RestoreFailure{Err: errors.New("s3://private-bucket/object-key?token=secret"), Attempts: []string{"txid", "timestamp"}})
+		anchor: "2026-09-08T12:00:00Z", txid: "0000000000000009", attempts: []string{"txid", restoreTxidForward}},
+		&RestoreFailure{Err: errors.New("s3://private-bucket/object-key?token=secret"), Attempts: []string{"txid", restoreTxidForward}})
 
 	if got == nil {
 		t.Fatal("restore_failure event was not emitted")
@@ -512,8 +512,8 @@ func TestRestoreFailureEventIsBoundedAndRedacted(t *testing.T) {
 			t.Errorf("%s = %v, want %v", key, value, want)
 		}
 	}
-	if chain, ok := got["attempt_chain"].([]string); !ok || strings.Join(chain, ",") != "txid,timestamp" {
-		t.Errorf("attempt_chain = %#v, want ordered txid,timestamp", got["attempt_chain"])
+	if chain, ok := got["attempt_chain"].([]string); !ok || strings.Join(chain, ",") != "txid,txid-forward" {
+		t.Errorf("attempt_chain = %#v, want ordered txid,txid-forward", got["attempt_chain"])
 	}
 	for _, value := range got {
 		if strings.Contains(fmt.Sprint(value), "private-bucket") || strings.Contains(fmt.Sprint(value), "secret") {
@@ -522,7 +522,11 @@ func TestRestoreFailureEventIsBoundedAndRedacted(t *testing.T) {
 	}
 }
 
-func TestRestoreFailureEventPreservesActualFallbackChain(t *testing.T) {
+// The chain the replicator actually walked has to reach `restore_failure`,
+// not a chain the supervisor assumed. Here the fake fails every invocation,
+// so the `litestream ltx` listing that picks a forward target fails too and
+// the recovery is the replica's latest transaction.
+func TestRestoreFailureEventPreservesActualAttemptChain(t *testing.T) {
 	bin, _ := fakeLitestream(t, `case "$*" in
   *-txid*) echo "ERROR no matching backup files available" >&2; exit 1;;
 esac
@@ -552,8 +556,8 @@ exit 1`)
 	if len(events) != 1 {
 		t.Fatalf("restore_failure events = %d, want one", len(events))
 	}
-	if chain, ok := events[0]["attempt_chain"].([]string); !ok || strings.Join(chain, ",") != "txid,timestamp" {
-		t.Fatalf("attempt_chain = %#v, want txid,timestamp", events[0]["attempt_chain"])
+	if chain, ok := events[0]["attempt_chain"].([]string); !ok || strings.Join(chain, ",") != "txid,latest-forward" {
+		t.Fatalf("attempt_chain = %#v, want txid,latest-forward", events[0]["attempt_chain"])
 	}
 }
 
