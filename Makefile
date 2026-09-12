@@ -142,10 +142,12 @@ test.plori.unit:
 # names its tests rather than running the package.
 	$(PLORI_CGO) go test -count=1 -timeout 5m -tags "$(PLORI_TAGS)" ./cmd/ \
 		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath|TestTheTrashIsNotWalked|TestAFailedTrashWalk'
-# Mount fixtures exercise the asynchronous chunk cache under the race detector.
-# Broader chunk race coverage awaits fixes in disk-cache state and test fixtures.
+# The asynchronous chunk cache, and the mount fixtures that drive it, under the
+# race detector. PLO-633 fixed the unsynchronized reads of diskCache.state and
+# diskCache.scanned and the test fixtures that mutated a running store, which is
+# what had kept ./pkg/chunk out of this gate.
 	$(PLORI_CGO) go test -race -count=1 -timeout 20m \
-		-tags "$(PLORI_TAGS)" ./pkg/plori/...
+		-tags "$(PLORI_TAGS)" ./pkg/chunk/... ./pkg/plori/...
 
 # Upstream's own unit tests on the default build. Nothing in the Plori workflow
 # ran a default-build `go test`, which is why pkg/chunk/cached_store_test.go sat

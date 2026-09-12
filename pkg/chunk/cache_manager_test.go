@@ -162,6 +162,7 @@ func TestCacheManager(t *testing.T) {
 	conf.CacheDir = dir0 + ":" + dir1 + ":" + dir2
 	conf.AutoCreate = true
 	manager := newCacheManager(&conf, nil, nil)
+	defer manager.stop()
 	require.True(t, !manager.isEmpty())
 
 	m, ok := manager.(*cacheManager)
