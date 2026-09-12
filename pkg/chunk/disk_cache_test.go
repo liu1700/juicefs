@@ -372,8 +372,8 @@ func TestLruEviction(t *testing.T) {
 		}
 		require.Equal(t, len(le.keys), le.lruHeap.Len(), "Heap length should match keys length after staged items are uploaded")
 
-		s.maxItems = 1
 		s.Lock()
+		s.maxItems = 1
 		s.cleanupFull()
 		s.Unlock()
 		require.Equal(t, 0, len(le.keys), "Cache should be empty by cleanupFull after setting maxItems to 1")
@@ -390,7 +390,10 @@ func TestCooldownAtimeOnWriteFixedOnLoad(t *testing.T) {
 	m := new(cacheManagerMetrics)
 	m.initMetrics()
 	cache := newDiskCache(m, dir, 1<<30, 1000, 1, &conf, nil)
+	defer cache.stop()
+	cache.Lock()
 	cache.scanned = true
+	cache.Unlock()
 	key := "0_0_4"
 
 	beforeStage := time.Now()

@@ -29,6 +29,29 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
+// waitForFlush blocks until the store's flush goroutine has drained every page
+// the caller queued. The flush loop deletes the page from cache.pages under the
+// cache mutex after flushPage has returned, so taking the same mutex and seeing
+// the map empty orders that goroutine's read of cache.checksum before whatever
+// the caller does next. A sleep does not: it separates the two accesses in time
+// without ordering them, and that unordered pair is what the detector reports.
+func waitForFlush(t *testing.T, s *diskCache, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		s.Lock()
+		pending := len(s.pages)
+		s.Unlock()
+		if pending == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("cache %s still holds %d unflushed pages after %s", s.dir, pending, timeout)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestChecksum(t *testing.T) {
 	conf := testConf()
 	conf.FreeSpace = 0.01
@@ -37,6 +60,7 @@ func TestChecksum(t *testing.T) {
 	m := new(cacheManagerMetrics)
 	m.initMetrics()
 	s := newDiskCache(m, conf.CacheDir, 1<<30, conf.CacheItems, 1, &conf, nil)
+	defer s.stop()
 	k1 := "0_0_10" // no checksum
 	k2 := "1_0_10"
 	k3 := "2_1_102400"
@@ -47,6 +71,7 @@ func TestChecksum(t *testing.T) {
 	defer p.Release()
 	s.cache(k1, p, true, false)
 
+	waitForFlush(t, s, time.Minute)
 	s.checksum = CsFull
 	s.cache(k2, p, true, false)
 
@@ -82,7 +107,7 @@ func TestChecksum(t *testing.T) {
 	buf = make([]byte, 1048576)
 	utils.RandRead(buf)
 	s.cache(k5, NewPage(buf), true, false)
-	time.Sleep(time.Second * 5) // wait for cache file flushed
+	waitForFlush(t, s, time.Minute) // wait for cache files flushed
 
 	check := func(key string, off int64, size int) error {
 		rc, err := s.load(key)
@@ -122,6 +147,8 @@ func TestChecksum(t *testing.T) {
 		{k5, 102400, 512000, true},
 	}
 	for _, l := range []string{CsNone, CsFull, CsShrink, CsExtend} {
+		// Nothing is queued past this point, and waitForFlush above ordered the
+		// flush goroutine's last read of checksum before these writes.
 		s.checksum = l
 		if l != CsNone {
 			cases[6].expect = false

@@ -266,8 +266,19 @@ func (cache *diskCache) checkLockFile() {
 	}
 }
 
+// curState returns the state machine the cache is in at this moment. Every
+// transition replaces cache.state under stateLock, so a reader has to take the
+// same lock to read the field. The lock is released before the state is used:
+// onIOErr transitions the machine from inside, and that path takes stateLock
+// itself.
+func (c *diskCache) curState() dcState {
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+	return c.state
+}
+
 func (c *diskCache) available() bool {
-	return c.state.state() != dcDown
+	return c.curState().state() != dcDown
 }
 
 func (c *diskCache) enabled() bool {
@@ -279,12 +290,15 @@ func (c *diskCache) full() bool {
 }
 
 func (cache *diskCache) checkErr(f func() error) error {
-	if !cache.available() {
+	// One state for the whole operation: beforeCacheOp and afterCacheOp have to
+	// land on the same object even when the machine transitions meanwhile.
+	st := cache.curState()
+	if st.state() == dcDown {
 		return errCacheDown
 	}
-	cache.state.beforeCacheOp()
-	defer cache.state.afterCacheOp()
-	if err := cache.state.checkCacheOp(); err != nil {
+	st.beforeCacheOp()
+	defer st.afterCacheOp()
+	if err := st.checkCacheOp(); err != nil {
 		return err
 	}
 
@@ -300,10 +314,10 @@ func (cache *diskCache) checkErr(f func() error) error {
 	if err != nil {
 		if errors.Is(err, syscall.EIO) || errors.Is(err, utils.ErrFuncTimeout) {
 			logger.Errorf("cache store is unavailable: %s", err)
-			cache.state.onIOErr()
+			st.onIOErr()
 		}
 	} else {
-		cache.state.onIOSucc()
+		st.onIOSucc()
 	}
 	return err
 }
@@ -316,11 +330,12 @@ func (c *diskCache) checkTimeout() {
 	for c.available() {
 		now := utils.Clock()
 		cutOff := now - maxIODur
+		st := c.curState()
 		c.opMu.Lock()
 		for ts := range c.opTs {
 			if ts < cutOff {
 				logger.Warnf("IO operation %s on %s is timeout after %s, ", getFunctionName(c.opTs[ts]), c.dir, now-ts)
-				c.state.onIOErr()
+				st.onIOErr()
 				delete(c.opTs, ts)
 			}
 		}
@@ -934,7 +949,14 @@ func (cache *diskCache) cleanupFull() {
 }
 
 func (cache *diskCache) uploadStaging() {
-	if !cache.scanned || cache.uploader == nil {
+	if cache.uploader == nil {
+		return
+	}
+	// scanned is owned by the cache mutex; scanCached flips it there.
+	cache.Lock()
+	scanned := cache.scanned
+	cache.Unlock()
+	if !scanned {
 		return
 	}
 	usage := cache.curFreeRatio()

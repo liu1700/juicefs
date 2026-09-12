@@ -169,6 +169,16 @@ type unstableDC struct {
 	ioCnt     uint32
 
 	concurrency atomic.Int64
+
+	// The four tunables below are read by tick's goroutine for as long as this
+	// state lives. They are copied here in init, before that goroutine starts,
+	// so the goroutine reads its own fields: the package variables they come
+	// from are rewritten by getEnvs on every newCacheManager and by tests, and
+	// neither write is ordered against a running ticker.
+	tickDur           time.Duration
+	minIOSuccToNormal uint32
+	maxIOErrPct       float64
+	maxDurToDown      time.Duration
 }
 
 func (dc *unstableDC) state() int { return dcUnstable }
@@ -176,6 +186,10 @@ func (dc *unstableDC) state() int { return dcUnstable }
 func (dc *unstableDC) init(cs *diskCache) {
 	dc.baseDC.init(cs)
 	dc.startTime = time.Now()
+	dc.tickDur = tickDurForUnstable
+	dc.minIOSuccToNormal = minIOSuccToNormal
+	dc.maxIOErrPct = maxIOErrPercentageToNormal
+	dc.maxDurToDown = maxDurToDown
 }
 
 func (dc *unstableDC) onIOErr() {
@@ -194,7 +208,7 @@ func probeCacheKey(id, size int) string {
 func (dc *unstableDC) tick() {
 	go dc.probe()
 	go func() {
-		ticker := time.NewTicker(tickDurForUnstable)
+		ticker := time.NewTicker(dc.tickDur)
 		defer ticker.Stop()
 
 		for {
@@ -203,9 +217,9 @@ func (dc *unstableDC) tick() {
 				return
 			case <-ticker.C:
 				errCnt, ioCnt := atomic.LoadUint32(&dc.ioErrCnt), atomic.LoadUint32(&dc.ioCnt)
-				if ioCnt >= minIOSuccToNormal && float64(errCnt)/float64(ioCnt) <= maxIOErrPercentageToNormal {
+				if ioCnt >= dc.minIOSuccToNormal && float64(errCnt)/float64(ioCnt) <= dc.maxIOErrPct {
 					dc.cache.event(eventToNormal)
-				} else if time.Since(dc.startTime) >= maxDurToDown {
+				} else if time.Since(dc.startTime) >= dc.maxDurToDown {
 					dc.cache.event(eventToDown)
 				} else {
 					atomic.StoreUint32(&dc.ioErrCnt, 0)
