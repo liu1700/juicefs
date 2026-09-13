@@ -46,6 +46,14 @@ var (
 		Name: "fuse_ops_io_errors",
 		Help: "Number of IO errors.",
 	}, []string{"errno"})
+	fuseForgetTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "fuse_forget_total",
+		Help: "Total number of FUSE FORGET requests.",
+	})
+	fuseForgetNlookupTotal = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "fuse_forget_nlookup_total",
+		Help: "Total lookup references released by FUSE FORGET requests.",
+	})
 )
 
 type logReader struct {

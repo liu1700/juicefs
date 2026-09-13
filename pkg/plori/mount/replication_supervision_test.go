@@ -59,6 +59,12 @@ func (r *watchedReplicator) counts() (probes, restarts int) {
 	return r.probes, r.restarts
 }
 
+func (r *watchedReplicator) RestartCount() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return uint64(r.restarts)
+}
+
 // slowProbeReplicator waits for its recovery context to expire. It models a
 // local socket call that cannot return before the supervisor's call budget.
 type slowProbeReplicator struct {
@@ -159,6 +165,10 @@ func TestTheRepairIsAttemptedOncePerFailure(t *testing.T) {
 	}
 	if restarts != 1 {
 		t.Errorf("restarts = %d, want exactly one for one uninterrupted failure", restarts)
+	}
+	sup.writeHealth()
+	if got := readHealth(t, sup).LitestreamRestarts; got != 1 {
+		t.Errorf("litestream restarts = %d, want 1", got)
 	}
 }
 

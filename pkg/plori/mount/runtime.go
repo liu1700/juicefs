@@ -42,6 +42,10 @@ func (p Paths) ReadyPath() string { return p.StateDir + "/ready" }
 // HealthPath is rewritten every renew tick.
 func (p Paths) HealthPath() string { return p.StateDir + "/health.json" }
 
+// MetricsPath is the private in-pod Prometheus socket. It is not a TCP
+// listener because the Agent shares the Pod network namespace.
+func (p Paths) MetricsPath() string { return p.StateDir + "/metrics.sock" }
+
 // CleanStopPath records that the previous generation completed its ordered
 // stop. It is written as the last act of a clean shutdown and removed at the
 // start of every run, so its absence is a reliable "the previous writer died
@@ -375,6 +379,13 @@ type ReplicationSupervisor interface {
 	// it from its own goroutine, so it never overlaps a barrier or a stop,
 	// and never more than once per uninterrupted failure.
 	Restart(ctx context.Context) error
+}
+
+// ReplicatorRestartCounter is optional because node-level replication does
+// not own a Litestream child for an individual mount. The per-mount
+// implementation reports only replacements it actually started.
+type ReplicatorRestartCounter interface {
+	RestartCount() uint64
 }
 
 // Fencer claims the epoch's fence marker in the object store.

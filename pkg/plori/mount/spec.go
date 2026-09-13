@@ -78,9 +78,10 @@ var ParseMountOptions = mountspec.ParseMountOptions
 var ErrSpec = mountspec.ErrSpec
 
 const (
-	// CredentialSourceNodeSecret is the single member of the credential-source
-	// vocabulary: the object key is already on the node.
-	CredentialSourceNodeSecret = mountspec.CredentialSourceNodeSecret
+	// CredentialSourceNodeSecret and CredentialSourceClaimInline are the
+	// credential-source vocabulary. The command binds each to a mount mode.
+	CredentialSourceNodeSecret  = mountspec.CredentialSourceNodeSecret
+	CredentialSourceClaimInline = mountspec.CredentialSourceClaimInline
 
 	// Volume lifecycle states this worker recognises.
 	VolumeStateAllocating = mountspec.VolumeStateAllocating

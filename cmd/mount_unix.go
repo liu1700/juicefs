@@ -430,6 +430,16 @@ func fuseFlags() []cli.Flag {
 			Name:  "all-squash",
 			Usage: "mapping all users to another one specified as <uid>:<gid>",
 		},
+		&cli.StringFlag{
+			Name:   "visible-owner",
+			Usage:  "replace UID/GID returned to the FUSE client as <uid>:<gid>",
+			Hidden: true,
+		},
+		&cli.BoolFlag{
+			Name:   "plori-trusted-all-squash-root",
+			Usage:  "map all requests to root for the trusted in-pod Plori mount",
+			Hidden: true,
+		},
 		&cli.BoolFlag{
 			Name:  "prefix-internal",
 			Usage: "add '.jfs' prefix to all internal files",
@@ -1156,9 +1166,23 @@ func serveMount(v *vfs.VFS, c *cli.Context) error {
 		logger.Warnf("On kernel versions below 5.11 (current: %d.%d), negative-entry-cache may cause concurrent check-then-create operations (e.g. mkdir -p) to fail in a distributed environment", major, minor)
 	}
 	conf.NonDefaultPermission = c.Bool("non-default-permission")
+	applyOwnershipMappings(conf, c)
+	logger.Infof("Mounting volume %s at %q ...", conf.Format.Name, conf.Meta.MountPoint)
+	return fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))
+}
+
+// applyOwnershipMappings applies public squash flags and the one internal
+// in-pod root mapping. Public parseUIDGID deliberately refuses uid/gid zero;
+// the trusted flag bypasses it only for plori-mount's fixed in-pod context.
+func applyOwnershipMappings(conf *vfs.Config, c *cli.Context) {
 	rootSquash := c.String("root-squash")
 	allSquash := c.String("all-squash")
-	if allSquash != "" || rootSquash != "" {
+	visibleOwner := c.String("visible-owner")
+	if c.Bool("plori-trusted-all-squash-root") {
+		conf.NonDefaultPermission = true // disable kernel permission check
+		conf.AllSquash = &vfs.AnonymousAccount{Uid: 0, Gid: 0}
+		logger.Infof("Map all uid/gid to 0/0 for trusted in-pod mount")
+	} else if allSquash != "" || rootSquash != "" {
 		nobodyUid, nobodyGid := getNobodyUIDGID()
 		// all-squash takes precedence over root-squash
 		if allSquash != "" {
@@ -1172,6 +1196,10 @@ func serveMount(v *vfs.VFS, c *cli.Context) error {
 			logger.Infof("Map root uid/gid 0 to %d/%d by setting root-squash", uid, gid)
 		}
 	}
-	logger.Infof("Mounting volume %s at %q ...", conf.Format.Name, conf.Meta.MountPoint)
-	return fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))
+	if visibleOwner != "" {
+		nobodyUid, nobodyGid := getNobodyUIDGID()
+		uid, gid := parseUIDGID(visibleOwner, nobodyUid, nobodyGid)
+		conf.VisibleOwner = &vfs.AnonymousAccount{Uid: uid, Gid: gid}
+		logger.Infof("Return uid/gid %d/%d to FUSE clients", uid, gid)
+	}
 }

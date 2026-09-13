@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -105,8 +106,9 @@ type Litestream struct {
 	done                chan error
 	lastRestoreAttempts []string
 
-	spec *MountSpec
-	opts MountOptions
+	spec     *MountSpec
+	opts     MountOptions
+	restarts atomic.Uint64
 }
 
 // ErrReplicaEmpty means the metadata prefix holds no restorable generation.
@@ -771,8 +773,16 @@ func (l *Litestream) Restart(ctx context.Context) error {
 		l.done = nil
 	}
 	l.cmd = nil
-	return l.Start(ctx)
+	if err := l.Start(ctx); err != nil {
+		return err
+	}
+	l.restarts.Add(1)
+	return nil
 }
+
+// RestartCount is the number of replacement children this Litestream started
+// after its initial child. Failed replacement attempts do not advance it.
+func (l *Litestream) RestartCount() uint64 { return l.restarts.Load() }
 
 func (l *Litestream) run(ctx context.Context, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, l.Bin, args...)
@@ -852,6 +862,7 @@ func (l *Litestream) ReloadCredentials(ctx context.Context) error {
 	if err := l.Start(ctx); err != nil {
 		return fmt.Errorf("restart litestream after credential reload: %w (final sync: %v)", err, syncErr)
 	}
+	l.restarts.Add(1)
 	return nil
 }
 

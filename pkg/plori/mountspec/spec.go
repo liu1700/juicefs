@@ -44,15 +44,19 @@ import (
 	"time"
 )
 
-// CredentialSourceNodeSecret is the single member of the credential-source
-// vocabulary. It means: the object key is already on the node, mounted into
-// this process as a Kubernetes Secret, and the MountSpec carries none.
+// CredentialSourceNodeSecret means the object key is already on the node.
+// CredentialSourceClaimInline means the trusted in-pod executor staged it in
+// this worker's private credential file. The command's mount mode binds each
+// source to its delivery path.
 //
 // A worker that does not recognise the value MUST refuse to mount rather than
 // fall back to any other source; that fail-closed rule is what stops a future
 // second delivery mode from silently downgrading an old worker
 // (docs/design/per-agent-juicefs/mountspec.md §5).
-const CredentialSourceNodeSecret = "node_secret"
+const (
+	CredentialSourceNodeSecret  = "node_secret"
+	CredentialSourceClaimInline = "claim_inline"
+)
 
 // Volume lifecycle states this worker recognises. `active` is the only state a
 // writable mount may be served from; `formatted` and `allocating` are the two
@@ -331,9 +335,10 @@ func (s *MountSpec) Validate() error {
 	if err := s.validateRestoreInstruction(); err != nil {
 		return err
 	}
-	if s.ObjectStore.CredentialSource != CredentialSourceNodeSecret {
-		return fmt.Errorf("%w: unsupported credential_source %q (this worker only understands %q)",
-			ErrSpec, s.ObjectStore.CredentialSource, CredentialSourceNodeSecret)
+	switch s.ObjectStore.CredentialSource {
+	case CredentialSourceNodeSecret, CredentialSourceClaimInline:
+	default:
+		return fmt.Errorf("%w: unsupported credential_source %q", ErrSpec, s.ObjectStore.CredentialSource)
 	}
 	if s.ObjectStore.Endpoint == "" || s.ObjectStore.Bucket == "" {
 		return fmt.Errorf("%w: object_store endpoint and bucket are required", ErrSpec)

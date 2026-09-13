@@ -75,6 +75,7 @@ machine.`,
 			&cli.StringFlag{Name: "token-file", Required: true, Usage: "projected ServiceAccount token, re-read on every call"},
 			&cli.StringFlag{Name: "lease-release-capability-file", Usage: "private one-generation lease-release capability file, used only during shutdown"},
 			&cli.StringFlag{Name: "credential-file", EnvVars: []string{"PLORI_OBJECT_CREDENTIAL_FILE"}, Usage: "JSON object credential, re-read while the worker runs; without it the AWS_* environment is used and the key cannot rotate"},
+			&cli.StringFlag{Name: "mount-mode", Value: "node_broker", Usage: "mount delivery mode: node_broker or in_pod"},
 			&cli.StringFlag{Name: "litestream-bin", Value: "litestream", Usage: "path to the pinned litestream binary"},
 			&cli.StringFlag{Name: "replicator", Usage: "control socket of the node-level litestream; without it this worker execs its own litestream child"},
 			&cli.StringFlag{Name: "log-format", Value: "json", Usage: "log format (json)"},
@@ -93,6 +94,18 @@ func ploriMount(c *cli.Context) error {
 	spec, err := pmount.LoadSpec(paths.SpecFile)
 	if err != nil {
 		exitTerminal("", 0, pmount.Classify(err))
+	}
+	mode, err := parseMountMode(c.String("mount-mode"))
+	if err != nil {
+		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
+	}
+	if err := validateMountRuntime(mode, spec.ObjectStore.CredentialSource, c.String("credential-file"), c.String("replicator")); err != nil {
+		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
+	}
+	if mode == mountModeInPod {
+		if err := setMountNonDumpable(); err != nil {
+			exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, &pmount.Fatal{Exit: pmount.CodeRefused, ErrCode: pmount.ErrCodeRestoreFailed, Err: fmt.Errorf("set non-dumpable mount process: %w", err)})
+		}
 	}
 	source, err := objectCredential(c.String("credential-file"))
 	if err != nil {
@@ -185,7 +198,7 @@ func ploriMount(c *cli.Context) error {
 		Paths:   paths,
 		Options: opts,
 		Deps: pmount.Deps{
-			FS:                   &ploriFS{paths: paths, opts: opts, credentials: credentials},
+			FS:                   &ploriFS{paths: paths, opts: opts, credentials: credentials, inPod: mode == mountModeInPod},
 			CP:                   cp,
 			Replicator:           replicator,
 			Fencer:               fencer,
@@ -195,6 +208,40 @@ func ploriMount(c *cli.Context) error {
 		},
 	}
 	exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, sup.Run(ctx, stop))
+	return nil
+}
+
+type mountMode string
+
+const (
+	mountModeNodeBroker mountMode = "node_broker"
+	mountModeInPod      mountMode = "in_pod"
+)
+
+func parseMountMode(raw string) (mountMode, error) {
+	mode := mountMode(raw)
+	switch mode {
+	case mountModeNodeBroker, mountModeInPod:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("%w: unsupported mount_mode %q", pmount.ErrSpec, raw)
+	}
+}
+
+func validateMountRuntime(mode mountMode, source, credentialFile, replicator string) error {
+	want := pmount.CredentialSourceNodeSecret
+	if mode == mountModeInPod {
+		want = pmount.CredentialSourceClaimInline
+	}
+	if source != want {
+		return fmt.Errorf("%w: mount_mode %q requires credential_source %q, got %q", pmount.ErrSpec, mode, want, source)
+	}
+	if mode == mountModeInPod && credentialFile == "" {
+		return fmt.Errorf("%w: mount_mode %q requires --credential-file", pmount.ErrSpec, mode)
+	}
+	if mode == mountModeInPod && replicator != "" {
+		return fmt.Errorf("%w: mount_mode %q does not support --replicator", pmount.ErrSpec, mode)
+	}
 	return nil
 }
 
@@ -257,6 +304,7 @@ type ploriFS struct {
 	paths       pmount.Paths
 	opts        pmount.MountOptions
 	credentials *pmount.CredentialWatcher
+	inPod       bool
 }
 
 // metaURI is the local SQLite metadata engine. It is deliberately a plain
@@ -420,7 +468,7 @@ func max64(a, b int64) int64 {
 // which is where the second juicefs process in the M0 RSS measurement comes
 // from. One volume per process means one process.
 func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volume, error) {
-	c, err := ploriMountContext(f.opts, f.paths)
+	c, err := ploriMountContext(f.opts, f.paths, f.inPod)
 	if err != nil {
 		return nil, err
 	}
@@ -448,6 +496,15 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 	// 68, whereas this path has to survive a rotation without stopping.
 	blob = &watchCredential{ObjectStorage: blob, w: f.credentials}
 	registerer, registry := wrapRegister(c, f.paths.MountPoint, format.Name)
+	var metrics *privateMetricsServer
+	if f.inPod {
+		metrics, err = startPrivateMetrics(f.paths.MetricsPath(), registry)
+		if err != nil {
+			object.Shutdown(blob)
+			_ = m.Shutdown()
+			return nil, fmt.Errorf("start private metrics: %w", err)
+		}
+	}
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(m, store, chunkConf)
 	return &ploriVolume{
@@ -459,6 +516,7 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 		vfsConf:  vfsConf,
 		registry: registry,
 		reg:      registerer,
+		metrics:  metrics,
 		identity: pmount.FormatIdentity{
 			Name:      format.Name,
 			UUID:      format.UUID,
@@ -478,6 +536,7 @@ type ploriVolume struct {
 	vfsConf   *vfs.Config
 	registry  *prometheus.Registry
 	reg       prometheus.Registerer
+	metrics   *privateMetricsServer
 	identity  pmount.FormatIdentity
 	v         *vfs.VFS
 	sessioned bool
@@ -582,6 +641,10 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	})
 	p.v = vfs.NewVFS(p.vfsConf, p.m, p.store, p.reg, p.registry)
 	p.v.UpdateFormat = updateFormat(p.cli)
+	// plori-mount serves FUSE in this process instead of going through the
+	// ordinary mount command, so it must register the VFS operation collectors
+	// that initBackgroundTasks normally installs.
+	vfs.InitMetrics(p.reg)
 	logger.Infof("JuiceFS version %s, plori-mount serving %s", version.Version(), p.identity.Name)
 	// serveMount rather than mountMain: the FUSE loop runs IN THIS PROCESS
 	// (cmd.mount() would re-exec itself at mount_unix.go:1016, which is the
@@ -780,8 +843,13 @@ func (p *ploriVolume) Unmount(ctx context.Context) error {
 func (p *ploriVolume) Close() error {
 	p.stopped = true
 	var err error
+	if p.metrics != nil {
+		err = p.metrics.Close()
+	}
 	if p.sessioned {
-		err = p.m.CloseSession()
+		if e := p.m.CloseSession(); err == nil {
+			err = e
+		}
 	}
 	object.Shutdown(p.blob)
 	if e := p.m.Shutdown(); err == nil {
@@ -803,7 +871,7 @@ func (p *ploriVolume) Close() error {
 // telemetry client, and an empty --metrics because one Prometheus listener per
 // mount does not fit a node running many (health.json is the surface, and
 // PLO-325 owns the rest).
-func ploriMountContext(opts pmount.MountOptions, paths pmount.Paths) (*cli.Context, error) {
+func ploriMountContext(opts pmount.MountOptions, paths pmount.Paths, inPod bool) (*cli.Context, error) {
 	set := flag.NewFlagSet("plori-mount", flag.ContinueOnError)
 	set.SetOutput(devNull{})
 	for _, f := range append(cmdMount().Flags, globalFlags()...) {
@@ -818,6 +886,9 @@ func ploriMountContext(opts pmount.MountOptions, paths pmount.Paths) (*cli.Conte
 		"buffer-size":     strconv.Itoa(opts.BufferSizeMB),
 		"heartbeat":       opts.Heartbeat.String(),
 	}
+	if opts.CacheSizeMB > 0 {
+		values["cache-size"] = strconv.Itoa(opts.CacheSizeMB)
+	}
 	if opts.Writeback {
 		values["writeback"] = "true"
 	}
@@ -826,6 +897,14 @@ func ploriMountContext(opts pmount.MountOptions, paths pmount.Paths) (*cli.Conte
 		// that default to uid 0 (pkg/fuse/fuse.go:485) while the explicit
 		// option sets it at any uid (:500-501).
 		values["o"] = "allow_other"
+	}
+	if inPod {
+		values["plori-trusted-all-squash-root"] = "true"
+		// The trusted supervisor keeps legacy metadata root-owned and maps every
+		// Agent request to root. gVisor performs chmod/utimes ownership checks
+		// before it dispatches FUSE_SETATTR, so it must see the isolated Agent as
+		// the client-visible owner.
+		values["visible-owner"] = "65532:65532"
 	}
 	for name, value := range values {
 		if set.Lookup(name) == nil {

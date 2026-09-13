@@ -122,26 +122,29 @@ type SecurityConfig struct {
 }
 
 type Config struct {
-	Meta                 *meta.Config
-	Format               meta.Format
-	Chunk                *chunk.Config
-	Security             *SecurityConfig
-	Port                 *Port
-	Version              string
-	AttrTimeout          time.Duration
-	DirEntryTimeout      time.Duration
-	NegEntryTimeout      time.Duration
-	EntryTimeout         time.Duration
-	ReaddirCache         bool
-	BackupMeta           time.Duration
-	BackupSkipTrash      bool
-	FastResolve          bool   `json:",omitempty"`
-	AccessLog            string `json:",omitempty"`
-	Subdir               string `json:",omitempty"`
-	PrefixInternal       bool
-	HideInternal         bool
-	RootSquash           *AnonymousAccount `json:",omitempty"`
-	AllSquash            *AnonymousAccount `json:",omitempty"`
+	Meta            *meta.Config
+	Format          meta.Format
+	Chunk           *chunk.Config
+	Security        *SecurityConfig
+	Port            *Port
+	Version         string
+	AttrTimeout     time.Duration
+	DirEntryTimeout time.Duration
+	NegEntryTimeout time.Duration
+	EntryTimeout    time.Duration
+	ReaddirCache    bool
+	BackupMeta      time.Duration
+	BackupSkipTrash bool
+	FastResolve     bool   `json:",omitempty"`
+	AccessLog       string `json:",omitempty"`
+	Subdir          string `json:",omitempty"`
+	PrefixInternal  bool
+	HideInternal    bool
+	RootSquash      *AnonymousAccount `json:",omitempty"`
+	AllSquash       *AnonymousAccount `json:",omitempty"`
+	// VisibleOwner replaces only the UID/GID returned to the FUSE client. It
+	// leaves metadata ownership and request credentials unchanged.
+	VisibleOwner         *AnonymousAccount `json:",omitempty"`
 	NonDefaultPermission bool              `json:",omitempty"`
 	UMask                uint16
 
@@ -1301,6 +1304,13 @@ func (v *VFS) ModifiedSince(ino Ino, start time.Time) bool {
 	return ok && t.After(start)
 }
 
+// Forget records a kernel FUSE FORGET request. JuiceFS uses durable inode IDs
+// directly and keeps no FUSE inode lookup table, so there is no VFS cleanup.
+func (v *VFS) Forget(nlookup uint64) {
+	fuseForgetTotal.Inc()
+	fuseForgetNlookupTotal.Add(float64(nlookup))
+}
+
 func (v *VFS) cleanupModified() {
 	for {
 		v.modM.Lock()
@@ -1395,6 +1405,8 @@ func InitMetrics(registerer prometheus.Registerer) {
 	registerer.MustRegister(opsTotal)
 	registerer.MustRegister(opsDurations)
 	registerer.MustRegister(opsIOErrors)
+	registerer.MustRegister(fuseForgetTotal)
+	registerer.MustRegister(fuseForgetNlookupTotal)
 	registerer.MustRegister(compactSizeHistogram)
 }
 

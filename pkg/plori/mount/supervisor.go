@@ -114,12 +114,13 @@ type Supervisor struct {
 	// renew), the allocator reissued the ceiling the volume already had, or a
 	// renew carrying the request came back with neither. It is the other half
 	// of quota_exhausted.
-	growDenied    bool
-	growAsked     bool
-	lastUsage     Usage
-	lastRenewOK   bool
-	fenced        bool
-	formattedHere bool
+	growDenied           bool
+	growAsked            bool
+	lastUsage            Usage
+	lastRenewOK          bool
+	leaseRenewalFailures uint64
+	fenced               bool
+	formattedHere        bool
 	// leaseTTL is the full lease length as the control-plane last issued it,
 	// observed rather than configured: the worker is never told the TTL, but
 	// every renewal's answer is one measurement of it. It bounds how early the
@@ -137,6 +138,9 @@ type Supervisor struct {
 	// restarted every health tick until the stop trips.
 	replRestarted  bool
 	restoreContext restoreContext
+	restoreMS      int64
+	mountMS        int64
+	readyMS        int64
 }
 
 type restoreContext struct {
@@ -163,6 +167,7 @@ func (s *Supervisor) log(event string, kv ...any) {
 // Run is the whole lifecycle: start, serve, stop. It returns a *Fatal whose
 // Exit is what the process exits with.
 func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
+	startedAt := s.now()
 	// The stop signal means two different things depending on when it lands,
 	// and ONE watcher turns it into both so there is a single cancellation
 	// path rather than two that can race:
@@ -230,6 +235,7 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- s.vol.Serve(serveCtx) }()
 
+	mountStartedAt := s.now()
 	if err := s.vol.AwaitMounted(startCtx); err != nil {
 		// The session is both the likeliest cause of a mount that never
 		// appeared and the only thing that knows why, so it is ended and
@@ -247,6 +253,7 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 		s.shutdown(context.Background(), stopOr(f, "mount_failed"))
 		return f
 	}
+	s.mountMS = s.now().Sub(mountStartedAt).Milliseconds()
 	// The control-plane learns what this filesystem is before the plugin is
 	// allowed to publish it. The ready file below is the plugin's signal to
 	// return a successful NodePublish, so everything that has to be true of
@@ -257,15 +264,20 @@ func (s *Supervisor) Run(ctx context.Context, stop <-chan os.Signal) *Fatal {
 		s.shutdown(context.Background(), reasonFor(f))
 		return f
 	}
+	readyMS := s.now().Sub(startedAt).Milliseconds()
 	if err := writeJSONAtomic(s.Paths.ReadyPath(), Ready{
 		Epoch:     s.Spec.FenceEpoch,
 		MountedAt: s.now().UTC(),
 		Volume:    s.Spec.StorageVolumeID,
+		RestoreMS: s.restoreMS,
+		MountMS:   s.mountMS,
+		ReadyMS:   readyMS,
 	}); err != nil {
 		f := preReady(startCtx, fatalf(CodeRefused, ErrCodeRestoreFailed, false, "write ready file: %s", err))
 		s.shutdown(context.Background(), stopOr(f, "ready_file_failed"))
 		return f
 	}
+	s.readyMS = readyMS
 	// Ordered after the ready file rather than before it, so the flag is never
 	// true for a worker whose mount the plugin was not told about. From here
 	// every renew tells the control-plane the restore this mount was admitted
@@ -427,9 +439,11 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 		s.log("fence_marker_claimed", "key", s.Spec.FenceMarkerKey)
 	}
 
+	restoreStartedAt := s.now()
 	if err := s.restoreOrFormat(ctx); err != nil {
 		return err
 	}
+	s.restoreMS = s.now().Sub(restoreStartedAt).Milliseconds()
 	// The long one. A restore is bounded by the size of the replica, not by
 	// anything this process controls, and it is the step the kubelet's grace
 	// period actually expires inside.
@@ -2285,6 +2299,9 @@ func reasonFor(f *Fatal) string {
 func (s *Supervisor) setRenewOK(ok bool) {
 	s.mu.Lock()
 	s.lastRenewOK = ok
+	if !ok {
+		s.leaseRenewalFailures++
+	}
 	s.mu.Unlock()
 }
 
@@ -2311,14 +2328,15 @@ func (s *Supervisor) writeHealth() {
 	s.noteQuotaTrips()
 	s.mu.Lock()
 	h := Health{
-		Epoch:             s.Spec.FenceEpoch,
-		LeaseExpiresAt:    s.deadline.WallExpiry(),
-		LastRenewOK:       s.lastRenewOK,
-		PendingBlocks:     s.vol.PendingBlocks(),
-		LastBarrierAt:     s.lastBarrier.BarrierAt,
-		UsedBytes:         s.lastUsage.Bytes,
-		UsedInodes:        s.lastUsage.Inodes,
-		GrantEpochApplied: s.grantApplied,
+		Epoch:                s.Spec.FenceEpoch,
+		LeaseExpiresAt:       s.deadline.WallExpiry(),
+		LastRenewOK:          s.lastRenewOK,
+		LeaseRenewalFailures: s.leaseRenewalFailures,
+		PendingBlocks:        s.vol.PendingBlocks(),
+		LastBarrierAt:        s.lastBarrier.BarrierAt,
+		UsedBytes:            s.lastUsage.Bytes,
+		UsedInodes:           s.lastUsage.Inodes,
+		GrantEpochApplied:    s.grantApplied,
 		// The whole predicate, in one place and evaluated from the state the
 		// mount already holds: this volume is against its ceiling AND there is
 		// no more room to be had. Either half alone is a normal, transient
@@ -2329,6 +2347,12 @@ func (s *Supervisor) writeHealth() {
 		Fenced:            s.fenced,
 		StagingBacklogCap: s.backlogCap,
 		ReplicationFailed: !s.replFailedSince.IsZero(),
+		RestoreMS:         s.restoreMS,
+		MountMS:           s.mountMS,
+		ReadyMS:           s.readyMS,
+	}
+	if counter, ok := s.Deps.Replicator.(ReplicatorRestartCounter); ok {
+		h.LitestreamRestarts = counter.RestartCount()
 	}
 	h.ProjectedDrainSeconds = s.drain.Project(h.PendingBlocks).Seconds()
 	h.DrainRateBlocksPerSecond = s.drain.RatePerSecond()
