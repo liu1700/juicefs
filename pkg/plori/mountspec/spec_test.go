@@ -138,6 +138,18 @@ func TestLoadAcceptsTheBootstrapWireShape(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsClaimInlineCredentialSource(t *testing.T) {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(validSpecJSON), &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["object_store"].(map[string]any)["credential_source"] = CredentialSourceClaimInline
+	body, _ := json.Marshal(raw)
+	if _, err := Load(writeSpec(t, string(body))); err != nil {
+		t.Fatalf("Load claim_inline: %v", err)
+	}
+}
+
 // A field this worker does not know about means the control-plane is ahead of
 // it. Ignoring it is the silent downgrade the closed vocabulary exists to
 // prevent, so the spec is refused with exit 64.

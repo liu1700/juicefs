@@ -950,6 +950,9 @@ func TestTransientRenewFailuresRetryBeforeTheWriteStopMargin(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("recovered worker did not stop")
 	}
+	if got := sup.leaseRenewalFailures; got != 1 {
+		t.Errorf("lease renewal failures = %d, want the one failed renewal", got)
+	}
 }
 
 func TestBlockedRenewCannotOutlastTheWriteStopMargin(t *testing.T) {

@@ -74,3 +74,14 @@ func TestMountOptionDurationsAcceptBothSpellings(t *testing.T) {
 		t.Errorf("litestream sync = %s, want the default %s", got.LitestreamSync, DefaultLitestreamSync)
 	}
 }
+
+func TestCacheSizeIsPositiveAndBoundedInMiB(t *testing.T) {
+	if got := ParseMountOptions([]string{"cache_size=512"}).CacheSizeMB; got != 512 {
+		t.Errorf("cache size = %d, want 512 MiB", got)
+	}
+	for _, raw := range []string{"cache_size=0", "cache_size=-1", "cache_size=bogus", "cache_size=2049"} {
+		if got := ParseMountOptions([]string{raw}).CacheSizeMB; got != 0 {
+			t.Errorf("%s produced cache size %d, want absent", raw, got)
+		}
+	}
+}

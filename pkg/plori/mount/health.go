@@ -33,21 +33,25 @@ type Ready struct {
 	Epoch     int64     `json:"epoch"`
 	MountedAt time.Time `json:"mounted_at"`
 	Volume    string    `json:"volume"`
+	RestoreMS int64     `json:"restore_ms"`
+	MountMS   int64     `json:"mount_ms"`
+	ReadyMS   int64     `json:"ready_ms"`
 }
 
 // Health is rewritten on every renew tick. Field names are the CLI contract's
 // ("Health" section); the plugin exposes them through its metrics endpoint,
 // which PLO-325 will consume.
 type Health struct {
-	Epoch             int64     `json:"epoch"`
-	LeaseExpiresAt    time.Time `json:"lease_expires_at"`
-	LastRenewOK       bool      `json:"last_renew_ok"`
-	ReplicaLagMs      int64     `json:"replica_lag_ms"`
-	PendingBlocks     uint64    `json:"pending_blocks"`
-	LastBarrierAt     time.Time `json:"last_barrier_at"`
-	UsedBytes         int64     `json:"used_bytes"`
-	UsedInodes        int64     `json:"used_inodes"`
-	GrantEpochApplied int64     `json:"grant_epoch_applied"`
+	Epoch                int64     `json:"epoch"`
+	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
+	LastRenewOK          bool      `json:"last_renew_ok"`
+	LeaseRenewalFailures uint64    `json:"lease_renewal_failures"`
+	ReplicaLagMs         int64     `json:"replica_lag_ms"`
+	PendingBlocks        uint64    `json:"pending_blocks"`
+	LastBarrierAt        time.Time `json:"last_barrier_at"`
+	UsedBytes            int64     `json:"used_bytes"`
+	UsedInodes           int64     `json:"used_inodes"`
+	GrantEpochApplied    int64     `json:"grant_epoch_applied"`
 	// ProjectedDrainSeconds is how long PendingBlocks would take to become
 	// durable at the drain rate this worker has measured. It is what makes the
 	// third stop instant possible: the plugin waits write_stop_margin + this
@@ -100,7 +104,11 @@ type Health struct {
 	// the new key up yet" without anything having to name the key. A worker
 	// whose credential cannot rotate at all (the environment-variable path)
 	// stays at 1 forever, which is the same signal read the other way.
-	CredentialGeneration int64 `json:"credential_generation"`
+	CredentialGeneration int64  `json:"credential_generation"`
+	LitestreamRestarts   uint64 `json:"litestream_restarts"`
+	RestoreMS            int64  `json:"restore_ms"`
+	MountMS              int64  `json:"mount_ms"`
+	ReadyMS              int64  `json:"ready_ms"`
 }
 
 // DurablePoint is the persisted recovery anchor.

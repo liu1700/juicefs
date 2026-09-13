@@ -25,7 +25,7 @@ import (
 // MountOptions is the resolved form of the MountSpec's `mount_options`.
 //
 // The vocabulary is closed and small (CLI contract rev 2): `writeback`,
-// `allow_other`, `buffer_size=`, `heartbeat=`, `barrier_interval=`,
+// `allow_other`, `buffer_size=`, `cache_size=`, `heartbeat=`, `barrier_interval=`,
 // `litestream_sync=`. It is deliberately NOT "a list of juicefs flags" — the
 // list is server-built and the two sides version independently, so the worker
 // understands a vocabulary rather than a command line.
@@ -39,9 +39,12 @@ import (
 // worker's environment; the Go runtime reads it directly, so it appears here
 // only to be ignored rather than warned about.
 type MountOptions struct {
-	Writeback       bool
-	AllowOther      bool
-	BufferSizeMB    int
+	Writeback    bool
+	AllowOther   bool
+	BufferSizeMB int
+	// CacheSizeMB is the total local disk cache capacity in MiB. Zero means
+	// absent, preserving the generic client's default for existing node mounts.
+	CacheSizeMB     int
 	Heartbeat       time.Duration
 	BarrierInterval time.Duration
 	LitestreamSync  time.Duration
@@ -67,6 +70,10 @@ const (
 	// DefaultBufferSizeMB is the floor the chunk store enforces anyway
 	// (pkg/chunk/cached_store.go:584-586 raises anything smaller to 32).
 	DefaultBufferSizeMB = 32
+	// MaxCacheSizeMB keeps a server-issued cache cap inside the per-sandbox
+	// ephemeral-storage envelope. Absent is distinct from zero: old node
+	// mounts retain JuiceFS's own cache-size default.
+	MaxCacheSizeMB = 2048
 	// DefaultBarrierInterval is the acknowledged-write loss window: an unclean
 	// death loses everything written since the last barrier, so the period is
 	// chosen for how much that costs, not for what the barrier costs. 15/60/300 s
@@ -164,6 +171,10 @@ func ParseMountOptions(entries []string) MountOptions {
 		case "buffer_size":
 			if n, err := strconv.Atoi(value); err == nil && n > 0 {
 				opts.BufferSizeMB = n
+			}
+		case "cache_size":
+			if n, err := strconv.Atoi(value); err == nil && n > 0 && n <= MaxCacheSizeMB {
+				opts.CacheSizeMB = n
 			}
 		case "heartbeat":
 			if d, ok := parseSeconds(value); ok {

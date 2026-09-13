@@ -70,6 +70,10 @@ func (fs *fileSystem) replyAttr(ctx *fuseContext, entry *meta.Entry, attr *fuse.
 		}
 	}
 	attrToStat(entry.Inode, entry.Attr, attr)
+	if owner := fs.conf.VisibleOwner; owner != nil {
+		attr.Uid = owner.Uid
+		attr.Gid = owner.Gid
+	}
 }
 
 func (fs *fileSystem) replyEntry(ctx *fuseContext, out *fuse.EntryOut, e *meta.Entry) fuse.Status {
@@ -99,6 +103,13 @@ func (fs *fileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name
 	return fs.replyEntry(ctx, out, entry)
 }
 
+// Forget observes the kernel's lookup-reference release. The VFS has no
+// FUSE inode lookup table to reclaim, so this preserves the default no-op
+// filesystem behavior while making the request observable privately.
+func (fs *fileSystem) Forget(nodeID, nlookup uint64) {
+	fs.v.Forget(nlookup)
+}
+
 func (fs *fileSystem) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *fuse.AttrOut) (code fuse.Status) {
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
@@ -112,6 +123,14 @@ func (fs *fileSystem) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *f
 	}
 	fs.replyAttr(ctx, entry, &out.Attr, out.SetTimeout)
 	return 0
+}
+
+// Access is required when the kernel does not provide default_permissions.
+// newContext applies AllSquash before VFS checks the requested access.
+func (fs *fileSystem) Access(cancel <-chan struct{}, in *fuse.AccessIn) (code fuse.Status) {
+	ctx := fs.newContext(cancel, &in.InHeader)
+	defer releaseContext(ctx)
+	return fuse.Status(fs.v.Access(ctx, Ino(in.NodeId), int(in.Mask)))
 }
 
 func (fs *fileSystem) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fuse.AttrOut) (code fuse.Status) {
