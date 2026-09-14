@@ -141,7 +141,9 @@ test.plori.unit:
 # argv. The rest of ./cmd's suite needs a Redis and a real object store, so this
 # names its tests rather than running the package.
 	$(PLORI_CGO) go test -count=1 -timeout 5m -tags "$(PLORI_TAGS)" ./cmd/ \
-		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath|TestTheTrashIsNotWalked|TestAFailedTrashWalk'
+		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath|TestTheTrashIsNotWalked|TestAFailedTrashWalk|TestPloriVFSConfigDisablesInternalCommandsForBothMountModes|TestGenericVFSConfigKeepsInternalCommandsEnabled'
+	$(PLORI_CGO) go test -count=1 -timeout 5m -tags "$(PLORI_TAGS)" ./pkg/fuse/ \
+		-run '^(TestPloriNativeInodeXattrIsReadOnlyFUSEIdentity|TestFuseXattrsEnabledOnlyForExistingOptionOrPloriIdentity)$$'
 # The asynchronous chunk cache, and the mount fixtures that drive it, under the
 # race detector. PLO-633 fixed the unsynchronized reads of diskCache.state and
 # diskCache.scanned and the test fixtures that mutated a running store, which is

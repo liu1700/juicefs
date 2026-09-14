@@ -305,6 +305,7 @@ func objectCredential(path string) (*creds.Source, error) {
 func ploriVFSConfig(c *cli.Context, metaConf *meta.Config, format *meta.Format, chunkConf *chunk.Config) *vfs.Config {
 	conf := getVfsConf(c, metaConf, format, chunkConf)
 	conf.DisableInternalCommands = true
+	conf.EnablePloriNativeInodeXattr = true
 	return conf
 }
 

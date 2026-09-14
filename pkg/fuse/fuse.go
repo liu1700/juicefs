@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -35,6 +36,8 @@ import (
 )
 
 var logger = utils.GetLogger("juicefs")
+
+const ploriNativeInodeXattr = "user.plori.native_inode"
 
 type fileSystem struct {
 	fuse.RawFileSystem
@@ -213,6 +216,17 @@ func (fs *fileSystem) Readlink(cancel <-chan struct{}, header *fuse.InHeader) (o
 }
 
 func (fs *fileSystem) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string, dest []byte) (sz uint32, code fuse.Status) {
+	if fs.conf.EnablePloriNativeInodeXattr {
+		if attr != ploriNativeInodeXattr {
+			return 0, fuse.Status(syscall.EOPNOTSUPP)
+		}
+		value := strconv.FormatUint(header.NodeId, 10)
+		if len(dest) > 0 && len(value) > len(dest) {
+			return 0, fuse.Status(syscall.ERANGE)
+		}
+		copy(dest, value)
+		return uint32(len(value)), 0
+	}
 	ctx := fs.newContext(cancel, header)
 	defer releaseContext(ctx)
 	value, err := fs.v.GetXattr(ctx, Ino(header.NodeId), attr, uint32(len(dest)))
@@ -224,6 +238,9 @@ func (fs *fileSystem) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, at
 }
 
 func (fs *fileSystem) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, dest []byte) (uint32, fuse.Status) {
+	if fs.conf.EnablePloriNativeInodeXattr {
+		return 0, 0
+	}
 	ctx := fs.newContext(cancel, header)
 	defer releaseContext(ctx)
 	data, err := fs.v.ListXattr(ctx, Ino(header.NodeId), len(dest))
@@ -235,6 +252,9 @@ func (fs *fileSystem) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, d
 }
 
 func (fs *fileSystem) SetXAttr(cancel <-chan struct{}, in *fuse.SetXAttrIn, attr string, data []byte) fuse.Status {
+	if fs.conf.EnablePloriNativeInodeXattr {
+		return fuse.Status(syscall.EOPNOTSUPP)
+	}
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	err := fs.v.SetXattr(ctx, Ino(in.NodeId), attr, data, in.Flags)
@@ -242,6 +262,9 @@ func (fs *fileSystem) SetXAttr(cancel <-chan struct{}, in *fuse.SetXAttrIn, attr
 }
 
 func (fs *fileSystem) RemoveXAttr(cancel <-chan struct{}, header *fuse.InHeader, attr string) (code fuse.Status) {
+	if fs.conf.EnablePloriNativeInodeXattr {
+		return fuse.Status(syscall.EOPNOTSUPP)
+	}
 	ctx := fs.newContext(cancel, header)
 	defer releaseContext(ctx)
 	err := fs.v.RemoveXattr(ctx, Ino(header.NodeId), attr)
@@ -496,7 +519,7 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	opt.EnableSymlinkCaching = conf.FuseOpts.EnableSymlinkCaching
 	opt.EnableAcl = conf.Format.EnableACL
 	opt.DontUmask = conf.Format.EnableACL
-	opt.DisableXAttrs = !xattrs
+	opt.DisableXAttrs = !fuseXattrsEnabled(conf, xattrs)
 	opt.EnableIoctl = ioctl
 	opt.MaxWrite = conf.FuseOpts.MaxWrite
 	opt.MaxReadAhead = 1 << 20
@@ -563,6 +586,10 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	fsserv = fssrv
 	fssrv.Serve()
 	return nil
+}
+
+func fuseXattrsEnabled(conf *vfs.Config, requested bool) bool {
+	return requested || (conf != nil && conf.EnablePloriNativeInodeXattr)
 }
 
 func GenFuseOpt(conf *vfs.Config, options string, mt int, noxattr, noacl bool, maxWrite int) fuse.MountOptions {

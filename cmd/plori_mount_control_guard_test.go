@@ -48,6 +48,12 @@ func TestPloriVFSConfigDisablesInternalCommandsForBothMountModes(t *testing.T) {
 			if !conf.DisableInternalCommands {
 				t.Fatal(".control commands remain enabled")
 			}
+			if !conf.EnablePloriNativeInodeXattr {
+				t.Fatal("native inode xattr is disabled")
+			}
+			if ctx.Bool("enable-xattr") {
+				t.Fatal("plori mount enables generic xattrs")
+			}
 		})
 	}
 }
@@ -65,5 +71,8 @@ func TestGenericVFSConfigKeepsInternalCommandsEnabled(t *testing.T) {
 	conf := getVfsConf(ctx, &meta.Config{}, &meta.Format{}, &chunk.Config{})
 	if conf.DisableInternalCommands {
 		t.Fatal("generic VFS configuration disables .control commands")
+	}
+	if conf.EnablePloriNativeInodeXattr {
+		t.Fatal("generic VFS configuration enables the native inode xattr")
 	}
 }

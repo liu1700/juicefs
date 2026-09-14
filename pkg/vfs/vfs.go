@@ -142,8 +142,12 @@ type Config struct {
 	HideInternal    bool
 	// DisableInternalCommands denies every .control command for this VFS.
 	DisableInternalCommands bool
-	RootSquash              *AnonymousAccount `json:",omitempty"`
-	AllSquash               *AnonymousAccount `json:",omitempty"`
+	// EnablePloriNativeInodeXattr exposes the read-only Plori native-inode
+	// identity through the FUSE adapter. It is set only by plori-mount; ordinary
+	// JuiceFS xattrs remain disabled unless their existing option enables them.
+	EnablePloriNativeInodeXattr bool              `json:"-"`
+	RootSquash                  *AnonymousAccount `json:",omitempty"`
+	AllSquash                   *AnonymousAccount `json:",omitempty"`
 	// VisibleOwner replaces only the UID/GID returned to the FUSE client. It
 	// leaves metadata ownership and request credentials unchanged.
 	VisibleOwner         *AnonymousAccount `json:",omitempty"`
