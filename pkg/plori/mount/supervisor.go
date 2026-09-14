@@ -2085,9 +2085,9 @@ func (s *Supervisor) fenceAndStop(f *Fatal, reason string) *Fatal {
 	if reason == ReasonFencedOutOfBand {
 		// Seal now: this writer provably no longer owns the epoch, so nothing
 		// it still holds open may commit — not one more slice (F-2 + F-1).
-		// The loop's workers are cancelled and joined first, so no periodic
-		// barrier can START once the seal is in: it would upload staged blocks
-		// into a data prefix this writer no longer owns.
+		// The seal is deliberately first: a writer that has lost its epoch
+		// must not make another commit while a cancelled periodic barrier
+		// returns. shutdown then cancels and joins the loop workers.
 		s.vol.FenceWrites()
 	}
 	s.mu.Lock()
@@ -2106,18 +2106,17 @@ func (s *Supervisor) fenceAndStop(f *Fatal, reason string) *Fatal {
 	return f
 }
 
-// shutdown is the ordered stop of ADR / PLO-326: fence new operations, run the
-// durability barrier, unmount and close SQLite, final replication sync, report
-// the durable point and usage, release the lease.
+// shutdown runs the ordered stop of ADR / PLO-326 after its loop workers join:
+// fence new operations, run the durability barrier, unmount and close SQLite,
+// final replication sync, report the durable point and usage, then release the
+// lease.
 //
 // The whole sequence is bounded by what is left of the lease, because a
 // barrier that outlives its authority is exactly the fault PLO-323 fault 4
-// names. When the bound is exhausted the worker exits 69 — reported data
-// loss — and still releases the lease, because holding it costs the Agent a
-// full TTL and buys nothing: the data is already lost either way. (PLO-326 B2
-// asks for "fail visibly WITHOUT releasing"; with F-2's seal a failed stop
-// cannot still be writing, so the amended bullet is "fail visibly, fenced,
-// then release" — threat-model.md §7.)
+// names. If a stop step exhausts that bound, the worker exits 69 after fencing
+// writes and releases the lease. A worker join timeout is different: the worker
+// can still own resources, so this process performs no teardown or lease
+// release; cmd/plori_mount.go exits the process instead.
 //
 // `reason` chooses between two shapes:
 //
@@ -2145,7 +2144,7 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// a periodic barrier, a probe or repair, a renewal or a usage walk
 	// overlapping the barrier, the final sync, the close or the release below
 	// is the overlap the loop once ruled out by running everything inline. The
-	// The bounded join uses the remaining lease as its budget. If it cannot
+	// bounded join uses the remaining lease as its budget. If it cannot
 	// finish, shutdown fences and returns without touching shared resources.
 	budget := s.deadline.RemainingLease(s.now())
 	if budget < time.Second {
