@@ -337,6 +337,10 @@ var internalMsgGate func(ctx meta.Context, cmd uint32) syscall.Errno
 func InternalMsgGateInstalled() bool { return internalMsgGate != nil }
 
 func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
+	if v.Conf != nil && v.Conf.DisableInternalCommands {
+		_, _ = out.Write([]byte{byte(syscall.EACCES & 0xff)})
+		return
+	}
 	if internalMsgGate != nil {
 		if eno := internalMsgGate(ctx, cmd); eno != 0 {
 			_, _ = out.Write([]byte{byte(eno & 0xff)})
