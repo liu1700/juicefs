@@ -216,6 +216,7 @@ var ClientRoutes = mountspec.ClientRoutes
 // spent that call and the resulting spec is in --spec-file.
 type Client struct {
 	BaseURL               string
+	WorkspaceGateway      bool
 	TokenFile             string
 	ReleaseCapabilityFile string
 	HTTP                  *http.Client
@@ -257,6 +258,13 @@ func (c *Client) post(ctx context.Context, route string, body, out any) error {
 }
 
 func (c *Client) postToken(ctx context.Context, route, tok string, body, out any) error {
+	if c.WorkspaceGateway {
+		const legacy = "/v1/internal/storage/"
+		if !strings.HasPrefix(route, legacy) {
+			return errors.New("unsupported gateway storage route")
+		}
+		route = "/v1/internal/workspace-storage/" + strings.TrimPrefix(route, legacy)
+	}
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("encode %s request: %w", route, err)

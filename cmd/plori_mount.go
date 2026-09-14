@@ -72,6 +72,7 @@ machine.`,
 			&cli.StringFlag{Name: "state-dir", Required: true, Usage: "private directory for the metadata database, WAL and replication state"},
 			&cli.StringFlag{Name: "cache-dir", Required: true, Usage: "JuiceFS writeback cache directory, one per volume"},
 			&cli.StringFlag{Name: "control-plane-url", Required: true, Usage: "base URL of the control-plane"},
+			&cli.BoolFlag{Name: "workspace-gateway", Usage: "use the separately authenticated Workspace writer API"},
 			&cli.StringFlag{Name: "token-file", Required: true, Usage: "projected ServiceAccount token, re-read on every call"},
 			&cli.StringFlag{Name: "lease-release-capability-file", Usage: "private one-generation lease-release capability file, used only during shutdown"},
 			&cli.StringFlag{Name: "credential-file", EnvVars: []string{"PLORI_OBJECT_CREDENTIAL_FILE"}, Usage: "JSON object credential, re-read while the worker runs; without it the AWS_* environment is used and the key cannot rotate"},
@@ -192,6 +193,7 @@ func ploriMount(c *cli.Context) error {
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 
 	cp := pmount.NewClient(c.String("control-plane-url"), paths.TokenFile, 10*time.Second)
+	cp.WorkspaceGateway = c.Bool("workspace-gateway")
 	cp.ReleaseCapabilityFile = c.String("lease-release-capability-file")
 	sup := &pmount.Supervisor{
 		Spec:    spec,
