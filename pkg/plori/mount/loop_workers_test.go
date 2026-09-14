@@ -604,6 +604,60 @@ type ledgerReplicator struct {
 	probes         atomic.Int32
 }
 
+// heldReloadReplicator deliberately violates ReplicatorReloader's cancellation
+// contract until the test releases it. It proves shutdown fences and leaves the
+// volume untouched rather than racing a live worker through unmount or close.
+type heldReloadReplicator struct {
+	fakeReplicator
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *heldReloadReplicator) ReloadCredentials(context.Context) error {
+	close(r.started)
+	<-r.release
+	return nil
+}
+
+func TestHeldCredentialReloadFencesWithoutTeardownOrCleanMarker(t *testing.T) {
+	path := credentialFile(t, testKeyID, testSecret)
+	vol := healthyVolume()
+	rep := &heldReloadReplicator{started: make(chan struct{}), release: make(chan struct{})}
+	spec := testSpec()
+	spec.LeaseRenewInterval = Duration(time.Second)
+	spec.LeaseExpiresAt = time.Now().UTC().Add(200 * time.Millisecond)
+	spec.WriteStopMargin = Duration(50 * time.Millisecond)
+	sup := newCloseoutSup(t, spec, vol, &fakeCP{}, rep, &fakeFencer{})
+	sup.Deps.Credentials = testWatcher(t, path, (&capturedLog{}).fn)
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	waitFor(t, 10*time.Second, func() bool { return exists(t, sup.Paths.ReadyPath()) }, "mount never became ready")
+	writeCredentialFile(t, path, testRotatedID, testSecret)
+	select {
+	case <-rep.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("credential reload never started")
+	}
+	stop <- syscall.SIGTERM
+	f := waitFatal(t, done, 5*time.Second, "held reload retained the supervisor")
+	if f.Exit != CodeBarrierIncomplete || f.ErrCode != ErrCodeBarrierIncomplete {
+		t.Fatalf("exit = %d/%s, want incomplete fenced stop", f.Exit, f.ErrCode)
+	}
+	if !vol.Fenced() {
+		t.Fatal("held worker stop did not fence writes")
+	}
+	for _, call := range vol.order() {
+		if call == "barrier" || call == "unmount" || call == "detach" || call == "close" {
+			t.Fatalf("unsafe teardown %q ran while reload was live: %v", call, vol.order())
+		}
+	}
+	if exists(t, sup.Paths.CleanStopPath()) {
+		t.Fatal("held worker stop wrote a clean marker")
+	}
+	close(rep.release)
+}
+
 func (r *ledgerReplicator) TxID(ctx context.Context) (string, error) {
 	defer r.ledger.enter("txid")()
 	ledgerJitter(ctx)

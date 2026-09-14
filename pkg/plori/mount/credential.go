@@ -95,8 +95,8 @@ const ReasonCredentialRejected = "credential_rejected"
 // untouched.
 type ReplicatorReloader interface {
 	// ReloadCredentials makes the replicator use the credential the source
-	// holds now. It is called only after a rotation, from the supervisor's own
-	// goroutine, so it never runs concurrently with a barrier or a shutdown.
+	// holds now. It runs on the serial replication lane and must return when
+	// ctx is cancelled: shutdown joins that lane before it touches the volume.
 	ReloadCredentials(ctx context.Context) error
 }
 

@@ -185,18 +185,32 @@ func (w *loopWorkers) pump() {
 //
 // It is called by the run loop's goroutine only, and is a no-op when no loop is
 // running: before the mount is up, and in tests that drive a step directly.
-func (s *Supervisor) stopWorkers(abandon bool) {
+func (s *Supervisor) stopWorkers(ctx context.Context, abandon bool) bool {
 	w := s.workers
 	if w == nil {
-		return
+		return true
 	}
 	s.workers = nil
 	w.cancel()
 	if abandon {
 		w.cancelRepair()
 	}
-	w.wg.Wait()
+	joined := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-ctx.Done():
+		// A caller that cannot join must fence and leave every owned resource
+		// alone. The mount command exits the process rather than tearing down
+		// underneath a live worker.
+		w.cancelRepair()
+		return false
+	}
 	w.cancelRepair()
+	return true
 }
 
 // spawn runs fn as one of the run loop's workers, so the stop joins it. With no

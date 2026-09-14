@@ -50,7 +50,6 @@ type Health struct {
 	// mtime said the same only as long as nothing else touched the file.
 	ObservedAt           time.Time `json:"observed_at"`
 	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
-	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
 	LastRenewOK          bool      `json:"last_renew_ok"`
 	LeaseRenewalFailures uint64    `json:"lease_renewal_failures"`
 	ReplicaLagMs         int64     `json:"replica_lag_ms"`

@@ -1179,7 +1179,7 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	// object store runs on the workers, and every stop joins them before it
 	// begins (loopWorkers). This select only decides.
 	w := s.startWorkers(ctx)
-	defer s.stopWorkers(false)
+	defer s.stopWorkers(context.Background(), false)
 	usageResults := make(chan usageObservation, 1)
 	startUsage := func() { s.startUsageObservation(w.ctx, usageResults) }
 
@@ -1543,7 +1543,10 @@ func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 func (s *Supervisor) runReplicationJob(ctx, repairCtx context.Context, job replicationJob) replicationObservation {
 	var obs replicationObservation
 	if job.reload && ctx.Err() == nil {
-		s.reloadReplicatorCredentials(repairCtx)
+		// Reload is cancelled with the ordinary worker context. A repair keeps
+		// repairCtx so an ordered stop can wait for bounded re-registration;
+		// credential reload may not retain the mount past that stop.
+		s.reloadReplicatorCredentials(ctx)
 	}
 	if job.probe && ctx.Err() == nil {
 		obs.stop, obs.changed = s.superviseReplication(ctx, repairCtx)
@@ -2085,7 +2088,6 @@ func (s *Supervisor) fenceAndStop(f *Fatal, reason string) *Fatal {
 		// The loop's workers are cancelled and joined first, so no periodic
 		// barrier can START once the seal is in: it would upload staged blocks
 		// into a data prefix this writer no longer owns.
-		s.stopWorkers(true)
 		s.vol.FenceWrites()
 	}
 	s.mu.Lock()
@@ -2143,15 +2145,26 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// a periodic barrier, a probe or repair, a renewal or a usage walk
 	// overlapping the barrier, the final sync, the close or the release below
 	// is the overlap the loop once ruled out by running everything inline. The
-	// join comes before the budget is read, so the budget is what is left.
-	s.stopWorkers(outOfBand)
-
+	// The bounded join uses the remaining lease as its budget. If it cannot
+	// finish, shutdown fences and returns without touching shared resources.
 	budget := s.deadline.RemainingLease(s.now())
 	if budget < time.Second {
 		budget = time.Second
 	}
 	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
+	if !s.stopWorkers(ctx, outOfBand) {
+		// A worker that did not observe cancellation can still hold a replicator
+		// or volume handle. Fence before returning, but do not detach, close,
+		// final-sync, release, or write clean: the command boundary terminates
+		// this process instead of racing those resources.
+		s.vol.FenceWrites()
+		s.mu.Lock()
+		s.fenced = true
+		s.mu.Unlock()
+		return fatalf(CodeBarrierIncomplete, ErrCodeBarrierIncomplete, false,
+			"worker did not stop before the lease shutdown budget")
+	}
 
 	var incomplete error
 	// Which of exit 69's two identifiers the shortfall belongs to. `incomplete`
