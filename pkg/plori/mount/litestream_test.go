@@ -20,7 +20,12 @@
 package mount
 
 import (
+	"bufio"
 	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -171,5 +176,163 @@ func TestStopStillEndsTheChildOutsideTheGroup(t *testing.T) {
 	}
 	if err := syscall.Kill(child, 0); err == nil {
 		t.Fatalf("the child pid %d is still alive after Stop", child)
+	}
+}
+
+// rawControlSocket is a Litestream control socket that answers with whatever
+// bytes the test writes, so an answer can be cut off, left unfinished or never
+// started: the shapes a dying or stalled replicator produces, which net/http's
+// own server will not emit on purpose.
+type rawControlSocket struct {
+	path string
+}
+
+func newRawControlSocket(t *testing.T, answer func(conn net.Conn)) *rawControlSocket {
+	t.Helper()
+	// A short path: sun_path is capped near 100 bytes on macOS.
+	dir, err := os.MkdirTemp("", "ctl")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	s := &rawControlSocket{path: filepath.Join(dir, "c.sock")}
+	ln, err := net.Listen("unix", s.path)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", s.path, err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				if _, err := http.ReadRequest(bufio.NewReader(conn)); err != nil {
+					return
+				}
+				answer(conn)
+			}()
+		}
+	}()
+	return s
+}
+
+// A 200 is only an acknowledgement once its body is whole. Each row is a way a
+// replicator can die mid-answer, and each used to be a completed sync: the read
+// loop stopped at any error and returned the bytes it had. The transport can
+// see the first two; the third ends like a whole body and only the decode of a
+// waiting sync can refuse it.
+func TestAControlAnswerCutShortIsNeverASuccessfulSync(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		wire             string
+		transportRefuses bool
+	}{
+		{
+			name:             "shorter than its content-length",
+			wire:             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 96\r\n\r\n{\"status\":\"synced\",\"txid\":9,",
+			transportRefuses: true,
+		},
+		{
+			name:             "a chunked body that never ends",
+			wire:             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n40\r\n{\"status\":\"synced\",\"txid\":9,",
+			transportRefuses: true,
+		},
+		{
+			name: "a close-delimited body cut mid-object",
+			wire: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"synced\",\"txid\":9,\"replicated_txid\":",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sock := newRawControlSocket(t, func(conn net.Conn) { _, _ = io.WriteString(conn, tc.wire) })
+			ctx := context.Background()
+			db := filepath.Join(t.TempDir(), "meta.db")
+			if _, err := litestreamControl(ctx, sock.path, "/sync", map[string]any{"path": db}); (err != nil) != tc.transportRefuses {
+				t.Errorf("control call error = %v, want refused by the transport: %t", err, tc.transportRefuses)
+			}
+			ls := &Litestream{SocketPath: sock.path, DBPath: db}
+			node := &NodeReplicator{SocketPath: sock.path, DBPath: db}
+			if err := ls.SyncAndWait(ctx); err == nil {
+				t.Error("per-mount SyncAndWait read a cut-off 200 as a completed sync")
+			}
+			if txid, err := ls.TxID(ctx); err == nil {
+				t.Errorf("per-mount TxID = %q from a cut-off 200, want an error", txid)
+			}
+			if err := node.SyncAndWait(ctx); err == nil {
+				t.Error("node SyncAndWait read a cut-off 200 as a completed sync")
+			}
+			if txid, err := node.TxID(ctx); err == nil {
+				t.Errorf("node TxID = %q from a cut-off 200, want an error", txid)
+			}
+		})
+	}
+}
+
+// The status line is whole even when the body is not, and a 404 is the answer
+// the node replicator's repair and detach branch on (isNotRegistered). A
+// cut-off body must not turn it into an untyped transport error.
+func TestAControlRefusalWithACutOffBodyKeepsItsStatus(t *testing.T) {
+	sock := newRawControlSocket(t, func(conn net.Conn) {
+		_, _ = io.WriteString(conn, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"error\":\"database not")
+	})
+	node := &NodeReplicator{SocketPath: sock.path, DBPath: filepath.Join(t.TempDir(), "meta.db")}
+	if err := node.Probe(context.Background()); !isNotRegistered(err) {
+		t.Fatalf("probe error = %v, want a 404 the caller can still tell apart", err)
+	}
+	if err := node.DetachBeforeRestore(context.Background()); err != nil {
+		t.Fatalf("detach read a cut-off 404 as a failure: %v", err)
+	}
+}
+
+// A replicator that stops answering must not hold a control call past its
+// bound, whether it never sends a status line or sends one and stalls in the
+// body, and a caller with no deadline of its own still gets one. The
+// abandoned connection is closed, so nothing is left waiting on the socket.
+func TestAStalledControlAnswerIsBoundedEvenWithoutACallerDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		answer   func(net.Conn)
+		noStatus bool
+	}{
+		{
+			name:     "no status line",
+			answer:   func(conn net.Conn) { _, _ = io.Copy(io.Discard, conn) },
+			noStatus: true,
+		},
+		{
+			name: "a body that stops arriving",
+			answer: func(conn net.Conn) {
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 96\r\n\r\n{\"status\":")
+				_, _ = io.Copy(io.Discard, conn)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			released := make(chan struct{}, 1)
+			sock := newRawControlSocket(t, func(conn net.Conn) {
+				tc.answer(conn)
+				released <- struct{}{}
+			})
+			const bound = 150 * time.Millisecond
+			start := time.Now()
+			_, err := litestreamControlWithin(context.Background(), bound, sock.path, "/sync", map[string]any{"wait": true})
+			elapsed := time.Since(start)
+			if err == nil {
+				t.Fatal("a stalled control call returned success")
+			}
+			if tc.noStatus && !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("error = %v, want the call's own deadline", err)
+			}
+			if elapsed > bound+time.Second {
+				t.Errorf("the call returned after %s, want about %s", elapsed, bound)
+			}
+			select {
+			case <-released:
+			case <-time.After(2 * time.Second):
+				t.Error("the abandoned connection was left open on the replicator")
+			}
+		})
 	}
 }

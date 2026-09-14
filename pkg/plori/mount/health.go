@@ -38,11 +38,18 @@ type Ready struct {
 	ReadyMS   int64     `json:"ready_ms"`
 }
 
-// Health is rewritten on every renew tick. Field names are the CLI contract's
-// ("Health" section); the plugin exposes them through its metrics endpoint,
-// which PLO-325 will consume.
+// Health is rewritten on every renew answer and every health tick. Field names
+// are the CLI contract's ("Health" section); the plugin exposes them through its
+// metrics endpoint, which PLO-325 will consume.
 type Health struct {
-	Epoch                int64     `json:"epoch"`
+	Epoch int64 `json:"epoch"`
+	// ObservedAt is when the run loop took this snapshot. The loop no longer
+	// waits on replication or a barrier, so a document whose observed_at stops
+	// moving means the loop itself is stuck or the write is failing
+	// (health_write_failed), not that a slow call is in progress. The file's
+	// mtime said the same only as long as nothing else touched the file.
+	ObservedAt           time.Time `json:"observed_at"`
+	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
 	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
 	LastRenewOK          bool      `json:"last_renew_ok"`
 	LeaseRenewalFailures uint64    `json:"lease_renewal_failures"`
@@ -99,6 +106,12 @@ type Health struct {
 	// ReplicaLagMs keeps reporting the last good value forever. Nothing else
 	// in this document distinguishes "replicating" from "not replicating".
 	ReplicationFailed bool `json:"replication_failed"`
+	// ReplicationCheckedAt is when the last replication probe returned, pass or
+	// fail; zero until the first one does, and for a replicator that cannot be
+	// probed. ReplicationFailed is only as current as this: a probe or repair
+	// that has not returned leaves the previous verdict standing, and the gap
+	// between this and ObservedAt is how old that verdict is.
+	ReplicationCheckedAt time.Time `json:"replication_checked_at"`
 	// CredentialGeneration counts the object keys this worker has run on,
 	// starting at 1. It is how a rotation drill answers "has the fleet picked
 	// the new key up yet" without anything having to name the key. A worker

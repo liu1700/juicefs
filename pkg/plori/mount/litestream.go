@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -563,11 +564,7 @@ type syncResponse struct {
 // SyncAndWait forces a sync and blocks until it completes — the CLI half of
 // DB.SyncAndWait.
 func (l *Litestream) SyncAndWait(ctx context.Context) error {
-	_, err := l.control(ctx, "/sync", map[string]any{
-		"path":    l.DBPath,
-		"wait":    true,
-		"timeout": 30,
-	})
+	_, err := syncAndWait(ctx, l.SocketPath, l.DBPath)
 	return err
 }
 
@@ -582,27 +579,60 @@ func (l *Litestream) SyncAndWait(ctx context.Context) error {
 // reach. Zero means nothing has been replicated yet, and that is reported as
 // no id rather than as transaction zero.
 func (l *Litestream) TxID(ctx context.Context) (string, error) {
-	body, err := l.control(ctx, "/sync", map[string]any{
-		"path":    l.DBPath,
+	resp, err := syncAndWait(ctx, l.SocketPath, l.DBPath)
+	if err != nil {
+		return "", err
+	}
+	return resp.replicatedTXID(), nil
+}
+
+// syncAndWait posts `/sync -wait` and returns the answer only if it arrived
+// whole.
+//
+// A waiting sync is the one control call whose success is an acknowledgement:
+// it is the final sync of an ordered stop and the anchor a durable point names.
+// v0.5.17 commits the status before it encodes the body (server.go:346-350), so
+// a 200 whose body is not one complete JSON object says nothing about whether
+// the sync behind it finished, and is refused rather than read as done.
+func syncAndWait(ctx context.Context, socketPath, dbPath string) (syncResponse, error) {
+	body, err := litestreamControl(ctx, socketPath, "/sync", map[string]any{
+		"path":    dbPath,
 		"wait":    true,
 		"timeout": 30,
 	})
 	if err != nil {
-		return "", err
+		return syncResponse{}, err
 	}
 	var resp syncResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", fmt.Errorf("decode sync response: %w", err)
+		return syncResponse{}, fmt.Errorf("decode sync response: %w", err)
 	}
-	if resp.ReplicatedTXID == 0 {
-		return "", nil
+	return resp, nil
+}
+
+// replicatedTXID is the replica position in `litestream restore -txid` form, or
+// "" when nothing has been replicated yet.
+func (r syncResponse) replicatedTXID() string {
+	if r.ReplicatedTXID == 0 {
+		return ""
 	}
-	return fmt.Sprintf("%016x", resp.ReplicatedTXID), nil
+	return fmt.Sprintf("%016x", r.ReplicatedTXID)
 }
 
 func (l *Litestream) control(ctx context.Context, route string, body any) ([]byte, error) {
 	return litestreamControl(ctx, l.SocketPath, route, body)
 }
+
+// ControlCallTimeout bounds one control-socket round trip, headers and body
+// together, whatever deadline the caller's context carries. v0.5.17 gives a
+// waiting `/sync` and `/unregister` 30 s of their own (server.go:422-428,
+// :649-653), so the bound leaves that answer room to arrive; it exists for the
+// routes with no server-side timeout and for callers whose context has none.
+const ControlCallTimeout = 45 * time.Second
+
+// maxControlResponse bounds a control-socket body. Every route the worker calls
+// answers one small JSON object.
+const maxControlResponse = 1 << 20
 
 // litestreamControl posts one request to a Litestream control socket.
 //
@@ -611,12 +641,22 @@ func (l *Litestream) control(ctx context.Context, route string, body any) ([]byt
 // node-level replicator on the socket the plugin owns (PLO-366). The only
 // thing that differs is which socket, which is the argument.
 func litestreamControl(ctx context.Context, socketPath, route string, body any) ([]byte, error) {
+	return litestreamControlWithin(ctx, ControlCallTimeout, socketPath, route, body)
+}
+
+// litestreamControlWithin is litestreamControl with its bound as an argument, so
+// a test can show the bound holds for a caller with no deadline of its own
+// without waiting out ControlCallTimeout.
+func litestreamControlWithin(ctx context.Context, limit time.Duration, socketPath, route string, body any) ([]byte, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
+	// A request's context covers the dial, the headers and the body read
+	// (net/http NewRequestWithContext), so this one deadline is the whole bound.
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
 	client := &http.Client{
-		Timeout: 60 * time.Second,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
@@ -641,17 +681,25 @@ func litestreamControl(ctx context.Context, socketPath, route string, body any) 
 		return nil, fmt.Errorf("litestream control %s: %w", route, err)
 	}
 	defer resp.Body.Close()
-	data := make([]byte, 0, 4096)
-	buf := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(buf)
-		data = append(data, buf[:n]...)
-		if err != nil || len(data) > 1<<20 {
-			break
-		}
+	// A body that ends early is an error, not a shorter answer. The read used to
+	// stop at ANY error and return what it had, so a 200 cut off by a deadline or
+	// a dropped connection (io.ErrUnexpectedEOF against its Content-Length) was
+	// a success.
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, maxControlResponse+1))
+	if readErr == nil && len(data) > maxControlResponse {
+		readErr = fmt.Errorf("response larger than %d bytes", maxControlResponse)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, &controlStatusError{Route: route, Status: resp.StatusCode, Body: strings.TrimSpace(string(data))}
+		// The status is whole even when the body is not, and callers branch on
+		// it (isNotRegistered), so the refusal is still typed.
+		msg := strings.TrimSpace(string(data))
+		if readErr != nil {
+			msg = fmt.Sprintf("%s (response body incomplete: %v)", msg, readErr)
+		}
+		return nil, &controlStatusError{Route: route, Status: resp.StatusCode, Body: msg}
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("litestream control %s: read response: %w", route, readErr)
 	}
 	return data, nil
 }

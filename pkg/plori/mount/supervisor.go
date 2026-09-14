@@ -137,11 +137,20 @@ type Supervisor struct {
 	// replRestarted records that the one repair attempt for the current
 	// failure has been made, so a replicator that cannot be revived is not
 	// restarted every health tick until the stop trips.
-	replRestarted  bool
+	replRestarted bool
+	// replCheckedAt is when the last replication probe returned, pass or fail.
+	replCheckedAt  time.Time
 	restoreContext restoreContext
 	restoreMS      int64
 	mountMS        int64
 	readyMS        int64
+
+	// workers is the run loop's slow work while the loop runs (loopWorkers).
+	// Only the loop's goroutine reads or writes it.
+	workers *loopWorkers
+	// tuneMu keeps one backlog-cap computation and its push together: a renewal
+	// and a barrier can both retune now, and must not push their caps out of order.
+	tuneMu sync.Mutex
 }
 
 type restoreContext struct {
@@ -1166,9 +1175,13 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	// published `used_bytes: 0` until the first report landed, which is how a
 	// whole staging run read zero for a volume holding 34 files.
 	s.usageTotals(ctx)
-	usageCtx, cancelUsage := context.WithCancel(ctx)
-	defer cancelUsage()
+	// Everything below that can wait on the network, the replicator or the
+	// object store runs on the workers, and every stop joins them before it
+	// begins (loopWorkers). This select only decides.
+	w := s.startWorkers(ctx)
+	defer s.stopWorkers(false)
 	usageResults := make(chan usageObservation, 1)
+	startUsage := func() { s.startUsageObservation(w.ctx, usageResults) }
 
 	renew := time.NewTimer(s.Spec.LeaseRenewInterval.D())
 	defer renew.Stop()
@@ -1193,15 +1206,22 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	credential := time.NewTicker(s.Deps.Credentials.Interval())
 	defer credential.Stop()
 
+	// The first probe runs now rather than one health interval from now, so the
+	// first health.json already carries a replication verdict.
+	_, supervised := s.Deps.Replicator.(ReplicationSupervisor)
+	w.wantProbe = supervised
+
 	ticks := 0
 	retrying := false
+	renewing := false
 	renewedAt := s.now()
 	for {
+		w.pump()
 		select {
 		case <-s.admissionRenew:
 			// Reuse the existing renewal timer and retry path. An event advances
 			// the next request; it does not start a second renewal goroutine.
-			if s.admissionPending() {
+			if !renewing && s.admissionPending() {
 				retrying = true
 				renew.Reset(0)
 			}
@@ -1245,12 +1265,10 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 					"lease deadline reached without a successful renewal"), ReasonFenced)
 			}
 			// A replacement node replicator can appear between health ticks. Once
-			// replication is known failed, use this existing one-second guard to
-			// finish its bounded recovery before the durability window closes.
-			if !s.replicationFailureSince().IsZero() {
-				if f := s.checkReplication(ctx); f != nil {
-					return f
-				}
+			// replication is known failed, this one-second guard asks for its
+			// bounded recovery before the durability window closes.
+			if supervised && !s.replicationFailureSince().IsZero() {
+				w.wantProbe = true
 			}
 
 		case <-renew.C:
@@ -1258,7 +1276,16 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			if normalRenew {
 				ticks++
 			}
-			result := s.renew(ctx, ticks, normalRenew, usageCtx, usageResults)
+			// The timer is re-armed only once this renewal's answer has been
+			// applied, so one renewal is in flight at a time.
+			renewing = true
+			if f := s.beginRenew(w, ticks, normalRenew); f != nil {
+				return f
+			}
+
+		case obs := <-w.renewDone:
+			renewing = false
+			result := s.applyRenew(ctx, obs, startUsage)
 			if result.fatal != nil {
 				return result.fatal
 			}
@@ -1276,14 +1303,13 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			renew.Reset(s.Spec.LeaseRenewInterval.D())
 
 		case <-health.C:
-			// The replication check runs on the health tick and not on its
-			// own, because health.json is where its verdict is published and
-			// because this select is the supervisor's only goroutine: a
-			// check here cannot overlap a barrier, a credential reload or a
-			// stop, which is what makes the repair safe to attempt from it
-			// (PLO-411).
-			if f := s.checkReplication(ctx); f != nil {
-				return f
+			// The replication check is asked for on the health tick because
+			// health.json is where its verdict is published. It runs on the
+			// replication lane, which never overlaps another probe, a repair,
+			// a credential reload or a stop (PLO-411), and its verdict comes
+			// back on replicationDone.
+			if supervised {
+				w.wantProbe = true
 			}
 			// The usage snapshot is refreshed on the tick that publishes it,
 			// for the same reason the replication check runs here. This ticker
@@ -1295,33 +1321,70 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			s.writeHealth()
 
 		case observed := <-usageResults:
-			s.finishUsageObservation(ctx, observed)
+			s.finishUsageObservation(w.ctx, observed)
 
 		case <-credential.C:
-			if f := s.pollCredential(ctx); f != nil {
+			// The file is read here, where the verdict is taken, so a key that
+			// has just rotated is seen before a rejection is acted on. Only the
+			// replicator's reload, which can take tens of seconds, is handed off.
+			if s.credentialRotated() {
+				w.wantReload = true
+			}
+			if f := s.stopIfCredentialRejected(); f != nil {
 				return f
 			}
 
+		case obs := <-w.replicationDone:
+			w.replicating = false
+			if obs.stop != nil {
+				return s.stopReplicationFailure(ctx, obs.stop.err, obs.stop.at, obs.stop.since)
+			}
+			if obs.changed {
+				s.writeHealth()
+			}
+
 		case <-barrier.C:
-			s.runBarrier(ctx)
+			w.wantBarrier = true
+
+		case <-w.barrierDone:
+			w.barriering = false
 		}
 	}
 }
 
-// renew performs one lease renewal. Its request is bounded by the same
-// ordered-stop instant that the guard uses, so a response arriving after that
-// instant cannot revive expired write authority.
-func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool, usageCtx context.Context, usageResults chan<- usageObservation) renewResult {
+// beginRenew starts one lease renewal off the run loop. Its request is bounded
+// by the ordered-stop instant the guard uses, taken now, so a response arriving
+// after that instant cannot revive expired write authority (applyRenew).
+func (s *Supervisor) beginRenew(w *loopWorkers, ticks int, reportUsage bool) *Fatal {
 	before := s.now()
 	due := s.deadline.StopBy(s.stopEarliness())
 	if !before.Before(due) {
-		return renewResult{fatal: s.deadlineFence()}
+		return s.deadlineFence()
 	}
-	renewCtx, cancel := context.WithTimeout(ctx, due.Sub(before))
-	defer cancel()
 	s.noteQuotaTrips()
-	request := s.renewRequest()
-	resp, err := s.Deps.CP.RenewLease(renewCtx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, request)
+	req := s.renewRequest()
+	renewCtx, cancel := context.WithTimeout(w.ctx, due.Sub(before))
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		defer cancel()
+		resp, err := s.Deps.CP.RenewLease(renewCtx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, req)
+		w.renewDone <- renewObservation{before: before, due: due, ticks: ticks, reportUsage: reportUsage, requestedGrowth: req.Grow, resp: resp, err: err}
+	}()
+	return nil
+}
+
+// applyRenew applies one renewal's answer. It runs on the run loop, the only
+// goroutine that moves the deadline or the write gate.
+func (s *Supervisor) applyRenew(ctx context.Context, obs renewObservation, startUsage func()) renewResult {
+	// A stop has begun and the loop is leaving: nothing a renewal still in
+	// flight says may move the deadline or the write gate again, or start a
+	// second stop.
+	if s.stopping() {
+		s.log("renew_answer_after_stop_ignored")
+		return renewResult{}
+	}
+	resp, err, before, due := obs.resp, obs.err, obs.before, obs.due
 	if err == nil {
 		err = resp.notOurs(s.Spec.StorageVolumeID, s.Spec.FenceEpoch)
 	}
@@ -1364,11 +1427,11 @@ func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool, usa
 		s.growAsked = false
 	}
 	s.mu.Unlock()
-	if request.Grow && resp.OverBudget && !grew && !unapplied {
+	if obs.requestedGrowth && resp.OverBudget && !grew && !unapplied {
 		s.growRefused()
 	}
-	if reportUsage && ticks%DefaultUsageReportEvery == 0 {
-		s.startUsageObservation(usageCtx, usageResults)
+	if obs.reportUsage && obs.ticks%DefaultUsageReportEvery == 0 && startUsage != nil {
+		startUsage()
 	}
 	s.writeHealth()
 	return renewResult{renewedAt: before, retry: s.admissionPending()}
@@ -1395,17 +1458,28 @@ func (s *Supervisor) renewRetryDelay(now time.Time) (time.Duration, bool) {
 // pollCredential re-reads the object key and decides whether this worker can
 // still reach the store. It returns non-nil only when the worker must stop.
 //
-// It runs in the supervisor's own goroutine, which is what makes the
-// replicator restart safe: a barrier, a shutdown and this cannot overlap.
+// The run loop takes the same two steps apart: it polls and decides on its own
+// goroutine, and hands the replicator reload to the replication lane, which
+// never overlaps a probe, a repair or a stop.
 func (s *Supervisor) pollCredential(ctx context.Context) *Fatal {
-	w := s.Deps.Credentials
-	if w == nil {
-		return nil
-	}
-	if w.Poll() {
+	if s.credentialRotated() {
 		s.reloadReplicatorCredentials(ctx)
 	}
-	if w.Verdict() != CredentialRejected {
+	return s.stopIfCredentialRejected()
+}
+
+// credentialRotated re-reads the credential file and reports whether the key
+// changed.
+func (s *Supervisor) credentialRotated() bool {
+	w := s.Deps.Credentials
+	return w != nil && w.Poll()
+}
+
+// stopIfCredentialRejected stops the worker once the store has refused its key
+// for the whole grace.
+func (s *Supervisor) stopIfCredentialRejected() *Fatal {
+	w := s.Deps.Credentials
+	if w == nil || w.Verdict() != CredentialRejected {
 		return nil
 	}
 	// The store has refused this key for the whole grace and no new one has
@@ -1457,9 +1531,32 @@ func (s *Supervisor) reloadReplicatorCredentials(ctx context.Context) {
 // data-loss-reported class a missed barrier gets (69), because that is what
 // it is.
 func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
+	stop, _ := s.superviseReplication(ctx, ctx)
+	if stop == nil {
+		return nil
+	}
+	return s.stopReplicationFailure(ctx, stop.err, stop.at, stop.since)
+}
+
+// runReplicationJob is the replication lane's work. It never stops the mount:
+// it reports what it found and the run loop decides.
+func (s *Supervisor) runReplicationJob(ctx, repairCtx context.Context, job replicationJob) replicationObservation {
+	var obs replicationObservation
+	if job.reload && ctx.Err() == nil {
+		s.reloadReplicatorCredentials(repairCtx)
+	}
+	if job.probe && ctx.Err() == nil {
+		obs.stop, obs.changed = s.superviseReplication(ctx, repairCtx)
+	}
+	return obs
+}
+
+// superviseReplication is checkReplication without the stop. The probe runs
+// under ctx and the repair under repairCtx, which an ordered stop lets finish.
+func (s *Supervisor) superviseReplication(ctx, repairCtx context.Context) (stop *replicationStop, changed bool) {
 	sup, ok := s.Deps.Replicator.(ReplicationSupervisor)
 	if !ok {
-		return nil
+		return nil, false
 	}
 	probeNow := s.now()
 	since := s.replicationFailureSince()
@@ -1468,56 +1565,65 @@ func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 		// The regular health check does not own lease expiry. The guard has
 		// already made that decision before it requests a recovery retry.
 		if since.IsZero() {
-			return nil
+			return nil, false
 		}
-		return s.stopReplicationFailure(ctx, errors.New("replication recovery window closed"), probeNow, since)
+		return &replicationStop{err: errors.New("replication recovery window closed"), at: probeNow, since: since}, false
 	}
 	err := sup.Probe(probe)
 	cancel()
+	// A probe the stop interrupted says nothing about the replicator, and
+	// counting it as a failure would send a repair into the replicator the stop
+	// is about to sync.
+	if ctx.Err() != nil {
+		return nil, false
+	}
 	if err == nil {
 		s.mu.Lock()
 		wasFailing := !s.replFailedSince.IsZero()
 		s.replFailedSince, s.replRestarted = time.Time{}, false
+		s.replCheckedAt = s.now()
 		s.mu.Unlock()
 		if wasFailing {
 			s.log("replication_recovered")
 		}
-		return nil
+		return nil, wasFailing
 	}
 
 	// Probe may consume its whole budget. Record the failure and calculate any
 	// next call from the time it returned, never from the time it began.
 	now := s.now()
 	s.mu.Lock()
-	if s.replFailedSince.IsZero() {
+	changed = s.replFailedSince.IsZero()
+	if changed {
 		s.replFailedSince = now
 	}
+	s.replCheckedAt = now
 	since, restarted := s.replFailedSince, s.replRestarted
 	s.mu.Unlock()
 	if now.Sub(since) >= s.barrierInterval() {
-		return s.stopReplicationFailure(ctx, err, now, since)
+		return &replicationStop{err: err, at: now, since: since}, changed
 	}
 
 	s.log("replication_probe_failed", "error", err.Error(), "failed_for", now.Sub(since).String())
 	if restarted {
-		return nil
+		return nil, changed
 	}
 	restartNow := s.now()
-	restart, cancel, canRestart := s.replicationRecoveryContext(ctx, restartNow, since)
+	restart, cancel, canRestart := s.replicationRecoveryContext(repairCtx, restartNow, since)
 	if !canRestart {
-		return s.stopReplicationFailure(ctx, err, restartNow, since)
+		return &replicationStop{err: err, at: restartNow, since: since}, changed
 	}
 	if rerr := sup.Restart(restart); rerr != nil {
 		cancel()
 		s.log("replication_restart_failed", "error", rerr.Error())
-		return nil
+		return nil, changed
 	}
 	cancel()
 	s.mu.Lock()
 	s.replRestarted = true
 	s.mu.Unlock()
 	s.log("replication_restarted")
-	return nil
+	return nil, changed
 }
 
 func (s *Supervisor) replicationFailureSince() time.Time {
@@ -1618,6 +1724,13 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 		// The barrier made the data-plane backlog durable, but a failed metadata
 		// sync cannot name a replica prefix the next generation can restore.
 		// Keep the previous local and control-plane point intact.
+		s.noteBarrier(res)
+		return
+	}
+	// A stop that began while this barrier ran owns what is reported next: an
+	// ordered stop reports the point its own barrier makes, and a stop that
+	// uploads nothing reports nothing.
+	if ctx.Err() != nil {
 		s.noteBarrier(res)
 		return
 	}
@@ -1888,13 +2001,13 @@ func (s *Supervisor) startUsageObservation(ctx context.Context, results chan<- u
 	}
 	s.usageObserving = true
 	s.mu.Unlock()
-	go func() {
+	s.spawn(func() {
 		u, err := s.vol.Usage(ctx, true)
 		select {
 		case results <- usageObservation{usage: u, err: err}:
 		case <-ctx.Done():
 		}
-	}()
+	})
 }
 
 func (s *Supervisor) finishUsageObservation(ctx context.Context, observed usageObservation) {
@@ -1908,7 +2021,14 @@ func (s *Supervisor) finishUsageObservation(ctx context.Context, observed usageO
 	s.mu.Lock()
 	s.lastUsage = observed.usage
 	s.mu.Unlock()
-	s.postUsage(ctx, observed.usage)
+	// The report is a control-plane round trip, so under a running loop it is
+	// a worker the stop joins rather than a wait inside the select.
+	if s.workers == nil {
+		s.postUsage(ctx, observed.usage)
+		return
+	}
+	u := observed.usage
+	s.spawn(func() { s.postUsage(ctx, u) })
 }
 
 // postUsage sends a snapshot the caller has already read. It is separate from
@@ -1962,6 +2082,10 @@ func (s *Supervisor) fenceAndStop(f *Fatal, reason string) *Fatal {
 	if reason == ReasonFencedOutOfBand {
 		// Seal now: this writer provably no longer owns the epoch, so nothing
 		// it still holds open may commit — not one more slice (F-2 + F-1).
+		// The loop's workers are cancelled and joined first, so no periodic
+		// barrier can START once the seal is in: it would upload staged blocks
+		// into a data prefix this writer no longer owns.
+		s.stopWorkers(true)
 		s.vol.FenceWrites()
 	}
 	s.mu.Lock()
@@ -2014,6 +2138,13 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	// process, so running them would spend the whole remaining lease failing
 	// and report data loss for a condition that is retryable (PLO-322).
 	outOfBand := reason == ReasonFencedOutOfBand || reason == ReasonCredentialRejected
+
+	// Nothing the run loop started may still be running once the stop begins:
+	// a periodic barrier, a probe or repair, a renewal or a usage walk
+	// overlapping the barrier, the final sync, the close or the release below
+	// is the overlap the loop once ruled out by running everything inline. The
+	// join comes before the budget is read, so the budget is what is left.
+	s.stopWorkers(outOfBand)
 
 	budget := s.deadline.RemainingLease(s.now())
 	if budget < time.Second {
@@ -2305,6 +2436,8 @@ func (s *Supervisor) retuneBacklog() {
 	if s.vol == nil {
 		return
 	}
+	s.tuneMu.Lock()
+	defer s.tuneMu.Unlock()
 	want := s.drain.CapForBudget(s.drainBudget(), DefaultMaxStagingBacklog)
 	s.mu.Lock()
 	changed := want != s.backlogCap
@@ -2364,6 +2497,14 @@ func reasonFor(f *Fatal) string {
 
 // ----------------------------------------------------------------- health ---
 
+// stopping reports whether a stop has begun; fenceAndStop and shutdown both
+// mark the worker fenced.
+func (s *Supervisor) stopping() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fenced
+}
+
 func (s *Supervisor) setRenewOK(ok bool) {
 	s.mu.Lock()
 	s.lastRenewOK = ok
@@ -2397,6 +2538,7 @@ func (s *Supervisor) writeHealth() {
 	s.mu.Lock()
 	h := Health{
 		Epoch:                s.Spec.FenceEpoch,
+		ObservedAt:           s.now().UTC(),
 		LeaseExpiresAt:       s.deadline.WallExpiry(),
 		LastRenewOK:          s.lastRenewOK,
 		LeaseRenewalFailures: s.leaseRenewalFailures,
@@ -2419,6 +2561,7 @@ func (s *Supervisor) writeHealth() {
 		MountMS:           s.mountMS,
 		ReadyMS:           s.readyMS,
 	}
+	h.ReplicationCheckedAt = s.replCheckedAt.UTC()
 	if counter, ok := s.Deps.Replicator.(ReplicatorRestartCounter); ok {
 		h.LitestreamRestarts = counter.RestartCount()
 	}

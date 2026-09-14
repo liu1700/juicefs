@@ -346,3 +346,48 @@ func TestAProbeThatConsumesTheLeaseBudgetDoesNotStartRestart(t *testing.T) {
 		t.Fatal("probe that exhausted the lease stop budget did not stop")
 	}
 }
+
+// health.json says when it was taken and when replication was last actually
+// checked, so a reader can tell a fresh verdict from one a slow probe has left
+// standing. A failed probe is still a check: it is what set the verdict.
+func TestHealthStampsTheObservationAndTheLastReplicationCheck(t *testing.T) {
+	rep := &watchedReplicator{}
+	sup, _, clock := supWithWatchedReplicator(t, rep)
+
+	sup.writeHealth()
+	h := readHealth(t, sup)
+	if !h.ObservedAt.Equal(*clock) {
+		t.Errorf("observed_at = %s, want the snapshot instant %s", h.ObservedAt, *clock)
+	}
+	if !h.ReplicationCheckedAt.IsZero() {
+		t.Errorf("replication_checked_at = %s before any probe returned, want zero", h.ReplicationCheckedAt)
+	}
+
+	*clock = clock.Add(time.Second)
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("healthy replicator produced a stop: %v", f.Err)
+	}
+	checked := *clock
+	*clock = clock.Add(3 * time.Second)
+	sup.writeHealth()
+	h = readHealth(t, sup)
+	if !h.ReplicationCheckedAt.Equal(checked) {
+		t.Errorf("replication_checked_at = %s, want the probe's return %s", h.ReplicationCheckedAt, checked)
+	}
+	if !h.ObservedAt.Equal(*clock) {
+		t.Errorf("observed_at = %s, want %s: a snapshot is taken whether or not a probe ran since", h.ObservedAt, *clock)
+	}
+
+	rep.fail(errors.New("litestream exited on its own: signal: killed"))
+	*clock = clock.Add(time.Second)
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("the first failing probe must repair, not stop: %v", f.Err)
+	}
+	failed := *clock
+	sup.writeHealth()
+	h = readHealth(t, sup)
+	if !h.ReplicationFailed || !h.ReplicationCheckedAt.Equal(failed) {
+		t.Errorf("replication_failed = %t checked_at = %s, want true at the failing probe %s",
+			h.ReplicationFailed, h.ReplicationCheckedAt, failed)
+	}
+}

@@ -216,11 +216,7 @@ func (n *NodeReplicator) Start(ctx context.Context) error {
 // SyncAndWait forces a sync of this database and blocks until the replica has
 // it — the same call the per-mount child makes, on a different socket.
 func (n *NodeReplicator) SyncAndWait(ctx context.Context) error {
-	_, err := n.control(ctx, "/sync", map[string]any{
-		"path":    n.DBPath,
-		"wait":    true,
-		"timeout": 30,
-	})
+	_, err := syncAndWait(ctx, n.SocketPath, n.DBPath)
 	return err
 }
 
@@ -233,22 +229,11 @@ func (n *NodeReplicator) SyncAndWait(ctx context.Context) error {
 // (store.go:463-472). Naming a local position as the durable anchor would
 // point a restore at transactions that never left the node.
 func (n *NodeReplicator) TxID(ctx context.Context) (string, error) {
-	body, err := n.control(ctx, "/sync", map[string]any{
-		"path":    n.DBPath,
-		"wait":    true,
-		"timeout": 30,
-	})
+	resp, err := syncAndWait(ctx, n.SocketPath, n.DBPath)
 	if err != nil {
 		return "", err
 	}
-	var resp syncResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", fmt.Errorf("decode sync response: %w", err)
-	}
-	if resp.ReplicatedTXID == 0 {
-		return "", nil
-	}
-	return fmt.Sprintf("%016x", resp.ReplicatedTXID), nil
+	return resp.replicatedTXID(), nil
 }
 
 // Stop unregisters this database, which is where the shared daemon performs
