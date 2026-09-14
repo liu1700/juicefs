@@ -140,8 +140,10 @@ type Config struct {
 	Subdir          string `json:",omitempty"`
 	PrefixInternal  bool
 	HideInternal    bool
-	RootSquash      *AnonymousAccount `json:",omitempty"`
-	AllSquash       *AnonymousAccount `json:",omitempty"`
+	// DisableInternalCommands denies every .control command for this VFS.
+	DisableInternalCommands bool
+	RootSquash              *AnonymousAccount `json:",omitempty"`
+	AllSquash               *AnonymousAccount `json:",omitempty"`
 	// VisibleOwner replaces only the UID/GID returned to the FUSE client. It
 	// leaves metadata ownership and request credentials unchanged.
 	VisibleOwner         *AnonymousAccount `json:",omitempty"`

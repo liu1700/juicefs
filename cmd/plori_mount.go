@@ -300,6 +300,14 @@ func objectCredential(path string) (*creds.Source, error) {
 	return source, nil
 }
 
+// ploriVFSConfig is the only VFS configuration constructor used by both
+// plori-mount delivery modes. Generic juicefs mount keeps getVfsConf unchanged.
+func ploriVFSConfig(c *cli.Context, metaConf *meta.Config, format *meta.Format, chunkConf *chunk.Config) *vfs.Config {
+	conf := getVfsConf(c, metaConf, format, chunkConf)
+	conf.DisableInternalCommands = true
+	return conf
+}
+
 type ploriFS struct {
 	paths       pmount.Paths
 	opts        pmount.MountOptions
@@ -484,7 +492,7 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 	// which is what PLO-346 measured; the Plori profile bounds it and the
 	// supervisor tightens it from the drain rate it measures (PLO-383).
 	chunkConf.MaxStagingBacklog = pmount.DefaultMaxStagingBacklog
-	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
+	vfsConf := ploriVFSConfig(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
 	blob, err := NewReloadableStorage(format, m, f.credentialPatch())
 	if err != nil {
