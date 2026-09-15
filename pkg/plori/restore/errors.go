@@ -47,6 +47,10 @@ const (
 	// (crash-consistency.md §7 d3): metadata references a block the object
 	// store does not hold.
 	CodeBlockMissingAfterRestore = "E_BLOCK_MISSING_AFTER_RESTORE"
+	// CodeBlockScanFailed means the block integrity scan could not finish.
+	// It is deliberately distinct from CodeBlockMissingAfterRestore: no damage
+	// was confirmed, so callers must not quarantine from a partial inventory.
+	CodeBlockScanFailed = "E_RESTORE_BLOCK_SCAN_FAILED"
 )
 
 // Error is the typed error every exported function in this package returns.
@@ -86,6 +90,7 @@ var (
 	ErrFormatCarriesCredentials = &Error{Code: CodeFormatCarriesCredentials}
 	ErrTrashDisabled            = &Error{Code: CodeTrashDisabled}
 	ErrBlockMissing             = &Error{Code: CodeBlockMissingAfterRestore}
+	ErrBlockScanFailed          = &Error{Code: CodeBlockScanFailed}
 )
 
 // Code extracts the code from err, or "" if err carries none.

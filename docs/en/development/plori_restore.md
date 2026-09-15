@@ -28,9 +28,9 @@ builds in two processes is the configuration the locking protocol is designed
 for, and it is what the M0 harness measured working.
 
 `modernc.org/sqlite` sitting in `hack/verify_plori_sbom.py`'s `DENIED_PREFIXES`
-is that same fact written down as a gate. An earlier draft of this package used
-the library for restore only — which is safe in isolation, because nothing has
-the database open at that point — and admitting the dependency was measured at
+is that same fact written down as a gate. An earlier draft used
+the library only for restore, when no process had the database open. That
+use was safe in isolation. Adding the dependency measured
 **+6.9 MB of binary (+12.1 %) and +11 modules**, including a second SQLite
 implementation that keeps `sqlite3_enable_load_extension`
 (`modernc.org/sqlite@v1.49.1 lib/sqlite_linux_amd64.go`) where the audited
@@ -60,7 +60,7 @@ func VerifyRestored(ctx context.Context, dbPath string, quick bool, tablePrefix 
    line the check produced rather than the first. Litestream's own restore-time
    check proves the LTX chain replays; this proves the image it produced is a
    sound database. `quick` reduces it to `PRAGMA quick_check`, which skips the
-   cross-index pass — the right gate for a warm restart, never for a restore.
+   cross-index pass. Use it for a warm restart, never for a restore.
 2. The Format, read straight out of `jfs_setting` rather than through
    `meta.NewClient`, which calls `logger.Fatalf` on a database it cannot use
    and would take the supervisor's process with it. The whole point of these
@@ -83,8 +83,8 @@ Identity is deliberately **not** here. The three-way match needs the MountSpec
 and a live object-store handle, and `pkg/plori/mount` owns both
 (`Supervisor.identityMatches`): the spec says which volume the mount is for,
 the Format says which filesystem the metadata claims to be, and the
-`juicefs_uuid` **object** in the data prefix — a store read, not a database
-read — says which filesystem owns the data. `Format.Name` is the data prefix
+`juicefs_uuid` **object** in the data prefix identifies the filesystem that
+owns the data. That check reads the object store. `Format.Name` is the data prefix
 `agents/<vid>`, because the S3 backend ignores any path beyond the bucket, so
 the spec compares it as such. A second implementation of that match in this
 package would be a second thing to keep in step.
@@ -94,14 +94,14 @@ package would be a second thing to keep in step.
 ```go
 type BlockRef struct { Inode meta.Ino; Path string; Slice uint64; Chunk uint32; Key string; Size int; Offset uint64 }
 
-func ScanMissingBlocks(ctx context.Context, m SliceScanner, store BlockHeader, opt ScanOptions) (*ScanReport, error)
+func ScanMissingBlocks(ctx context.Context, m SliceScanner, store object.ObjectStorage, opt ScanOptions) (*ScanReport, error)
 func DeletedInos(ctx meta.Context, m meta.Meta) (map[meta.Ino]bool, error)
 func Quarantine(ctx context.Context, m Quarantiner, records []BlockRef, mode QuarantineMode, format *meta.Format) (*QuarantineReport, error)
 ```
 
-`SliceScanner`, `BlockHeader` and `Quarantiner` are three-method slices of
-`meta.Meta` and `object.ObjectStorage`, so the repair is unit-testable without
-FUSE, Redis or a network object store.
+`SliceScanner` and `Quarantiner` are narrow interfaces over `meta.Meta`. The repair
+accepts `object.ObjectStorage` so it can page through its complete inventory.
+This remains unit-testable without FUSE, Redis or a network object store.
 
 `DeletedInos` takes the full `meta.Meta` rather than an interface because
 `ScanDeletedObject`'s callback types are unexported and cannot appear in an
@@ -112,24 +112,24 @@ interface declared outside `pkg/meta`; the body is the same call
 
 A generation that did not write the clean marker died before its ordered stop
 finished, so the metadata Litestream replicated can reference blocks the
-writeback cache never uploaded. Those files stat fine and read `EIO` — the
-crux the M0 harness reproduced. `juicefs fsck` detects the condition
+writeback cache never uploaded. Those files report normal metadata but return
+`EIO` on reads. The M0 harness reproduced this failure. `juicefs fsck` detects the condition
 (`cmd/fsck.go:172-245`) but its `--repair` only fixes directories
 (`cmd/fsck.go:59-76`), so the repair action itself lives here. This package
 never shells out to `juicefs fsck`; it mirrors the traversal.
 
-1. **Enumerate.** `m.ScanSlices` yields every `(inode, slice)` the metadata
-   references. Slices below `ScanOptions.MinSliceID` and inodes in
-   `ScanOptions.SkipInos` are dropped.
-2. **HEAD.** For each slice, every block key is built exactly as
-   `cmd/fsck.go:229-235` builds it — `<id>_<index>_<size>`, under
-   `%02X/%d/` when `HashPrefix` is set and `%d/%d/` otherwise — and HEADed
-   through a `chunks/`-prefixed store handle, in a bounded worker pool
-   (8 by default).
-3. **Fail closed.** A HEAD failure that is not `os.ErrNotExist` ends the scan
-   with a retryable error. `juicefs fsck` logs such a failure and carries on;
-   a repair decision taken from a scan with holes in it would truncate healthy
-   files.
+1. **Inventory.** The repair lists every object through a `chunks/`-prefixed
+   store handle. It uses synchronous pagination so cancellation leaves no
+   background listing task. Local file stores use directory listings.
+2. **Enumerate.** After a complete inventory is available, `m.ScanSlices`
+   yields every `(inode, slice)` the metadata references. Slices below
+   `ScanOptions.MinSliceID` and inodes in `ScanOptions.SkipInos` are dropped.
+   The scan compares each complete block key with the inventory. Keys use
+   `<id>_<index>_<size>` under `%02X/%d/` with `HashPrefix`, and `%d/%d/` otherwise.
+   The comparison makes no HEAD requests.
+3. **Fail closed.** A listing error, a nil object, or cancellation returns
+   retryable `E_RESTORE_BLOCK_SCAN_FAILED`. No partial report reaches quarantine. Confirmed absent keys remain
+   `E_BLOCK_MISSING_AFTER_RESTORE` records.
 4. **Report.** Missing blocks come back sorted by `(inode, slice, chunk)`, each
    with the file path resolved once per inode, so two runs over the same damage
    produce the same report.
@@ -144,9 +144,9 @@ per-slice transaction id, so the closest available proxy is the slice id, which
 comes from a monotonic counter in the metadata engine: "allocated after the
 durable point" implies "id at or above the id in use then". A lower id whose
 block upload was still in flight is missed. The default is therefore zero, a
-full scan — PLO-316 wave 2 measured 870 ms, 12 LIST calls and 34 MiB on an
-11k-object volume, against roughly 15 times that for the path-scoped form, so
-the affordable variant is also the only complete one.
+full scan. PLO-316 wave 2 measured 870 ms, 12 LIST calls and 34 MiB on an
+11k-object volume. The path-scoped form took roughly 15 times longer. The
+full scan also detects damage below the watermark.
 
 ### The truncation boundary
 
@@ -173,10 +173,10 @@ reading or clearing it goes through FUSE, where the kernel restricts
 by us and read-only to the tenant without a second enforcement point. It also
 travels with the file across renames.
 
-The alternative — a `.plori-quarantine/` manifest inside the volume — was
-rejected on three counts: it needs data-plane writes during exactly the window
-where the data plane is known to be damaged, it lands in the tenant's
-namespace, and the tenant can delete it. `Quarantine` instead **returns** a
+A `.plori-quarantine/` manifest inside the volume would require writes while
+the data plane is damaged. It would also occupy the tenant's namespace, where
+the tenant could delete it. These constraints ruled out that alternative.
+`Quarantine` instead **returns** a
 `QuarantineReport`, and the supervisor persists it beside the mount state and
 reports it onward. The durable operator record belongs outside the tenant's
 filesystem.

@@ -160,6 +160,17 @@ func testFileSystem(t *testing.T, s ObjectStorage) {
 				t.Fatalf("chmod %ofailed: %s", mode, err)
 			}
 
+			if strings.HasPrefix(s.String(), "file://") && os.Geteuid() != 0 {
+				_, _, _, listErr := s.List(ctx, "x/", "", "", "/", 100, true)
+				if err := ss.Chmod("x/", 0777); err != nil {
+					t.Fatal(err)
+				}
+				if !os.IsPermission(listErr) {
+					t.Fatalf("file listing mode %o: %v, want permission error", mode, listErr)
+				}
+				continue
+			}
+
 			objs, err = listAll(ctx, s, "x", "", 100, true)
 			if err != nil {
 				t.Fatalf("list failed: %s mode %o", err, mode)
