@@ -32,6 +32,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -910,49 +911,60 @@ func TestUnreachableControlPlaneFencesAtTheMargin(t *testing.T) {
 }
 
 func TestTransientRenewFailuresRetryBeforeTheWriteStopMargin(t *testing.T) {
-	vol := healthyVolume()
-	base := &fakeCP{expiry: func() time.Time { return time.Now().UTC().Add(4 * time.Second) }}
-	cp := &recoveringRenewCP{fakeCP: base, failed: make(chan struct{})}
-	spec := testSpec()
-	// The first normal renew fails at 1.1s. Recovery is immediate, but the
-	// next normal tick is 2.2s while the two-second guard fences after the
-	// 1.3s stop due time. A retry at one tenth interval lands at 1.21s.
-	spec.LeaseRenewInterval = Duration(1100 * time.Millisecond)
-	spec.WriteStopMargin = Duration(1700 * time.Millisecond)
-	spec.LeaseExpiresAt = time.Now().UTC().Add(3 * time.Second)
-	sup := newSup(t, spec, &fakeFS{vol: vol}, base, &fakeReplicator{}, &fakeFencer{})
-	sup.Deps.CP = cp
+	synctest.Test(t, func(t *testing.T) {
+		vol := healthyVolume()
+		base := &fakeCP{expiry: func() time.Time { return time.Now().UTC().Add(4 * time.Second) }}
+		cp := &recoveringRenewCP{fakeCP: base, failed: make(chan struct{})}
+		spec := testSpec()
+		// The first normal renew fails at 1.1s. Recovery is immediate, but the
+		// next normal tick is 2.2s while the two-second guard fences after the
+		// 1.3s stop due time. A retry at one tenth interval lands at 1.21s.
+		spec.LeaseRenewInterval = Duration(1100 * time.Millisecond)
+		spec.WriteStopMargin = Duration(1700 * time.Millisecond)
+		spec.LeaseExpiresAt = time.Now().UTC().Add(3 * time.Second)
+		sup := newSup(t, spec, &fakeFS{vol: vol}, base, &fakeReplicator{}, &fakeFencer{})
+		sup.Deps.CP = cp
 
-	stop := make(chan os.Signal, 1)
-	done := make(chan *Fatal, 1)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { done <- sup.Run(ctx, stop) }()
-	select {
-	case <-cp.failed:
-	case <-time.After(1500 * time.Millisecond):
-		t.Fatal("transient renew failure did not occur")
-	}
-	select {
-	case got := <-done:
-		t.Fatalf("worker stopped after recovery before the next normal tick: %d/%s (%v), renew calls %d", got.Exit, got.ErrCode, got.Err, cp.calls.Load())
-	case <-time.After(1200 * time.Millisecond):
-	}
-	if got := cp.calls.Load(); got < 2 {
-		t.Fatalf("renew calls = %d, want retry after recovery before write-stop margin", got)
-	}
-	stop <- syscall.SIGTERM
-	select {
-	case got := <-done:
-		if got.Exit != CodeOK {
+		stop := make(chan os.Signal, 1)
+		done := make(chan *Fatal, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() { done <- sup.Run(ctx, stop) }()
+		<-cp.failed
+		synctest.Wait()
+
+		// Advance only through the retry delay, before either the normal 2.2 s
+		// tick or the 2 s deadline guard can run.
+		time.Sleep(110 * time.Millisecond)
+		synctest.Wait()
+		if got := cp.calls.Load(); got < 2 {
+			t.Fatalf("renew calls = %d, want retry after recovery before write-stop margin", got)
+		}
+		select {
+		case got := <-done:
+			t.Fatalf("worker stopped after recovery before the next normal tick: %d/%s (%v), renew calls %d", got.Exit, got.ErrCode, got.Err, cp.calls.Load())
+		default:
+		}
+
+		// The retry must update the deadline. Advance through the original
+		// two-second guard instant; a retry that merely increments the call
+		// count would still fence there.
+		time.Sleep(800 * time.Millisecond)
+		synctest.Wait()
+		select {
+		case got := <-done:
+			t.Fatalf("worker stopped after recovery at the original guard instant: %d/%s (%v)", got.Exit, got.ErrCode, got.Err)
+		default:
+		}
+
+		stop <- syscall.SIGTERM
+		if got := <-done; got.Exit != CodeOK {
 			t.Fatalf("recovered worker shutdown = %d/%s (%v), want clean stop", got.Exit, got.ErrCode, got.Err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("recovered worker did not stop")
-	}
-	if got := sup.leaseRenewalFailures; got != 1 {
-		t.Errorf("lease renewal failures = %d, want the one failed renewal", got)
-	}
+		if got := sup.leaseRenewalFailures; got != 1 {
+			t.Errorf("lease renewal failures = %d, want the one failed renewal", got)
+		}
+	})
 }
 
 func TestBlockedRenewCannotOutlastTheWriteStopMargin(t *testing.T) {
