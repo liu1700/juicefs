@@ -71,3 +71,33 @@ func TestFilestoreRejectsKeyPathTraversal(t *testing.T) {
 		t.Fatal("expected Chtimes to reject a key escaping the storage root")
 	}
 }
+
+// A permission failure must not look like an empty object inventory: restore
+// repair uses a completed inventory to identify missing blocks.
+func TestFilestoreListReturnsUnreadableDirectoryError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read directories despite their permission bits")
+	}
+	root := t.TempDir()
+	dir := filepath.Join(root, "chunks")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "present"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newDisk(root+"/", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	for _, mode := range []os.FileMode{0o100, 0o400} {
+		if err := os.Chmod(dir, mode); err != nil {
+			t.Fatal(err)
+		}
+		objects, _, _, err := store.List(t.Context(), "chunks/", "", "", "/", 1000, true)
+		if !os.IsPermission(err) || objects != nil {
+			t.Fatalf("mode %o: List = %v, %v; want no inventory and a permission error", mode, objects, err)
+		}
+	}
+}

@@ -401,13 +401,20 @@ func readDirSorted(root *os.Root, dir string, followLink bool) ([]*mEntry, error
 		return nil, err
 	}
 	defer f.Close()
-	entries, err := f.Readdir(-1)
+	entries, err := f.ReadDir(-1)
 	if err != nil {
 		return nil, err
 	}
 
 	mEntries := make([]*mEntry, 0, len(entries))
-	for _, e := range entries {
+	for _, entry := range entries {
+		e, err := entry.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
 		isSymlink := e.Mode()&os.ModeSymlink != 0
 		if e.IsDir() {
 			mEntries = append(mEntries, &mEntry{e, e.Name() + dirSuffix, nil, false})
@@ -496,10 +503,6 @@ func (d *filestore) List(ctx context.Context, prefix, marker, token, delimiter s
 	}
 	entries, err := readDirSorted(r, name, followLink)
 	if err != nil {
-		if os.IsPermission(err) {
-			logger.Warnf("skip %s: %s", dir, err)
-			return nil, false, "", nil
-		}
 		if os.IsNotExist(err) {
 			logger.Debugf("skip %s: %s", dir, err)
 			return nil, false, "", nil

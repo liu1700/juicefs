@@ -24,14 +24,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
 
 // QuarantineXattr is the extended attribute a quarantined inode carries.
@@ -77,13 +76,6 @@ type SliceScanner interface {
 	GetPaths(ctx meta.Context, inode meta.Ino) []string
 }
 
-// BlockHeader is the slice of object.ObjectStorage that ScanMissingBlocks
-// needs. Pass object.WithPrefix(blob, "chunks/"), the same handle
-// cmd/fsck.go:135 builds, so that Key is relative to the data prefix.
-type BlockHeader interface {
-	Head(ctx context.Context, key string) (object.Object, error)
-}
-
 // ScanOptions configures ScanMissingBlocks.
 type ScanOptions struct {
 	// Format supplies BlockSize and HashPrefix. Required.
@@ -110,9 +102,6 @@ type ScanOptions struct {
 	// ScanPending includes slices from pending (uncommitted) chunks.
 	ScanPending bool
 
-	// Concurrency bounds parallel HEAD requests. Zero means 8.
-	Concurrency int
-
 	// Progress, when set, is called once per scanned slice.
 	Progress func()
 }
@@ -124,7 +113,8 @@ type ScanReport struct {
 	Missing []BlockRef `json:"missing"`
 	// SlicesScanned counts slices considered after the watermark filter.
 	SlicesScanned int `json:"slices_scanned"`
-	// BlocksChecked counts HEAD requests issued.
+	// BlocksChecked counts referenced blocks checked against the completed
+	// object inventory.
 	BlocksChecked int `json:"blocks_checked"`
 	// InodesAffected counts distinct inodes in Missing.
 	InodesAffected int `json:"inodes_affected"`
@@ -132,31 +122,30 @@ type ScanReport struct {
 	Duration time.Duration `json:"duration"`
 }
 
-// ScanMissingBlocks enumerates every block the metadata references and asks
-// the object store whether it exists.
+// ScanMissingBlocks lists the complete chunks/ inventory, then enumerates every
+// block the metadata references and compares its complete key with that
+// inventory. Pass object.WithPrefix(blob, "chunks/"), the same handle
+// cmd/fsck.go:135 builds, so listed keys are relative to the data prefix.
 //
-// It mirrors cmd/fsck.go:172-245 rather than shelling out to `juicefs fsck`,
-// with two deliberate differences: it never lists the whole data prefix (a
-// LIST of every block is what makes path-scoped fsck 15x more expensive), and
-// it fails closed. `juicefs fsck` logs a HEAD failure that is not
-// "not found" and moves on; a repair decision taken from a scan that silently
-// skipped blocks would truncate files that are fine, so any such failure ends
-// the scan with an error and the supervisor retries.
-func ScanMissingBlocks(ctx context.Context, m SliceScanner, store BlockHeader, opt ScanOptions) (*ScanReport, error) {
+// It mirrors cmd/fsck.go:137-220 rather than shelling out. A full inventory is
+// faster than a per-referenced-block HEAD sweep and also makes the result a
+// complete comparison. Listing errors, a nil object in a listed page, and
+// cancellation fail closed: no incomplete report can reach quarantine.
+func ScanMissingBlocks(ctx context.Context, m SliceScanner, store object.ObjectStorage, opt ScanOptions) (*ScanReport, error) {
+	started := time.Now()
 	if opt.Format == nil {
-		return nil, newError(CodeBlockMissingAfterRestore, "format required for a block scan", false, nil)
+		return nil, newError(CodeBlockScanFailed, "format required for a block scan", false, nil)
 	}
 	blockSize := opt.Format.BlockSize << 10 // Format.BlockSize is in KiB
 	if blockSize <= 0 {
-		return nil, newError(CodeBlockMissingAfterRestore,
+		return nil, newError(CodeBlockScanFailed,
 			fmt.Sprintf("format has an unusable block size: %d", opt.Format.BlockSize), false, nil)
 	}
-	concurrency := opt.Concurrency
-	if concurrency <= 0 {
-		concurrency = 8
+	blocks, err := listBlocks(ctx, store)
+	if err != nil {
+		return nil, err
 	}
 
-	started := time.Now()
 	report := &ScanReport{}
 
 	type candidate struct {
@@ -164,7 +153,8 @@ func ScanMissingBlocks(ctx context.Context, m SliceScanner, store BlockHeader, o
 		slice meta.Slice
 	}
 	var candidates []candidate
-	mctx := meta.Background()
+	mctx := meta.WrapContext(ctx)
+	defer mctx.Cancel()
 	st := m.ScanSlices(mctx, &meta.ScanSlicesOption{
 		ScanPending: opt.ScanPending,
 		Progress:    opt.Progress,
@@ -182,48 +172,29 @@ func ScanMissingBlocks(ctx context.Context, m SliceScanner, store BlockHeader, o
 		return nil
 	})
 	if st != 0 {
-		return nil, newError(CodeBlockMissingAfterRestore, "scan slices", true, st)
+		cause := error(st)
+		if err := ctx.Err(); err != nil {
+			cause = err
+		}
+		return nil, newError(CodeBlockScanFailed, "scan slices", true, cause)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, newError(CodeBlockScanFailed, "scan cancelled", true, err)
 	}
 	report.SlicesScanned = len(candidates)
 
-	var (
-		mu      sync.Mutex
-		missing []BlockRef
-		checked int
-		scanErr error
-		wg      sync.WaitGroup
-	)
-	work := make(chan candidate)
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for c := range work {
-				refs, n, err := headSlice(ctx, store, c.ino, c.slice, blockSize, opt.Format.HashPrefix)
-				mu.Lock()
-				checked += n
-				missing = append(missing, refs...)
-				if err != nil && scanErr == nil {
-					scanErr = err
-				}
-				mu.Unlock()
-			}
-		}()
-	}
+	var missing []BlockRef
+	checked := 0
 	for _, c := range candidates {
-		select {
-		case <-ctx.Done():
-			close(work)
-			wg.Wait()
-			return nil, newError(CodeBlockMissingAfterRestore, "scan cancelled", true, ctx.Err())
-		case work <- c:
+		if err := ctx.Err(); err != nil {
+			return nil, newError(CodeBlockScanFailed, "scan cancelled", true, err)
 		}
+		refs, n := missingBlocks(c.ino, c.slice, blockSize, opt.Format.HashPrefix, blocks)
+		checked += n
+		missing = append(missing, refs...)
 	}
-	close(work)
-	wg.Wait()
-
-	if scanErr != nil {
-		return nil, scanErr
+	if err := ctx.Err(); err != nil {
+		return nil, newError(CodeBlockScanFailed, "scan cancelled", true, err)
 	}
 
 	sort.Slice(missing, func(i, j int) bool {
@@ -235,27 +206,45 @@ func ScanMissingBlocks(ctx context.Context, m SliceScanner, store BlockHeader, o
 		}
 		return missing[i].Chunk < missing[j].Chunk
 	})
+	if err := ctx.Err(); err != nil {
+		return nil, newError(CodeBlockScanFailed, "scan cancelled", true, err)
+	}
 
 	inodes := make(map[meta.Ino]bool, len(missing))
 	for i := range missing {
+		if err := ctx.Err(); err != nil {
+			return nil, newError(CodeBlockScanFailed, "scan cancelled", true, err)
+		}
 		if !inodes[missing[i].Inode] {
 			inodes[missing[i].Inode] = true
 			if paths := m.GetPaths(mctx, missing[i].Inode); len(paths) > 0 {
 				missing[i].Path = paths[0]
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, newError(CodeBlockScanFailed, "scan cancelled", true, err)
 			}
 		}
 	}
 	// Fill the path in for the remaining refs of an inode we already resolved.
 	paths := make(map[meta.Ino]string, len(inodes))
 	for i := range missing {
+		if err := ctx.Err(); err != nil {
+			return nil, newError(CodeBlockScanFailed, "scan cancelled", true, err)
+		}
 		if missing[i].Path != "" {
 			paths[missing[i].Inode] = missing[i].Path
 		}
 	}
 	for i := range missing {
+		if err := ctx.Err(); err != nil {
+			return nil, newError(CodeBlockScanFailed, "scan cancelled", true, err)
+		}
 		if missing[i].Path == "" {
 			missing[i].Path = paths[missing[i].Inode]
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, newError(CodeBlockScanFailed, "scan cancelled", true, err)
 	}
 
 	report.Missing = missing
@@ -265,8 +254,71 @@ func ScanMissingBlocks(ctx context.Context, m SliceScanner, store BlockHeader, o
 	return report, nil
 }
 
-// headSlice HEADs every block of one slice and returns the refs that are gone.
-func headSlice(ctx context.Context, store BlockHeader, ino meta.Ino, s meta.Slice, blockSize int, hashPrefix bool) ([]BlockRef, int, error) {
+const inventoryPageSize = 10000
+
+// listBlocks returns every complete, relative object key under chunks/. It is
+// synchronous so a cancelled restore has no listing producer to outlive it.
+// S3-like stores use flat marker/token pagination. File-like stores reject a
+// flat list and use the same synchronous walk with delimiter-based pages.
+func listBlocks(ctx context.Context, store object.ObjectStorage) (map[string]struct{}, error) {
+	blocks := make(map[string]struct{})
+	delimiter := ""
+	dirs := []string{""}
+	seen := map[string]bool{"": true}
+	for len(dirs) > 0 {
+		dir := dirs[0]
+		dirs = dirs[1:]
+		marker, token := "", ""
+		for page := 1; ; page++ {
+			if err := ctx.Err(); err != nil {
+				return nil, newError(CodeBlockScanFailed, "block inventory cancelled", true, err)
+			}
+			objects, more, nextToken, err := store.List(ctx, dir, marker, token, delimiter, inventoryPageSize, true)
+			if err != nil {
+				// File stores require directory listings. Only a refusal of
+				// the initial flat request can select that traversal.
+				if delimiter == "" && page == 1 && errors.Is(err, utils.ErrNotSUP) {
+					delimiter = "/"
+					page--
+					continue
+				}
+				return nil, newError(CodeBlockScanFailed,
+					fmt.Sprintf("list block inventory prefix %q page %d", dir, page), true, err)
+			}
+			lastKey := marker
+			for _, obj := range objects {
+				if err := ctx.Err(); err != nil {
+					return nil, newError(CodeBlockScanFailed, "block inventory cancelled", true, err)
+				}
+				if obj == nil {
+					return nil, newError(CodeBlockScanFailed, "block inventory returned an incomplete page", true, nil)
+				}
+				lastKey = obj.Key()
+				if obj.IsDir() {
+					if delimiter != "" && !seen[lastKey] {
+						seen[lastKey] = true
+						dirs = append(dirs, lastKey)
+					}
+				} else {
+					blocks[lastKey] = struct{}{}
+				}
+			}
+			if !more {
+				break
+			}
+			if lastKey == marker && nextToken == token {
+				return nil, newError(CodeBlockScanFailed, "block inventory pagination made no progress", true, nil)
+			}
+			marker, token = lastKey, nextToken
+		}
+	}
+	return blocks, nil
+}
+
+// missingBlocks compares every complete block key from one slice with a
+// completed object inventory. The key includes the HashPrefix layout, so a
+// matching basename in a different directory cannot satisfy the comparison.
+func missingBlocks(ino meta.Ino, s meta.Slice, blockSize int, hashPrefix bool, blocks map[string]struct{}) ([]BlockRef, int) {
 	var (
 		refs    []BlockRef
 		checked int
@@ -279,11 +331,7 @@ func headSlice(ctx context.Context, store BlockHeader, ino meta.Ino, s meta.Slic
 		}
 		key := blockKey(s.Id, i, size, hashPrefix)
 		checked++
-		if _, err := store.Head(ctx, key); err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				return refs, checked, newError(CodeBlockMissingAfterRestore,
-					"HEAD block "+key, true, err)
-			}
+		if _, ok := blocks[key]; !ok {
 			refs = append(refs, BlockRef{
 				Inode:  ino,
 				Slice:  s.Id,
@@ -294,7 +342,7 @@ func headSlice(ctx context.Context, store BlockHeader, ino meta.Ino, s meta.Slic
 			})
 		}
 	}
-	return refs, checked, nil
+	return refs, checked
 }
 
 // blockKey mirrors cmd/fsck.go:229-235. The returned key is relative to the

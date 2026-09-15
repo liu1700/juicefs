@@ -560,10 +560,9 @@ func (p *ploriVolume) IntegrityCheck(ctx context.Context) error {
 	return err
 }
 
-// RepairAfterRestore is the restore-time missing-block repair. The scan reuses
-// cmd/fsck.go's traversal shape without its full-prefix LIST, and the repair
-// bounds each damaged file at its last readable byte and marks it; it never
-// deletes anything.
+// RepairAfterRestore is the restore-time missing-block repair. The scan lists
+// the full chunks prefix like cmd/fsck.go, then bounds each damaged file at its
+// last readable byte and marks it; it never deletes anything.
 func (p *ploriVolume) RepairAfterRestore(ctx context.Context) (pmount.RepairReport, error) {
 	format, err := p.m.Load(false)
 	if err != nil {

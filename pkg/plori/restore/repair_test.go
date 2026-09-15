@@ -24,12 +24,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
 
 func testCtx() meta.Context {
@@ -269,26 +272,40 @@ func TestScanRespectsWatermark(t *testing.T) {
 	}
 }
 
-// erroringHeader models a store that answers something other than "not found".
-type erroringHeader struct {
-	inner object.ObjectStorage
-	fail  error
-	n     int
+// inventoryStore wraps a real object store so tests can control page responses
+// and prove the repair never falls back to a per-block Head call.
+type inventoryStore struct {
+	object.ObjectStorage
+	list      func(context.Context, string, string, string, string, int64, bool) ([]object.Object, bool, string, error)
+	heads     int
+	lists     int
+	headDelay time.Duration
 }
 
-func (e *erroringHeader) Head(ctx context.Context, key string) (object.Object, error) {
-	e.n++
-	if e.n > 1 {
-		return nil, e.fail
+func (s *inventoryStore) List(ctx context.Context, prefix, marker, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
+	s.lists++
+	if s.list != nil {
+		return s.list(ctx, prefix, marker, token, delimiter, limit, followLink)
 	}
-	return e.inner.Head(ctx, key)
+	return s.ObjectStorage.List(ctx, prefix, marker, token, delimiter, limit, followLink)
 }
 
-// TestScanFailsClosedOnHeadError is the difference from `juicefs fsck`, which
-// logs a non-"not found" HEAD failure and carries on (cmd/fsck.go:245). A
-// repair decision taken from a scan with holes in it would truncate healthy
-// files.
-func TestScanFailsClosedOnHeadError(t *testing.T) {
+func (s *inventoryStore) Head(ctx context.Context, _ string) (object.Object, error) {
+	s.heads++
+	if s.headDelay > 0 {
+		select {
+		case <-time.After(s.headDelay):
+			return nil, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, errors.New("the inventory scan must not call Head")
+}
+
+// TestScanUsesACompleteInventoryAndNeverHeads proves present objects come from
+// the one complete listing, not a request per referenced block.
+func TestScanUsesACompleteInventoryAndNeverHeads(t *testing.T) {
 	const blockSize = 1 << 20
 	v := newVolume(t, volumeOptions{
 		trashDays:    1,
@@ -299,17 +316,188 @@ func TestScanFailsClosedOnHeadError(t *testing.T) {
 	m, _, closeFn := v.openMeta(t, v.metaPath)
 	defer closeFn()
 
-	store := &erroringHeader{inner: v.blocks(t), fail: errors.New("503 slow down")}
-	_, err := ScanMissingBlocks(t.Context(), m, store,
-		ScanOptions{Format: v.format, Concurrency: 1})
-	if err == nil {
-		t.Fatal("a HEAD failure that is not ErrNotExist must end the scan")
+	store := &inventoryStore{ObjectStorage: v.blocks(t)}
+	report, err := ScanMissingBlocks(t.Context(), m, store, ScanOptions{Format: v.format})
+	if err != nil {
+		t.Fatalf("scan complete inventory: %v", err)
 	}
-	if Code(err) != CodeBlockMissingAfterRestore {
-		t.Fatalf("got code %q (%v)", Code(err), err)
+	if len(report.Missing) != 0 {
+		t.Fatalf("missing = %+v, want none", report.Missing)
 	}
-	if !Retryable(err) {
-		t.Fatal("a store-side failure should be retryable")
+	if store.lists < 2 || store.heads != 0 {
+		t.Fatalf("list/head calls = %d/%d, want file fallback listings and 0 Heads", store.lists, store.heads)
+	}
+}
+
+func TestScanFailsClosedWhenInventoryCannotStart(t *testing.T) {
+	v := newVolume(t, volumeOptions{trashDays: 1, files: map[string]int{"/f": 1}})
+	m, _, closeFn := v.openMeta(t, v.metaPath)
+	defer closeFn()
+	want := errors.New("listing unavailable")
+	store := &inventoryStore{ObjectStorage: v.blocks(t), list: func(context.Context, string, string, string, string, int64, bool) ([]object.Object, bool, string, error) {
+		return nil, false, "", want
+	}}
+	_, err := ScanMissingBlocks(t.Context(), m, store, ScanOptions{Format: v.format})
+	if Code(err) != CodeBlockScanFailed || !errors.Is(err, want) || !Retryable(err) {
+		t.Fatalf("error = %v, want retryable inventory failure wrapping %v", err, want)
+	}
+}
+
+func TestScanFailsClosedOnIncompleteInventoryPage(t *testing.T) {
+	v := newVolume(t, volumeOptions{trashDays: 1, files: map[string]int{"/f": 1}})
+	m, _, closeFn := v.openMeta(t, v.metaPath)
+	defer closeFn()
+	store := &inventoryStore{ObjectStorage: v.blocks(t), list: func(context.Context, string, string, string, string, int64, bool) ([]object.Object, bool, string, error) {
+		return []object.Object{nil}, false, "", nil
+	}}
+	_, err := ScanMissingBlocks(t.Context(), m, store, ScanOptions{Format: v.format})
+	if Code(err) != CodeBlockScanFailed || !Retryable(err) {
+		t.Fatalf("error = %v, want retryable incomplete-inventory failure", err)
+	}
+}
+
+type syntheticSliceScanner struct{ count int }
+
+func (s syntheticSliceScanner) ScanSlices(_ meta.Context, _ *meta.ScanSlicesOption, fn func(meta.Ino, meta.Slice) error) syscall.Errno {
+	for i := 0; i < s.count; i++ {
+		if err := fn(meta.Ino(i+2), meta.Slice{Id: uint64(i + 1), Size: 1024}); err != nil {
+			return syscall.ECANCELED
+		}
+	}
+	return 0
+}
+
+func (syntheticSliceScanner) GetPaths(meta.Context, meta.Ino) []string { return nil }
+
+type trackingSliceScanner struct{ calls int }
+
+func (s *trackingSliceScanner) ScanSlices(meta.Context, *meta.ScanSlicesOption, func(meta.Ino, meta.Slice) error) syscall.Errno {
+	s.calls++
+	return 0
+}
+
+func (*trackingSliceScanner) GetPaths(meta.Context, meta.Ino) []string { return nil }
+
+type cancelingSliceScanner struct{ cancel context.CancelFunc }
+
+func (s cancelingSliceScanner) ScanSlices(meta.Context, *meta.ScanSlicesOption, func(meta.Ino, meta.Slice) error) syscall.Errno {
+	s.cancel()
+	return 0
+}
+
+func (cancelingSliceScanner) GetPaths(meta.Context, meta.Ino) []string { return nil }
+
+func TestCancelledSliceScanCannotReturnAnEmptySuccess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &inventoryStore{list: func(context.Context, string, string, string, string, int64, bool) ([]object.Object, bool, string, error) {
+		return nil, false, "", nil
+	}}
+	_, err := ScanMissingBlocks(ctx, cancelingSliceScanner{cancel: cancel}, store,
+		ScanOptions{Format: &meta.Format{BlockSize: 1}})
+	if Code(err) != CodeBlockScanFailed || !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want cancelled slice scan failure", err)
+	}
+}
+
+type syntheticObject struct {
+	key string
+	dir bool
+}
+
+func (o syntheticObject) Key() string        { return o.key }
+func (syntheticObject) Size() int64          { return 1024 }
+func (syntheticObject) Mtime() time.Time     { return time.Time{} }
+func (o syntheticObject) IsDir() bool        { return o.dir }
+func (syntheticObject) IsSymlink() bool      { return false }
+func (syntheticObject) StorageClass() string { return "" }
+func (syntheticObject) Status() string       { return "" }
+
+func TestScanLargeInventoryUsesPaginatedListingAndNoHeads(t *testing.T) {
+	const count = 13083
+	store := &inventoryStore{list: func(_ context.Context, prefix, marker, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
+		if prefix != "" || delimiter != "" || limit != inventoryPageSize || !followLink {
+			t.Fatalf("list args prefix=%q delimiter=%q limit=%d follow=%v", prefix, delimiter, limit, followLink)
+		}
+		start := 1
+		switch token {
+		case "":
+		case "page-2":
+			if marker != blockKey(10000, 0, 1024, false) {
+				t.Fatalf("page-two marker = %q", marker)
+			}
+			start = 10001
+		default:
+			t.Fatalf("unexpected continuation token %q", token)
+		}
+		end := start + 10000
+		if end > count+1 {
+			end = count + 1
+		}
+		objects := make([]object.Object, 0, end-start)
+		for i := start; i < end; i++ {
+			objects = append(objects, syntheticObject{key: blockKey(uint64(i), 0, 1024, false)})
+		}
+		if end <= count {
+			return objects, true, "page-2", nil
+		}
+		return objects, false, "", nil
+	}, headDelay: 20 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	report, err := ScanMissingBlocks(ctx, syntheticSliceScanner{count: count}, store,
+		ScanOptions{Format: &meta.Format{BlockSize: 1}})
+	if err != nil {
+		t.Fatalf("large scan: %v", err)
+	}
+	if report.BlocksChecked != count || len(report.Missing) != 0 {
+		t.Fatalf("checked/missing = %d/%d, want %d/0", report.BlocksChecked, len(report.Missing), count)
+	}
+	if store.lists != 2 || store.heads != 0 {
+		t.Fatalf("list/head calls = %d/%d, want 2/0", store.lists, store.heads)
+	}
+}
+
+func TestScanFailsClosedOnLaterInventoryPage(t *testing.T) {
+	for _, directory := range []bool{false, true} {
+		for _, cause := range []error{errors.New("page unavailable"), os.ErrPermission, utils.ErrNotSUP, context.Canceled} {
+			t.Run(fmt.Sprintf("directory=%t/%v", directory, cause), func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				calls := 0
+				store := &inventoryStore{list: func(_ context.Context, prefix, marker, token, delimiter string, _ int64, _ bool) ([]object.Object, bool, string, error) {
+					calls++
+					if directory && delimiter == "" {
+						return nil, false, "", utils.ErrNotSUP
+					}
+					if directory && prefix == "" {
+						return []object.Object{syntheticObject{key: "1/", dir: true}}, false, "", nil
+					}
+					if marker == "" {
+						return []object.Object{syntheticObject{key: "1/0001_0_1024"}}, true, "page-2", nil
+					}
+					if token != "page-2" || marker != "1/0001_0_1024" {
+						t.Fatalf("unexpected continuation marker=%q token=%q", marker, token)
+					}
+					if errors.Is(cause, context.Canceled) {
+						cancel()
+					}
+					return nil, false, "", cause
+				}}
+				scanner := &trackingSliceScanner{}
+				report, err := ScanMissingBlocks(ctx, scanner, store, ScanOptions{Format: &meta.Format{BlockSize: 1}})
+				if Code(err) != CodeBlockScanFailed || !errors.Is(err, cause) || !Retryable(err) || errors.Is(err, ErrBlockMissing) {
+					t.Fatalf("error = %v, want retryable page-two failure wrapping %v, not confirmed damage", err, cause)
+				}
+				wantCalls := 2
+				if directory {
+					wantCalls = 4
+				}
+				if report != nil || scanner.calls != 0 || calls != wantCalls {
+					t.Fatalf("report/scans/list calls = %v/%d/%d, want nil/0/%d", report, scanner.calls, calls, wantCalls)
+				}
+			})
+		}
 	}
 }
 
@@ -339,4 +527,16 @@ func TestBlockKeyMatchesFsck(t *testing.T) {
 		t.Fatalf("hashed key = %q", got)
 	}
 	_ = syscall.Errno(0)
+}
+
+func TestMissingBlocksRequiresTheCompleteKey(t *testing.T) {
+	slice := meta.Slice{Id: 1234567, Size: 1024}
+	key := blockKey(slice.Id, 0, 1024, true)
+	wrongPrefix := map[string]struct{}{"00/1/1234567_0_1024": {}}
+	if refs, _ := missingBlocks(2, slice, 1024, true, wrongPrefix); len(refs) != 1 {
+		t.Fatalf("wrong-prefix inventory satisfied %q: %+v", key, refs)
+	}
+	if refs, _ := missingBlocks(2, slice, 1024, true, map[string]struct{}{key: {}}); len(refs) != 0 {
+		t.Fatalf("complete-key inventory reported missing: %+v", refs)
+	}
 }
