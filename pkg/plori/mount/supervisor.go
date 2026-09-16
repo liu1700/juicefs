@@ -1671,6 +1671,9 @@ func (s *Supervisor) barrierInterval() time.Duration {
 }
 
 func (s *Supervisor) runBarrier(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	// A barrier must not outlive the authority that permits it
 	// (crash-consistency Q7): bound it by whatever is left of the lease.
 	budget := s.deadline.RemainingLease(s.now())
@@ -1686,6 +1689,12 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 	// The anchor's txid is read HERE, at T_before, and not after the barrier
 	// (PLO-416). See anchorTxID.
 	txid, replicaConfirmed := s.anchorTxID(bctx)
+	// anchorTxID can wait on the replicator. An out-of-band fence cancels the
+	// worker before it seals writes, so do not begin the data-plane flush after
+	// that cancellation becomes visible.
+	if ctx.Err() != nil {
+		return
+	}
 	// The periodic barrier IS a drain of the live backlog, so it is the one
 	// honest measurement of how long a drain takes on this node, under this
 	// workload, right now. Sampling anything else would be a model; this is an
@@ -2085,9 +2094,14 @@ func (s *Supervisor) fenceAndStop(f *Fatal, reason string) *Fatal {
 	if reason == ReasonFencedOutOfBand {
 		// Seal now: this writer provably no longer owns the epoch, so nothing
 		// it still holds open may commit — not one more slice (F-2 + F-1).
-		// The seal is deliberately first: a writer that has lost its epoch
-		// must not make another commit while a cancelled periodic barrier
-		// returns. shutdown then cancels and joins the loop workers.
+		// Tell loop workers to stop before the seal, but never wait for them
+		// here. Context cancellation is cooperative: a revoked epoch must lose
+		// metadata write authority immediately even when a worker ignores it.
+		// shutdown joins workers under the lease budget before it detaches or
+		// closes shared resources.
+		if w := s.workers; w != nil {
+			s.cancelWorkers(w, true)
+		}
 		s.vol.FenceWrites()
 	}
 	s.mu.Lock()

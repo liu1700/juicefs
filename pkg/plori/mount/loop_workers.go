@@ -191,10 +191,7 @@ func (s *Supervisor) stopWorkers(ctx context.Context, abandon bool) bool {
 		return true
 	}
 	s.workers = nil
-	w.cancel()
-	if abandon {
-		w.cancelRepair()
-	}
+	s.cancelWorkers(w, abandon)
 	joined := make(chan struct{})
 	go func() {
 		w.wg.Wait()
@@ -211,6 +208,17 @@ func (s *Supervisor) stopWorkers(ctx context.Context, abandon bool) bool {
 	}
 	w.cancelRepair()
 	return true
+}
+
+// cancelWorkers makes every worker observe an out-of-band stop before its
+// caller seals the volume. Joining is deliberately separate: losing an epoch
+// must close the worker contexts immediately, but a worker that ignores its
+// context must not retain the process past the shutdown budget.
+func (s *Supervisor) cancelWorkers(w *loopWorkers, abandon bool) {
+	w.cancel()
+	if abandon {
+		w.cancelRepair()
+	}
 }
 
 // spawn runs fn as one of the run loop's workers, so the stop joins it. With no

@@ -399,7 +399,7 @@ func TestQuotaAdmissionDuringRenewKeepsOneRequestInFlight(t *testing.T) {
 	select {
 	case <-cp.requests:
 		t.Fatal("quota signal started a second renewal before the first returned")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(250 * time.Millisecond):
 	}
 	close(cp.release)
 	select {
@@ -582,6 +582,162 @@ func TestAnOutOfBandFenceDuringABarrierStartsNoBarrierAndReportsNothing(t *testi
 	}
 }
 
+// sealGateVolume holds FenceWrites open after it has sealed the fake metadata
+// engine. This makes the ordering at an out-of-band fence observable: worker
+// cancellation must be issued before the seal, but the seal itself must not
+// wait for an uncooperative worker.
+type sealGateVolume struct {
+	*fakeVolume
+	sealed      chan struct{}
+	allowReturn chan struct{}
+	once        sync.Once
+}
+
+func (v *sealGateVolume) FenceWrites() {
+	v.fakeVolume.FenceWrites()
+	v.once.Do(func() { close(v.sealed) })
+	<-v.allowReturn
+}
+
+type sealAwareReplicator struct {
+	fakeReplicator
+	txidStarted chan struct{}
+	sealed      <-chan struct{}
+	cancelled   chan bool
+}
+
+func (r *sealAwareReplicator) TxID(ctx context.Context) (string, error) {
+	close(r.txidStarted)
+	<-r.sealed
+	r.cancelled <- ctx.Err() != nil
+	return "", ctx.Err()
+}
+
+func TestAnOutOfBandFenceCancelsABarrierBeforeItSealsWrites(t *testing.T) {
+	base := &fakeCP{}
+	vol := &sealGateVolume{
+		fakeVolume:  healthyVolume(),
+		sealed:      make(chan struct{}),
+		allowReturn: make(chan struct{}),
+	}
+	rep := &sealAwareReplicator{
+		txidStarted: make(chan struct{}),
+		sealed:      vol.sealed,
+		cancelled:   make(chan bool, 1),
+	}
+	spec := testSpec()
+	spec.LeaseExpiresAt = time.Now().UTC().Add(time.Second)
+	sup := newSup(t, spec, &fakeFS{vol: vol.fakeVolume}, base, &fakeReplicator{}, &fakeFencer{})
+	sup.vol = vol
+	sup.Deps.Replicator = rep
+	sup.deadline = NewDeadline(spec.LeaseExpiresAt, spec.WriteStopMargin.D(), time.Now())
+	w := sup.startWorkers(context.Background())
+	w.barrierJobs <- struct{}{}
+	select {
+	case <-rep.txidStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the periodic barrier did not begin its replica-position read")
+	}
+
+	done := make(chan *Fatal, 1)
+	go func() {
+		done <- sup.fenceAndStop(fatalf(CodeFenced, ErrCodeFencedOutOfBand, false, "test fence"), ReasonFencedOutOfBand)
+	}()
+
+	select {
+	case cancelled := <-rep.cancelled:
+		if !cancelled {
+			t.Fatal("the barrier context was live when FenceWrites had already sealed the volume")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the barrier never observed the fence seal")
+	}
+	close(vol.allowReturn)
+
+	f := waitFatal(t, done, 10*time.Second, "the out-of-band fence did not stop the mount")
+	if f.Exit != CodeFenced || f.ErrCode != ErrCodeFencedOutOfBand {
+		t.Fatalf("exit = %d/%s (%v), want %d/%s", f.Exit, f.ErrCode, f.Err, CodeFenced, ErrCodeFencedOutOfBand)
+	}
+	for _, call := range vol.order() {
+		if call == "barrier" {
+			t.Fatalf("a cancelled periodic barrier began a flush after the seal: %v", vol.order())
+		}
+	}
+}
+
+type heldTxIDReplicator struct {
+	fakeReplicator
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *heldTxIDReplicator) TxID(context.Context) (string, error) {
+	close(r.started)
+	<-r.release
+	return "", nil
+}
+
+// TestAnOutOfBandFenceSealsBeforeANonCooperativeBarrierReturns exercises the
+// opposite ordering from the cooperative case above. A stale writer must lose
+// its metadata gate now; waiting for an arbitrary worker would let it keep
+// committing until that worker happens to return.
+func TestAnOutOfBandFenceSealsBeforeANonCooperativeBarrierReturns(t *testing.T) {
+	vol := &sealGateVolume{
+		fakeVolume:  healthyVolume(),
+		sealed:      make(chan struct{}),
+		allowReturn: make(chan struct{}),
+	}
+	rep := &heldTxIDReplicator{started: make(chan struct{}), release: make(chan struct{})}
+	spec := testSpec()
+	spec.LeaseExpiresAt = time.Now().UTC().Add(time.Second)
+	sup := newSup(t, spec, &fakeFS{vol: vol.fakeVolume}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	sup.vol = vol
+	sup.Deps.Replicator = rep
+	sup.deadline = NewDeadline(spec.LeaseExpiresAt, spec.WriteStopMargin.D(), time.Now())
+	w := sup.startWorkers(context.Background())
+	w.barrierJobs <- struct{}{}
+	select {
+	case <-rep.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the periodic barrier did not begin its replica-position read")
+	}
+
+	done := make(chan *Fatal, 1)
+	go func() {
+		done <- sup.fenceAndStop(fatalf(CodeFenced, ErrCodeFencedOutOfBand, false, "test fence"), ReasonFencedOutOfBand)
+	}()
+	select {
+	case <-vol.sealed:
+		if !vol.Fenced() {
+			t.Fatal("FenceWrites returned without sealing the volume")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("out-of-band fence waited for a non-cooperative barrier")
+	}
+	close(vol.allowReturn)
+
+	f := waitFatal(t, done, 5*time.Second, "the fenced supervisor did not return within its shutdown budget")
+	if f.Exit != CodeBarrierIncomplete || f.ErrCode != ErrCodeBarrierIncomplete {
+		t.Fatalf("exit = %d/%s (%v), want %d/%s", f.Exit, f.ErrCode, f.Err, CodeBarrierIncomplete, ErrCodeBarrierIncomplete)
+	}
+	for _, call := range vol.order() {
+		if call == "detach" || call == "close" {
+			t.Fatalf("unsafe teardown %q ran while the barrier was live: %v", call, vol.order())
+		}
+	}
+	close(rep.release)
+	w.wg.Wait()
+	sealed := false
+	for _, call := range vol.order() {
+		if call == "fence" {
+			sealed = true
+		}
+		if sealed && call == "barrier" {
+			t.Fatalf("a barrier committed after the metadata seal: %v", vol.order())
+		}
+	}
+}
+
 // overlapLedger records which calls are in flight, and each call that began
 // while a call it must never overlap was still running.
 type overlapLedger struct {
@@ -645,7 +801,18 @@ type ledgerVolume struct {
 func (v ledgerVolume) Barrier(ctx context.Context) (BarrierResult, error) {
 	defer v.ledger.enter("barrier", "barrier")()
 	ledgerJitter(ctx)
-	return v.fakeVolume.Barrier(ctx)
+	// The real ploriVolume runs FlushAll through the metadata write gate. A
+	// barrier invocation that loses the race with FenceWrites therefore returns
+	// EROFS before it can commit any staged slice. This fake models that owning
+	// boundary under the same lock, so the concurrent-loop test asserts commits,
+	// not call entry.
+	v.fakeVolume.mu.Lock()
+	defer v.fakeVolume.mu.Unlock()
+	if v.fakeVolume.fenced {
+		return BarrierResult{}, syscall.EROFS
+	}
+	v.fakeVolume.calls = append(v.fakeVolume.calls, "barrier")
+	return BarrierResult{BarrierAt: time.Now().UTC()}, nil
 }
 
 func (v ledgerVolume) Usage(ctx context.Context, withTrash bool) (Usage, error) {
