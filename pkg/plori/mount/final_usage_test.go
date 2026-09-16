@@ -22,6 +22,8 @@ package mount
 import (
 	"context"
 	"errors"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -203,7 +205,25 @@ func TestAFailedFinalUsageReadLeavesHealthAlone(t *testing.T) {
 	cp := &fakeCP{}
 	sup := newCloseoutSup(t, testSpec(), vol, cp, &fakeReplicator{}, newSharedFencer())
 
-	f := sup.Run(context.Background(), stopAfter(120*time.Millisecond))
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	stopped := false
+	defer func() {
+		if !stopped {
+			stop <- syscall.SIGTERM
+			waitFatal(t, done, 10*time.Second, "supervisor cleanup did not finish")
+		}
+	}()
+	// The unchanged-health assertion requires a health file before shutdown.
+	// Wait for that observation instead of assuming a renewal completes in 120ms.
+	waitFor(t, 10*time.Second, func() bool {
+		_, ok := healthWhenWritten(sup)
+		return ok
+	}, "health.json was never written before shutdown")
+	stop <- syscall.SIGTERM
+	f := waitFatal(t, done, 10*time.Second, "supervisor did not stop")
+	stopped = true
 	if f.Exit != CodeOK {
 		t.Fatalf("exit = %d (%v), want a clean stop", f.Exit, f.Err)
 	}
