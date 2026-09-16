@@ -141,7 +141,7 @@ test.plori.unit:
 # argv. The rest of ./cmd's suite needs a Redis and a real object store, so this
 # names its tests rather than running the package.
 	$(PLORI_CGO) go test -count=1 -timeout 5m -tags "$(PLORI_TAGS)" ./cmd/ \
-		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath|TestTheTrashIsNotWalked|TestAFailedTrashWalk|TestPloriVFSConfigDisablesInternalCommandsForBothMountModes|TestGenericVFSConfigKeepsInternalCommandsEnabled'
+		-run 'Credential|TestTheInMemoryFormat|TestNoCommandLineFlag|TestTheEnvironmentPath|TestTheTrashIsNotWalked|TestAFailedTrashWalk|TestPloriVFSConfigDisablesInternalCommandsForBothMountModes|TestGenericVFSConfigKeepsInternalCommandsEnabled|TestPloriWorkspace'
 	$(PLORI_CGO) go test -count=1 -timeout 5m -tags "$(PLORI_TAGS)" ./pkg/fuse/ \
 		-run '^(TestPloriNativeInodeXattrIsReadOnlyFUSEIdentity|TestFuseXattrsEnabledOnlyForExistingOptionOrPloriIdentity)$$'
 # The asynchronous chunk cache, and the mount fixtures that drive it, under the
@@ -185,7 +185,7 @@ test.plori.unit:
 # open/close goroutine test lives in it.
 test.plori.upstream:
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 25m \
-		./pkg/chunk/... ./pkg/vfs/... ./pkg/fs/... ./pkg/object/... ./pkg/plori/mountspec/...
+		./pkg/chunk/... ./pkg/vfs/... ./pkg/fs/... ./pkg/object/... ./pkg/plori/mountspec/... ./pkg/plori/gatewaycontrol/...
 # Detect concurrent object-listing races in the default SDK build.
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -race -count=1 -timeout 25m ./pkg/object/...
 
