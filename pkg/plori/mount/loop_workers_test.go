@@ -399,7 +399,7 @@ func TestQuotaAdmissionDuringRenewKeepsOneRequestInFlight(t *testing.T) {
 	select {
 	case <-cp.requests:
 		t.Fatal("quota signal started a second renewal before the first returned")
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond):
 	}
 	close(cp.release)
 	select {
