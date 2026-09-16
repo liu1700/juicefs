@@ -1066,6 +1066,10 @@ func TestAWriteGateArmedBeforeASigstopRefusesAfterTheThaw(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=^TestAWriteGateArmedBeforeASigstopRefusesAfterTheThaw$", "-test.count=1")
 	cmd.Env = append(os.Environ(), sigstopChildEnv+"=1")
 	cmd.Stderr = os.Stderr
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("stdin pipe: %v", err)
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatalf("stdout pipe: %v", err)
@@ -1074,6 +1078,7 @@ func TestAWriteGateArmedBeforeASigstopRefusesAfterTheThaw(t *testing.T) {
 		t.Fatalf("start the child: %v", err)
 	}
 	defer func() {
+		_ = stdin.Close()
 		if cmd.ProcessState == nil {
 			_ = cmd.Process.Signal(syscall.SIGCONT)
 			_ = cmd.Process.Kill()
@@ -1106,14 +1111,52 @@ func TestAWriteGateArmedBeforeASigstopRefusesAfterTheThaw(t *testing.T) {
 	if line := next(); line != "armed" {
 		t.Fatalf("child: %s", line)
 	}
-	if err := syscall.Kill(cmd.Process.Pid, syscall.SIGSTOP); err != nil {
-		t.Fatalf("SIGSTOP: %v", err)
+	stopped := false
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		var status syscall.WaitStatus
+		pid, err := syscall.Wait4(cmd.Process.Pid, &status, syscall.WUNTRACED|syscall.WNOHANG, nil)
+		if err != nil {
+			t.Fatalf("wait for child SIGSTOP: %v", err)
+		}
+		if pid == 0 {
+			continue
+		}
+		if !status.Stopped() {
+			t.Fatalf("child state before SIGCONT = %v, want stopped by SIGSTOP", status)
+		}
+		if got := status.StopSignal(); got != syscall.SIGSTOP {
+			t.Fatalf("child stop signal = %v, want SIGSTOP", got)
+		}
+		stopped = true
+		break
+	}
+	if !stopped {
+		t.Fatal("the child did not stop itself")
 	}
 	time.Sleep(1500 * time.Millisecond)
 	if err := syscall.Kill(cmd.Process.Pid, syscall.SIGCONT); err != nil {
 		t.Fatalf("SIGCONT: %v", err)
 	}
+	if _, err := stdin.Write([]byte{1}); err != nil {
+		t.Fatalf("release child after SIGCONT: %v", err)
+	}
+	if err := stdin.Close(); err != nil {
+		t.Fatalf("close child stdin: %v", err)
+	}
 	line := next()
+	var elapsed time.Duration
+	for _, field := range strings.Fields(line) {
+		if value, ok := strings.CutPrefix(field, "elapsed="); ok {
+			var err error
+			elapsed, err = time.ParseDuration(value)
+			if err != nil {
+				t.Fatalf("child elapsed %q: %v", value, err)
+			}
+		}
+	}
+	if elapsed < time.Second {
+		t.Errorf("child stopped for %s, want at least 1s", elapsed)
+	}
 	for _, want := range []string{"write_allowed=false", "expired=true", "stop_due=true"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("after a 1.5 s SIGSTOP across a 1 s lease the child reported %q, want %s", line, want)
@@ -1124,10 +1167,10 @@ func TestAWriteGateArmedBeforeASigstopRefusesAfterTheThaw(t *testing.T) {
 	}
 }
 
-// sigstopChild is the stopped process. It prints `armed` once the gate is
-// published, then waits to observe a gap in its own loop long enough to be the
-// parent's SIGSTOP, and reports what the gate and the deadline say straight
-// after it.
+// sigstopChild arms its gate, then stops itself. The parent observes that stop
+// through wait4 before it starts the elapsed-lease interval, sends SIGCONT, and
+// releases this read. That ordering keeps the first tested gate read after the
+// proven stop; the pipe is synchronization only, never lease authority.
 func sigstopChild() {
 	say := func(format string, args ...any) { fmt.Printf("sigstop-child: "+format+"\n", args...) }
 	vol := healthyVolume()
@@ -1142,19 +1185,16 @@ func sigstopChild() {
 		say("refused before the stop")
 		return
 	}
+	armedAt := time.Now()
 	say("armed")
-	last := time.Now()
-	for giveUp := time.Now().Add(10 * time.Second); time.Now().Before(giveUp); {
-		time.Sleep(5 * time.Millisecond)
-		gap := time.Since(last)
-		last = time.Now()
-		if gap < 1200*time.Millisecond {
-			continue
-		}
-		at := time.Now()
-		say("thawed gap=%s write_allowed=%t expired=%t stop_due=%t",
-			gap.Round(time.Millisecond), write(), sup.deadline.Expired(at), sup.deadline.StopDue(at, 0))
+	if err := syscall.Kill(os.Getpid(), syscall.SIGSTOP); err != nil {
+		say("self SIGSTOP: %v", err)
 		return
 	}
-	say("never stopped")
+	if _, err := io.ReadFull(os.Stdin, make([]byte, 1)); err != nil {
+		say("wait for parent release: %v", err)
+		return
+	}
+	at := time.Now()
+	say("thawed elapsed=%s write_allowed=%t expired=%t stop_due=%t", time.Since(armedAt).Round(time.Millisecond), write(), sup.deadline.Expired(at), sup.deadline.StopDue(at, 0))
 }
