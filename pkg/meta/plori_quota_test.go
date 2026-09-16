@@ -20,6 +20,7 @@
 package meta
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -27,6 +28,21 @@ import (
 	"testing"
 	"time"
 )
+
+type quotaAdmissionTest struct {
+	m          Meta
+	calls      atomic.Int32
+	prefetches atomic.Int32
+}
+
+func (a *quotaAdmissionTest) Admit(context.Context) syscall.Errno {
+	a.calls.Add(1)
+	if err := PloriApplyGrant(a.m, 64<<20, 16384); err != nil {
+		return syscall.EIO
+	}
+	return 0
+}
+func (a *quotaAdmissionTest) Proactive() { a.prefetches.Add(1) }
 
 // PLO-324's premise — "the worker applies a new grant from the lease renewal
 // without a remount" — rests on three claims about the metadata engine that
@@ -98,6 +114,57 @@ func TestTheVolumeCeilingAnswersENOSPCNotEDQUOT(t *testing.T) {
 	atomic.StoreInt64(&m.usedInodes, 1024)
 	if st := m.checkQuota(ctx, 0, 1, 0, 0); st != syscall.ENOSPC {
 		t.Errorf("over the inode ceiling = %v, want ENOSPC", st)
+	}
+}
+
+// TestPloriAdmissionRetriesTheOriginalAtomicMetadataOperation proves the
+// marker is set only by Format.Capacity/Inodes and that the retry occurs after
+// the engine transaction returned. This is the boundary VFS needs to retain an
+// uploaded slice through a temporary allocation ceiling.
+func TestPloriAdmissionRetriesTheOriginalAtomicMetadataOperation(t *testing.T) {
+	m, _ := openQuotaVolume(t, 8<<20, 1024)
+	ctx := Background()
+	var ino Ino
+	if st := m.Mknod(ctx, RootInode, "admit", TypeFile, 0644, 022, 0, "", &ino, &Attr{}); st != 0 {
+		t.Fatal(st)
+	}
+	fill(m, 8<<20)
+	wrapped := PloriWithQuotaAdmission(m)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(wrapped, a)
+	if st := wrapped.Truncate(ctx, ino, 0, 8192, &Attr{}, false); st != 0 {
+		t.Fatalf("truncate after admission = %s", st)
+	}
+	if got := a.calls.Load(); got != 1 {
+		t.Fatalf("admission calls = %d, want 1", got)
+	}
+}
+
+// A successful metadata operation crossing 80% must request headroom before
+// any refusal. The admission waiter must not be involved in this fast path.
+func TestPloriAdmissionPrefetchesAtEightyPercent(t *testing.T) {
+	const capacity = 100 * 4096
+	m, _ := openQuotaVolume(t, capacity, 1024)
+	w := PloriWithQuotaAdmission(m)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	fill(m, 78*4096)
+	atomic.StoreInt64(&m.newSpace, 0)
+	var ino Ino
+	if st := w.Mkdir(Background(), RootInode, "below", 0755, 0, 0, &ino, &Attr{}); st != 0 {
+		t.Fatal(st)
+	}
+	if got := a.prefetches.Load(); got != 0 {
+		t.Fatalf("prefetch below threshold: %d", got)
+	}
+	if st := w.Mkdir(Background(), RootInode, "crosses", 0755, 0, 0, &ino, &Attr{}); st != 0 {
+		t.Fatal(st)
+	}
+	if got := a.prefetches.Load(); got != 1 {
+		t.Fatalf("prefetch at threshold: %d", got)
+	}
+	if got := a.calls.Load(); got != 0 {
+		t.Fatalf("a successful operation waited for admission: %d", got)
 	}
 }
 

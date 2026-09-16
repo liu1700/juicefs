@@ -213,6 +213,7 @@ func (f *fakeVolume) ApplyGrant(_ context.Context, bytes, inodes int64) error {
 	f.grants = append(f.grants, [2]int64{bytes, inodes})
 	return nil
 }
+func (f *fakeVolume) SetQuotaAdmission(QuotaAdmission) {}
 
 // QuotaTrips is the metadata engine's refusal counter. The double exposes it as
 // a settable number rather than a "the volume is full" flag for the same reason

@@ -528,18 +528,19 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 }
 
 type ploriVolume struct {
-	paths     pmount.Paths
-	cli       *cli.Context
-	m         meta.Meta
-	blob      object.ObjectStorage
-	store     chunk.ChunkStore
-	vfsConf   *vfs.Config
-	registry  *prometheus.Registry
-	reg       prometheus.Registerer
-	metrics   *privateMetricsServer
-	identity  pmount.FormatIdentity
-	v         *vfs.VFS
-	sessioned bool
+	quotaAdmission pmount.QuotaAdmission
+	paths          pmount.Paths
+	cli            *cli.Context
+	m              meta.Meta
+	blob           object.ObjectStorage
+	store          chunk.ChunkStore
+	vfsConf        *vfs.Config
+	registry       *prometheus.Registry
+	reg            prometheus.Registerer
+	metrics        *privateMetricsServer
+	identity       pmount.FormatIdentity
+	v              *vfs.VFS
+	sessioned      bool
 	// stopped is the supervisor's stop, as the volume sees it. Close is the one
 	// call the supervisor makes on every shape of stop and never otherwise, so
 	// it is where that state arrives; Usage is the only thing that touches the
@@ -638,7 +639,9 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	p.m.OnReload(func(fmtp *meta.Format) {
 		p.store.UpdateLimit(fmtp.UploadLimit, fmtp.DownloadLimit)
 	})
-	p.v = vfs.NewVFS(p.vfsConf, p.m, p.store, p.reg, p.registry)
+	admittedMeta := meta.PloriWithQuotaAdmission(p.m)
+	meta.PloriSetQuotaAdmission(admittedMeta, p.quotaAdmission)
+	p.v = vfs.NewVFS(p.vfsConf, admittedMeta, p.store, p.reg, p.registry)
 	p.v.UpdateFormat = updateFormat(p.cli)
 	// plori-mount serves FUSE in this process instead of going through the
 	// ordinary mount command, so it must register the VFS operation collectors
@@ -799,6 +802,10 @@ func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, 
 // metadata client, is meta.PloriApplyGrant.
 func (p *ploriVolume) ApplyGrant(_ context.Context, bytes, inodes int64) error {
 	return meta.PloriApplyGrant(p.m, bytes, inodes)
+}
+
+func (p *ploriVolume) SetQuotaAdmission(a pmount.QuotaAdmission) {
+	p.quotaAdmission = a
 }
 
 // QuotaTrips is the engine's count of operations the volume ceiling has

@@ -20,8 +20,11 @@
 package meta
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
+	"syscall"
+	"time"
 )
 
 // ploriQuotaTrips counts how many times the VOLUME ceiling has refused an
@@ -30,8 +33,126 @@ import (
 // refused something once, an hour ago", which a boolean cannot.
 var ploriQuotaTrips atomic.Uint64
 
+type ploriQuotaMarker struct{ tripped atomic.Bool }
+type ploriQuotaMarkerKey struct{}
+
+// PloriQuotaAdmission owns the wait outside metadata transactions. It is
+// implemented by the lease supervisor; meta only knows its terminal errno.
+type PloriQuotaAdmission interface {
+	Admit(context.Context) syscall.Errno
+	Proactive()
+}
+
+type ploriAdmissionMeta struct {
+	Meta
+	admission atomic.Pointer[PloriQuotaAdmission]
+}
+
+// PloriWithQuotaAdmission decorates the metadata client used by one mount.
+// Nil admission preserves the ordinary JuiceFS ENOSPC behavior.
+func PloriWithQuotaAdmission(m Meta) Meta { return &ploriAdmissionMeta{Meta: m} }
+
+func PloriSetQuotaAdmission(m Meta, a PloriQuotaAdmission) {
+	if wrapped, ok := m.(*ploriAdmissionMeta); ok {
+		wrapped.admission.Store(&a)
+	}
+}
+
+func (m *ploriAdmissionMeta) retry(ctx Context, call func(Context) syscall.Errno) syscall.Errno {
+	for {
+		marker := &ploriQuotaMarker{}
+		marked := ctx.WithValue(ploriQuotaMarkerKey{}, marker)
+		st := call(marked)
+		if st == 0 {
+			m.proactive()
+		}
+		if st != syscall.ENOSPC || !marker.tripped.Load() {
+			return st
+		}
+		a := m.admission.Load()
+		if a == nil || *a == nil {
+			return st
+		}
+		if st = (*a).Admit(ctx); st != 0 {
+			return st
+		}
+	}
+}
+
+func (m *ploriAdmissionMeta) proactive() {
+	a := m.admission.Load()
+	if a == nil || *a == nil {
+		return
+	}
+	if usage, ok := m.Meta.(interface{ ploriQuotaNearLimit() bool }); ok && usage.ploriQuotaNearLimit() {
+		(*a).Proactive()
+	}
+}
+
+// Read the same local counters as checkQuota. StatFS can consult directory
+// quotas and synchronously refresh remote counters; neither belongs on every
+// committed write's volume-admission path.
+func (m *baseMeta) ploriQuotaNearLimit() bool {
+	f := m.getFormat()
+	used := atomic.LoadInt64(&m.usedSpace) + atomic.LoadInt64(&m.newSpace)
+	inodes := atomic.LoadInt64(&m.usedInodes) + atomic.LoadInt64(&m.newInodes)
+	near := func(used int64, limit uint64) bool {
+		// ceil(4*limit/5), without overflowing either side of the comparison.
+		return limit > 0 && used >= 0 && uint64(used) >= limit-limit/5
+	}
+	return near(used, f.Capacity) || near(inodes, f.Inodes)
+}
+
+func (m *ploriAdmissionMeta) Mknod(ctx Context, parent Ino, name string, typ uint8, mode, cumask uint16, rdev uint32, path string, inode *Ino, attr *Attr) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno {
+		return m.Meta.Mknod(c, parent, name, typ, mode, cumask, rdev, path, inode, attr)
+	})
+}
+func (m *ploriAdmissionMeta) Create(ctx Context, parent Ino, name string, mode, cumask uint16, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno { return m.Meta.Create(c, parent, name, mode, cumask, flags, inode, attr) })
+}
+func (m *ploriAdmissionMeta) Mkdir(ctx Context, parent Ino, name string, mode, cumask uint16, copysgid uint8, inode *Ino, attr *Attr) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno {
+		return m.Meta.Mkdir(c, parent, name, mode, cumask, copysgid, inode, attr)
+	})
+}
+func (m *ploriAdmissionMeta) Symlink(ctx Context, parent Ino, name, path string, inode *Ino, attr *Attr) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno { return m.Meta.Symlink(c, parent, name, path, inode, attr) })
+}
+func (m *ploriAdmissionMeta) SetAttr(ctx Context, inode Ino, set uint16, clear uint8, attr *Attr) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno { return m.Meta.SetAttr(c, inode, set, clear, attr) })
+}
+func (m *ploriAdmissionMeta) Write(ctx Context, inode Ino, indx, off uint32, slice Slice, mtime time.Time) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno { return m.Meta.Write(c, inode, indx, off, slice, mtime) })
+}
+func (m *ploriAdmissionMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, attr *Attr, skip bool) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno { return m.Meta.Truncate(c, inode, flags, length, attr, skip) })
+}
+func (m *ploriAdmissionMeta) Fallocate(ctx Context, inode Ino, mode uint8, off, size uint64, length *uint64) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno { return m.Meta.Fallocate(c, inode, mode, off, size, length) })
+}
+func (m *ploriAdmissionMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut, size uint64, flags uint32, copied, length *uint64) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno {
+		return m.Meta.CopyFileRange(c, fin, offIn, fout, offOut, size, flags, copied, length)
+	})
+}
+
+// Clone's only volume check precedes all clone entries. The per-call marker
+// makes this retry apply only to that preflight refusal, never a backend error
+// after a partial clone. BatchClone does not perform a quota check.
+func (m *ploriAdmissionMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno {
+		return m.Meta.Clone(c, srcParentIno, srcIno, parent, name, cmode, cumask, concurrency, count, total)
+	})
+}
+
 func init() {
-	volumeQuotaHook = func() { ploriQuotaTrips.Add(1) }
+	volumeQuotaHook = func(ctx Context) {
+		ploriQuotaTrips.Add(1)
+		if marker, ok := ctx.Value(ploriQuotaMarkerKey{}).(*ploriQuotaMarker); ok {
+			marker.tripped.Store(true)
+		}
+	}
 }
 
 // PloriVolumeQuotaTrips is how many operations the volume ceiling has refused
