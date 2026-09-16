@@ -121,7 +121,6 @@ func newWorkspaceControlServer(parent context.Context, socket string, identity g
 		Handler:           http.HandlerFunc(s.serveHTTP),
 		ReadHeaderTimeout: workspaceControlReadHeaderTimeout,
 		ReadTimeout:       workspaceControlReadTimeout,
-		WriteTimeout:      workspaceControlWriteTimeout,
 		IdleTimeout:       workspaceControlIdleTimeout,
 		BaseContext: func(net.Listener) context.Context {
 			return s.ctx
@@ -314,6 +313,11 @@ func (s *workspaceControlServer) writeSuccess(w http.ResponseWriter, requestCtx 
 	ready := !s.closing && s.ctx.Err() == nil && requestCtx.Err() == nil && s.active != nil && s.active()
 	s.mu.Unlock()
 	if !ready {
+		return false
+	}
+	// Native work uses its lease-bound context. Start the network-write budget
+	// only now; a Server.WriteTimeout would also count the time spent cloning.
+	if err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(workspaceControlWriteTimeout)); err != nil {
 		return false
 	}
 	w.Header().Set("Content-Type", "application/json")

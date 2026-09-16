@@ -193,6 +193,56 @@ func TestWorkspaceControlRootCloseCancelsPendingRequest(t *testing.T) {
 	}
 }
 
+func TestWorkspaceControlRootSlowWorkKeepsReplyWritable(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root peer credentials; run the compiled test binary with sudo -n")
+	}
+	socket := filepath.Join(t.TempDir(), "workspace-control.sock")
+	identity := workspaceControlIdentity()
+	server, err := newWorkspaceControlServer(context.Background(), socket, identity, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close(context.Background()) })
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		select {
+		case request := <-server.requests:
+			timer := time.NewTimer(workspaceControlWriteTimeout + 100*time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				server.finish(request, workspaceControlReply{barrier: &gatewaycontrol.BarrierResponse{
+					Identity: identity, Fence: ptrUint64(0), LastSuccessfulFence: ptrUint64(0),
+					LastSuccessfulBarrierUnixMs: time.Now().UnixMilli(),
+				}})
+			case <-server.ctx.Done():
+			}
+		case <-server.ctx.Done():
+		}
+	}()
+	defer func() { _ = server.Close(context.Background()); <-finished }()
+	body, err := json.Marshal(gatewaycontrol.BarrierRequest{Identity: identity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := workspaceControlClient(socket)
+	client.Timeout = 2 * workspaceControlWriteTimeout
+	response, err := client.Post("http://workspace"+gatewaycontrol.BarrierRoute, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("native work consumed the reply write deadline: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("slow operation status = %d", response.StatusCode)
+	}
+	var reply gatewaycontrol.BarrierResponse
+	if err := json.NewDecoder(response.Body).Decode(&reply); err != nil || reply.Identity != identity {
+		t.Fatalf("slow operation reply = %+v, err=%v", reply, err)
+	}
+}
+
 type workspaceControlVolume struct {
 	*fakeVolume
 	clone func(context.Context, gatewaycontrol.CloneRequest) error
@@ -264,12 +314,17 @@ func TestWorkspaceControlAcceptsZeroFenceForEmptyVolume(t *testing.T) {
 func TestWorkspaceControlRefusesLateBarrierSuccess(t *testing.T) {
 	started := make(chan struct{})
 	volume := healthyVolume()
+	var sup *Supervisor
 	volume.barrier = func(ctx context.Context) (BarrierResult, error) {
 		close(started)
 		<-ctx.Done()
+		// The mount can have renewed while this request kept its original
+		// deadline. A fresh lease must not make the expired call successful.
+		now := time.Now()
+		sup.deadline.Update(now.Add(time.Minute), 0, now)
 		return BarrierResult{LastSuccessfulBarrierUnixMs: time.Now().UnixMilli()}, nil
 	}
-	sup := newWorkspaceControlSupervisor(t, volume)
+	sup = newWorkspaceControlSupervisor(t, volume)
 	sup.Spec.LeaseExpiresAt = time.Now().UTC().Add(20 * time.Millisecond)
 	sup.deadline = NewDeadline(sup.Spec.LeaseExpiresAt, 0, time.Now())
 	result := make(chan workspaceControlReply, 1)
