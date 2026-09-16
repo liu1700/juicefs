@@ -1320,7 +1320,8 @@ func (m *dbMeta) txn(f func(s *xorm.Session) error, inodes ...Ino) error {
 
 // cloneTxn reuses txn's engine-specific locking and retry behavior while
 // checking clone authority inside every transaction attempt. A refusal from
-// either check reaches xorm before Commit and rolls that attempt back.
+// either check reaches xorm before Commit and rolls that attempt back. It also
+// gates directory repair, a clone-tail mutation that is exposed to fsck.
 func (m *dbMeta) cloneTxn(ctx Context, f func(s *xorm.Session) error, inodes ...Ino) error {
 	return m.txn(func(s *xorm.Session) error {
 		s.Context(ctx)
@@ -4258,7 +4259,7 @@ func (m *dbMeta) doRepair(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 	n.setAtime(attr.Atime*1e9 + int64(attr.Atimensec))
 	n.setMtime(attr.Mtime*1e9 + int64(attr.Mtimensec))
 	n.setCtime(attr.Ctime*1e9 + int64(attr.Ctimensec))
-	return errno(m.txn(func(s *xorm.Session) error {
+	return errno(m.cloneTxn(ctx, func(s *xorm.Session) error {
 		n.Nlink = 2
 		var rows []edge
 		if err := s.Find(&rows, &edge{Parent: inode}); err != nil {

@@ -3630,9 +3630,11 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	}
 
 	if eno == 0 && skipped > 0 {
-		attr.Nlink -= skipped
-		if eno := m.en.doRepair(ctx, ino, &attr); eno != 0 {
-			logger.Warnf("fix nlink of %d: %s", ino, eno)
+		if eno = m.cloneAllowed(ctx); eno == 0 {
+			attr.Nlink -= skipped
+			if eno := m.en.doRepair(ctx, ino, &attr); eno != 0 {
+				logger.Warnf("fix nlink of %d: %s", ino, eno)
+			}
 		}
 	}
 	return eno

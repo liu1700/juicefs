@@ -214,6 +214,40 @@ func TestPloriWorkspaceBatchCloneAccountsCommittedFenceResult(t *testing.T) {
 	}
 }
 
+func TestPloriWorkspaceBatchCloneAccountsCanceledCommitThroughParentCacheMiss(t *testing.T) {
+	m, setup := cloneFenceMeta(t)
+	src := cloneFenceMkdir(t, m, setup, RootInode, "source")
+	file := cloneFenceFile(t, m, setup, src, "file")
+	dst := cloneFenceMkdir(t, m, setup, RootInode, "destination")
+	ancestorQuota := &Quota{MaxSpace: -1, MaxInodes: -1}
+	m.quotaMu.Lock()
+	m.dirQuotas[uint64(RootInode)] = ancestorQuota
+	m.quotaMu.Unlock()
+	m.parentMu.Lock()
+	delete(m.dirParents, dst)
+	m.parentMu.Unlock()
+
+	ctx := Background()
+	installCloneFenceEngine(t, m, &cloneFenceEngine{
+		engine: m.en,
+		afterBatchClone: func() {
+			ctx.Cancel()
+		},
+	})
+	var count uint64
+	entries := []*Entry{{Inode: file, Name: []byte("file")}}
+	if st := m.getBase().BatchClone(ctx, src, dst, entries, CLONE_MODE_PRESERVE_ATTR, 0, &count); st != syscall.EINTR {
+		t.Fatalf("batch clone after committed cancellation = %s, want EINTR", st)
+	}
+	cloneFencePresent(t, m, setup, dst, "file")
+	if got := atomic.LoadInt64(&ancestorQuota.newInodes); got != 1 {
+		t.Fatalf("ancestor quota inodes after parent cache miss = %d, want 1", got)
+	}
+	if count != 1 {
+		t.Fatalf("batch clone count after cancellation = %d, want 1", count)
+	}
+}
+
 // TestPloriWorkspaceRecursiveCloneFencesBeforeChild fences after the actual
 // directory read returns the child. The recursive cloneEntry guard must refuse
 // before it starts the child's metadata transaction or publishes the root.
@@ -327,5 +361,52 @@ func TestPloriWorkspaceCloneAllowedGuardsEveryEngine(t *testing.T) {
 	fenceForTest(t)
 	if st := m.cloneAllowed(Background()); st != syscall.EROFS {
 		t.Fatalf("cloneAllowed after fence = %s, want EROFS", st)
+	}
+}
+
+func TestPloriWorkspaceRepairRefusesFencedMetadataMutation(t *testing.T) {
+	m, ctx := cloneFenceMeta(t)
+	inode := cloneFenceMkdir(t, m, ctx, RootInode, "repair")
+	var before Attr
+	if st := m.GetAttr(ctx, inode, &before); st != 0 {
+		t.Fatalf("get repair directory before fence: %s", st)
+	}
+	repair := before
+	repair.Nlink = before.Nlink + 10
+
+	fenceForTest(t)
+	if st := m.doRepair(ctx, inode, &repair); st != syscall.EROFS {
+		t.Fatalf("repair after fence = %s, want EROFS", st)
+	}
+	var after Attr
+	if st := m.GetAttr(ctx, inode, &after); st != 0 {
+		t.Fatalf("get repair directory after fence: %s", st)
+	}
+	if after.Nlink != before.Nlink {
+		t.Fatalf("fenced repair nlink = %d, want %d", after.Nlink, before.Nlink)
+	}
+}
+
+func TestPloriWorkspaceRepairRefusesCanceledMetadataMutation(t *testing.T) {
+	m, setup := cloneFenceMeta(t)
+	inode := cloneFenceMkdir(t, m, setup, RootInode, "repair")
+	var before Attr
+	if st := m.GetAttr(setup, inode, &before); st != 0 {
+		t.Fatalf("get repair directory before cancellation: %s", st)
+	}
+	repair := before
+	repair.Nlink = before.Nlink + 10
+	ctx := Background()
+	ctx.Cancel()
+
+	if st := m.doRepair(ctx, inode, &repair); st != syscall.EINTR {
+		t.Fatalf("repair after cancellation = %s, want EINTR", st)
+	}
+	var after Attr
+	if st := m.GetAttr(setup, inode, &after); st != 0 {
+		t.Fatalf("get repair directory after cancellation: %s", st)
+	}
+	if after.Nlink != before.Nlink {
+		t.Fatalf("canceled repair nlink = %d, want %d", after.Nlink, before.Nlink)
 	}
 }
