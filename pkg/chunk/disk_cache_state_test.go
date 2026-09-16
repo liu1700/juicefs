@@ -18,6 +18,7 @@ package chunk
 
 import (
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -116,4 +117,48 @@ func testDiskCacheState(t *testing.T, cacheNum int) {
 func TestDiskCacheState(t *testing.T) {
 	testDiskCacheState(t, 1)
 	testDiskCacheState(t, 10)
+}
+
+func TestUnstableDCConcurrentProbes(t *testing.T) {
+	conf := defaultConf
+	conf.CacheEviction = Eviction2Random
+	caches := []*diskCache{
+		newTestCacheStore(t.TempDir(), &conf, nil),
+		newTestCacheStore(t.TempDir(), &conf, nil),
+	}
+	defer func() {
+		for _, cache := range caches {
+			cache.state.stop()
+		}
+	}()
+
+	const probesPerCache = 100
+	ready := make(chan struct{}, len(caches))
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for cacheIndex, cache := range caches {
+		unstable := &unstableDC{}
+		unstable.init(cache)
+
+		wg.Add(1)
+		go func(cacheIndex int, dc *unstableDC) {
+			defer wg.Done()
+			ready <- struct{}{}
+			<-start
+			for probeIndex := 0; probeIndex < probesPerCache; probeIndex++ {
+				page := NewPage(probeData)
+				dc.doProbe(probeCacheKey(1_000_000+cacheIndex*probesPerCache+probeIndex, len(probeData)), page)
+				pending := <-dc.cache.pending
+				atomic.AddInt64(&dc.cache.totalPages, -int64(cap(pending.page.Data)))
+				pending.page.Release()
+				page.Release()
+			}
+		}(cacheIndex, unstable)
+	}
+
+	for range caches {
+		<-ready
+	}
+	close(start)
+	wg.Wait()
 }
