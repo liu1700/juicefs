@@ -346,6 +346,80 @@ func TestASigtermDuringAStalledRenewStopsAtOnceAndTheLateAnswerMovesNothing(t *t
 	}
 }
 
+type quotaDuringRenewCP struct {
+	*fakeCP
+	requests chan RenewRequest
+	release  chan struct{}
+	calls    atomic.Int32
+}
+
+func (c *quotaDuringRenewCP) RenewLease(ctx context.Context, volume string, epoch int64, req RenewRequest) (LeaseResponse, error) {
+	c.requests <- req
+	if c.calls.Add(1) == 1 {
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return LeaseResponse{}, ctx.Err()
+		}
+	}
+	return c.fakeCP.RenewLease(ctx, volume, epoch, req)
+}
+
+func TestQuotaAdmissionDuringRenewKeepsOneRequestInFlight(t *testing.T) {
+	spec := testSpec()
+	spec.LeaseRenewInterval = Duration(500 * time.Millisecond)
+	spec.Grant = GrantSpec{Bytes: 64 << 20, Inodes: 16384, Epoch: 2, AckedEpoch: 2}
+	cp := &quotaDuringRenewCP{
+		fakeCP: &fakeCP{grant: spec.Grant, onGrow: func(g GrantSpec) GrantSpec {
+			g.Bytes += 64 << 20
+			g.Epoch++
+			return g
+		}},
+		requests: make(chan RenewRequest, 32), release: make(chan struct{}),
+	}
+	sup := newSup(t, spec, &fakeFS{vol: healthyVolume()}, cp.fakeCP, &fakeReplicator{}, &fakeFencer{})
+	sup.Deps.CP = cp
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	t.Cleanup(func() { stop <- syscall.SIGTERM; waitFatal(t, done, 5*time.Second, "quota test did not stop") })
+	select {
+	case req := <-cp.requests:
+		if req.Grow {
+			t.Fatal("ordinary first renewal unexpectedly requested growth")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ordinary renewal never started")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	admitted := make(chan syscall.Errno, 1)
+	go func() { admitted <- sup.Admit(ctx) }()
+	waitFor(t, time.Second, sup.admissionPending, "quota admission did not start")
+	select {
+	case <-cp.requests:
+		t.Fatal("quota signal started a second renewal before the first returned")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(cp.release)
+	select {
+	case req := <-cp.requests:
+		if !req.Grow {
+			t.Fatal("pending quota admission was not included in the next renewal")
+		}
+	case <-time.After(400 * time.Millisecond):
+		t.Fatal("pending quota admission waited for the full ordinary renewal interval")
+	}
+	select {
+	case result := <-admitted:
+		if result != 0 {
+			t.Fatalf("quota admission failed: %v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("applied growth did not release the quota waiter")
+	}
+}
+
 // Once a stop has begun, no renewal answer may act: not a success that would
 // extend the lease, and not a refusal that would run a second stop.
 func TestARenewAnswerAfterTheStopBeganMovesNothing(t *testing.T) {
