@@ -37,7 +37,7 @@ type quotaAdmissionTest struct {
 
 func (a *quotaAdmissionTest) Admit(context.Context) syscall.Errno {
 	a.calls.Add(1)
-	if err := PloriApplyGrant(a.m, 64<<20, 16384); err != nil {
+	if err := PloriApplyGrant(a.m, int64(a.m.GetFormat().Capacity)+(64<<20), 65536); err != nil {
 		return syscall.EIO
 	}
 	return 0
@@ -137,6 +137,24 @@ func TestPloriAdmissionRetriesTheOriginalAtomicMetadataOperation(t *testing.T) {
 	}
 	if got := a.calls.Load(); got != 1 {
 		t.Fatalf("admission calls = %d, want 1", got)
+	}
+}
+
+func TestPloriAdmissionCanGrowThroughSeveralGrants(t *testing.T) {
+	m, _ := openQuotaVolume(t, 8<<20, 1024)
+	w := PloriWithQuotaAdmission(m)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	var ino Ino
+	if st := w.Create(Background(), RootInode, "large", 0644, 0, 0, &ino, &Attr{}); st != 0 {
+		t.Fatal(st)
+	}
+	var attr Attr
+	if st := w.Truncate(Background(), ino, 0, 180<<20, &attr, false); st != 0 {
+		t.Fatal(st)
+	}
+	if attr.Length != 180<<20 || a.calls.Load() != 3 {
+		t.Fatalf("large operation: length=%d grants=%d", attr.Length, a.calls.Load())
 	}
 }
 
