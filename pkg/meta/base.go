@@ -1925,7 +1925,7 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	st := m.en.doBatchClone(ctx, srcParent, dstParent, entries, cmode, cumask, &r)
 	if st == 0 {
 		m.en.updateStats(r.space, r.inodes)
-		m.updateDirQuota(ctx, dstParent, r.space, r.inodes)
+		m.updateDirQuota(cloneAccountingContext(ctx), dstParent, r.space, r.inodes)
 		for _, q := range r.deltas {
 			m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
 		}
@@ -3467,28 +3467,23 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 			}
 		}
 	} else {
-		eno = m.cloneEntry(ctx, srcIno, parent, name, &dstIno, cmode, cumask, count, true, concurrent)
+		eno = m.cloneEntry(ctx, srcIno, parent, name, nil, cmode, cumask, count, true, concurrent)
 	}
-	published := eno == 0
-	accountingCtx := ctx
-	if ctx.Canceled() {
-		accountingCtx = WrapWithoutCancel(context.WithoutCancel(ctx), ctx.Pid(), ctx.Uid(), ctx.Gids())
-	}
-	if !published && dstIno != 0 && m.cloneAllowed(ctx) != 0 {
-		var publishedIno Ino
-		var publishedAttr Attr
-		published = m.en.doLookup(accountingCtx, parent, name, &publishedIno, &publishedAttr) == 0 && publishedIno == dstIno
-	}
-	if published {
+	if eno == 0 {
+		accountingCtx := cloneAccountingContext(ctx)
 		m.updateDirStat(accountingCtx, parent, int64(attr.Length), align4K(attr.Length), 1)
 		m.updateDirQuota(accountingCtx, parent, int64(sum.Size), int64(sum.Dirs)+int64(sum.Files))
-		if eno == 0 {
-			if eno = m.cloneAllowed(ctx); eno != 0 {
-				return eno
-			}
-		}
+		eno = m.cloneAllowed(ctx)
 	}
 	return eno
+}
+
+// cloneAccountingContext preserves accounting for a committed clone even if
+// its caller cancels. It is used only for counters and read-only ancestor
+// lookup, never to start another clone transaction. The writer supervisor
+// still bounds shutdown if a metadata read does not finish.
+func cloneAccountingContext(ctx Context) Context {
+	return WrapWithoutCancel(context.WithoutCancel(ctx), ctx.Pid(), ctx.Uid(), ctx.Gids())
 }
 
 // cloneAllowed rejects clone work once its request is canceled or this client
@@ -3523,11 +3518,13 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	m.en.updateStats(align4K(attr.Length), 1)
 	atomic.AddUint64(count, 1)
 	m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, align4K(attr.Length), 1)
+	if attr.Typ != TypeDirectory {
+		// The top-level caller accounts the published entry before reporting
+		// cancellation or authority loss. No further clone work starts here.
+		return 0
+	}
 	if eno = m.cloneAllowed(ctx); eno != 0 {
 		return eno
-	}
-	if attr.Typ != TypeDirectory {
-		return 0
 	}
 	if eno = m.Access(ctx, srcIno, MODE_MASK_R|MODE_MASK_X, &attr); eno != 0 {
 		return eno
