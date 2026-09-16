@@ -100,6 +100,10 @@ func ploriMount(c *cli.Context) error {
 	if err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
 	}
+	workspaceGateway := c.Bool("workspace-gateway")
+	if err := validateWorkspaceGatewayMode(workspaceGateway, mode); err != nil {
+		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
+	}
 	if err := validateMountRuntime(mode, spec.ObjectStore.CredentialSource, c.String("credential-file"), c.String("replicator")); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
 	}
@@ -193,12 +197,13 @@ func ploriMount(c *cli.Context) error {
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 
 	cp := pmount.NewClient(c.String("control-plane-url"), paths.TokenFile, 10*time.Second)
-	cp.WorkspaceGateway = c.Bool("workspace-gateway")
+	cp.WorkspaceGateway = workspaceGateway
 	cp.ReleaseCapabilityFile = c.String("lease-release-capability-file")
 	sup := &pmount.Supervisor{
-		Spec:    spec,
-		Paths:   paths,
-		Options: opts,
+		Spec:             spec,
+		Paths:            paths,
+		Options:          opts,
+		WorkspaceGateway: workspaceGateway,
 		Deps: pmount.Deps{
 			FS:                   &ploriFS{paths: paths, opts: opts, credentials: credentials, inPod: mode == mountModeInPod},
 			CP:                   cp,
@@ -243,6 +248,13 @@ func validateMountRuntime(mode mountMode, source, credentialFile, replicator str
 	}
 	if mode == mountModeInPod && replicator != "" {
 		return fmt.Errorf("%w: mount_mode %q does not support --replicator", pmount.ErrSpec, mode)
+	}
+	return nil
+}
+
+func validateWorkspaceGatewayMode(enabled bool, mode mountMode) error {
+	if enabled && mode != mountModeInPod {
+		return fmt.Errorf("%w: --workspace-gateway requires mount_mode %q", pmount.ErrSpec, mountModeInPod)
 	}
 	return nil
 }
@@ -725,7 +737,13 @@ func (p *ploriVolume) Barrier(ctx context.Context) (pmount.BarrierResult, error)
 		}
 	}
 	status, err := store.RemoteDurability(ctx)
-	res := pmount.BarrierResult{BarrierAt: time.Now().UTC(), PendingBlocks: status.PendingBlocks}
+	res := pmount.BarrierResult{
+		BarrierAt:                   time.Now().UTC(),
+		PendingBlocks:               status.PendingBlocks,
+		Fence:                       status.Fence,
+		LastSuccessfulFence:         status.LastSuccessfulFence,
+		LastSuccessfulBarrierUnixMs: status.LastSuccessfulBarrierUnixMs,
+	}
 	return res, err
 }
 
