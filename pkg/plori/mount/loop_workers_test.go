@@ -632,7 +632,7 @@ func TestAnOutOfBandFenceCancelsABarrierBeforeItSealsWrites(t *testing.T) {
 	sup.Deps.Replicator = rep
 	sup.deadline = NewDeadline(spec.LeaseExpiresAt, spec.WriteStopMargin.D(), time.Now())
 	w := sup.startWorkers(context.Background())
-	w.barrierJobs <- struct{}{}
+	w.barrierJobs <- barrierJob{}
 	select {
 	case <-rep.txidStarted:
 	case <-time.After(10 * time.Second):
@@ -695,7 +695,7 @@ func TestAnOutOfBandFenceSealsBeforeANonCooperativeBarrierReturns(t *testing.T) 
 	sup.Deps.Replicator = rep
 	sup.deadline = NewDeadline(spec.LeaseExpiresAt, spec.WriteStopMargin.D(), time.Now())
 	w := sup.startWorkers(context.Background())
-	w.barrierJobs <- struct{}{}
+	w.barrierJobs <- barrierJob{}
 	select {
 	case <-rep.started:
 	case <-time.After(10 * time.Second):

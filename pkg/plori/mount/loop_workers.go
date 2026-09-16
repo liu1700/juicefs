@@ -70,13 +70,14 @@ type loopWorkers struct {
 	renewDone       chan renewObservation
 	replicationJobs chan replicationJob
 	replicationDone chan replicationObservation
-	barrierJobs     chan struct{}
-	barrierDone     chan struct{}
+	barrierJobs     chan barrierJob
+	barrierDone     chan barrierObservation
 
 	// The rest is the run loop's own: a busy lane keeps what was asked of it,
 	// so ticks behind a slow call coalesce and nothing requested is dropped.
 	replicating, barriering            bool
 	wantProbe, wantReload, wantBarrier bool
+	workspaceControl                   *workspaceControlRequest
 }
 
 // renewObservation is one renewal's answer, with what the loop needs to judge
@@ -108,6 +109,15 @@ type replicationObservation struct {
 	changed bool
 }
 
+type barrierJob struct {
+	workspaceControl *workspaceControlRequest
+}
+
+type barrierObservation struct {
+	workspaceControl *workspaceControlRequest
+	reply            workspaceControlReply
+}
+
 // startWorkers starts the two lanes. The renewals and usage work are started on
 // demand by the loop.
 func (s *Supervisor) startWorkers(parent context.Context) *loopWorkers {
@@ -121,8 +131,8 @@ func (s *Supervisor) startWorkers(parent context.Context) *loopWorkers {
 		renewDone:       make(chan renewObservation, 1),
 		replicationJobs: make(chan replicationJob, 1),
 		replicationDone: make(chan replicationObservation, 1),
-		barrierJobs:     make(chan struct{}, 1),
-		barrierDone:     make(chan struct{}, 1),
+		barrierJobs:     make(chan barrierJob, 1),
+		barrierDone:     make(chan barrierObservation, 1),
 	}
 	w.wg.Add(2)
 	go func() {
@@ -150,13 +160,18 @@ func (s *Supervisor) startWorkers(parent context.Context) *loopWorkers {
 			select {
 			case <-ctx.Done():
 				return
-			case <-w.barrierJobs:
+			case job := <-w.barrierJobs:
 				if ctx.Err() != nil {
 					return
 				}
-				s.runBarrier(ctx)
+				observation := barrierObservation{workspaceControl: job.workspaceControl}
+				if job.workspaceControl == nil {
+					s.runBarrier(ctx)
+				} else {
+					observation.reply = s.runWorkspaceControlRequest(ctx, *job.workspaceControl)
+				}
 				select {
-				case w.barrierDone <- struct{}{}:
+				case w.barrierDone <- observation:
 				case <-ctx.Done():
 					return
 				}
@@ -173,9 +188,17 @@ func (w *loopWorkers) pump() {
 		w.replicationJobs <- replicationJob{probe: w.wantProbe, reload: w.wantReload}
 		w.replicating, w.wantProbe, w.wantReload = true, false, false
 	}
-	if !w.barriering && w.wantBarrier {
-		w.barrierJobs <- struct{}{}
-		w.barriering, w.wantBarrier = true, false
+	if !w.barriering {
+		job := barrierJob{}
+		if w.workspaceControl != nil {
+			job.workspaceControl, w.workspaceControl = w.workspaceControl, nil
+		} else if w.wantBarrier {
+			w.wantBarrier = false
+		} else {
+			return
+		}
+		w.barrierJobs <- job
+		w.barriering = true
 	}
 }
 

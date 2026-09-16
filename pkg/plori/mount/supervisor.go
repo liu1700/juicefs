@@ -76,6 +76,9 @@ type Supervisor struct {
 	// Options is the resolved mount_options vocabulary. cmd fills it so the
 	// operator override is applied exactly once, at startup.
 	Options MountOptions
+	// WorkspaceGateway enables the private writer control socket. cmd sets it
+	// only for the trusted in-pod workspace writer mode.
+	WorkspaceGateway bool
 
 	deadline *Deadline
 	vol      Volume
@@ -148,6 +151,7 @@ type Supervisor struct {
 	// workers is the run loop's slow work while the loop runs (loopWorkers).
 	// Only the loop's goroutine reads or writes it.
 	workers *loopWorkers
+	control *workspaceControlServer
 	// tuneMu keeps one backlog-cap computation and its push together: a renewal
 	// and a barrier can both retune now, and must not push their caps out of order.
 	tuneMu sync.Mutex
@@ -1180,6 +1184,12 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	// begins (loopWorkers). This select only decides.
 	w := s.startWorkers(ctx)
 	defer s.stopWorkers(context.Background(), false)
+	if err := s.startWorkspaceControl(ctx); err != nil {
+		f := fatalf(CodeRefused, ErrCodeRestoreFailed, false, "start workspace control: %s", err)
+		s.shutdown(context.Background(), ReasonShutdown)
+		return f
+	}
+	defer s.stopWorkspaceControl(context.Background()) //nolint:errcheck
 	usageResults := make(chan usageObservation, 1)
 	startUsage := func() { s.startUsageObservation(w.ctx, usageResults) }
 
@@ -1225,6 +1235,12 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 				retrying = true
 				renew.Reset(0)
 			}
+		case request := <-s.workspaceControlRequests():
+			if w.workspaceControl != nil {
+				s.control.finish(request, workspaceControlReply{err: errors.New("workspace control is busy")})
+				continue
+			}
+			w.workspaceControl = &request
 		case <-stopped:
 			s.log("sigterm")
 			return s.shutdown(context.Background(), ReasonShutdown)
@@ -1346,8 +1362,20 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 		case <-barrier.C:
 			w.wantBarrier = true
 
-		case <-w.barrierDone:
+		case observed := <-w.barrierDone:
 			w.barriering = false
+			if observed.workspaceControl != nil {
+				if observed.reply.err != nil {
+					operation := "barrier"
+					if observed.workspaceControl.clone != nil {
+						operation = "clone"
+					}
+					s.log("workspace_control_failed", "operation", operation, "stage", "supervisor")
+				}
+				if s.control != nil {
+					s.control.finish(*observed.workspaceControl, observed.reply)
+				}
+			}
 		}
 	}
 }
@@ -1700,7 +1728,7 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 	// workload, right now. Sampling anything else would be a model; this is an
 	// observation (PLO-383).
 	pendingBefore, startedAt := s.vol.PendingBlocks(), s.now()
-	res, err := s.vol.Barrier(bctx)
+	res, err := s.runPayloadBarrier(bctx)
 	if err != nil {
 		s.log("barrier_failed", "error", err.Error())
 		return
@@ -2099,6 +2127,7 @@ func (s *Supervisor) fenceAndStop(f *Fatal, reason string) *Fatal {
 		// metadata write authority immediately even when a worker ignores it.
 		// shutdown joins workers under the lease budget before it detaches or
 		// closes shared resources.
+		s.cancelWorkspaceControl()
 		if w := s.workers; w != nil {
 			s.cancelWorkers(w, true)
 		}
@@ -2166,19 +2195,23 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	}
 	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	if !s.stopWorkers(ctx, outOfBand) {
-		// A worker that did not observe cancellation can still hold a replicator
-		// or volume handle. Fence before returning, but do not detach, close,
-		// final-sync, release, or write clean: the command boundary terminates
-		// this process instead of racing those resources.
+	controlErr := s.stopWorkspaceControl(ctx)
+	workersStopped := s.stopWorkers(ctx, outOfBand)
+	if controlErr != nil || !workersStopped {
+		// Both joins share this finite budget. A listener or worker that remains
+		// live may still hold a volume handle, so fence and leave all teardown,
+		// final-barrier, receipt, and release steps to process exit.
 		s.vol.FenceWrites()
 		s.mu.Lock()
 		s.fenced = true
 		s.mu.Unlock()
+		if controlErr != nil {
+			return fatalf(CodeBarrierIncomplete, ErrCodeBarrierIncomplete, false,
+				"workspace control did not stop before the lease shutdown budget")
+		}
 		return fatalf(CodeBarrierIncomplete, ErrCodeBarrierIncomplete, false,
 			"worker did not stop before the lease shutdown budget")
 	}
-
 	var incomplete error
 	// Which of exit 69's two identifiers the shortfall belongs to. `incomplete`
 	// records the FIRST step that fell short and this records what that step

@@ -23,6 +23,8 @@ import (
 	"context"
 	"syscall"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/plori/gatewaycontrol"
 )
 
 // Paths are the four directories and files the plugin hands the worker.
@@ -53,6 +55,10 @@ func (p Paths) HealthPath() string { return p.StateDir + "/health.json" }
 // MetricsPath is the private in-pod Prometheus socket. It is not a TCP
 // listener because the Agent shares the Pod network namespace.
 func (p Paths) MetricsPath() string { return p.StateDir + "/metrics.sock" }
+
+// WorkspaceControlPath is the private Workspace writer control socket. It is
+// created only for an in-pod workspace gateway.
+func (p Paths) WorkspaceControlPath() string { return p.StateDir + "/workspace-control.sock" }
 
 // CleanStopPath records that the previous generation completed its ordered
 // stop. It is written as the last act of a clean shutdown and removed at the
@@ -87,6 +93,19 @@ type BarrierResult struct {
 	// PendingBlocks is what the writeback cache still owed when the barrier
 	// finished; zero on success.
 	PendingBlocks uint64
+	// Fence and LastSuccessfulFence identify the completed native durability
+	// barrier. They are not restore anchors.
+	Fence               uint64
+	LastSuccessfulFence uint64
+	// LastSuccessfulBarrierUnixMs is the native barrier completion timestamp.
+	LastSuccessfulBarrierUnixMs int64
+}
+
+// WorkspaceCloner is implemented only by the in-pod Workspace writer. It is
+// deliberately separate from Volume so ordinary mounts and their fakes retain
+// their existing surface.
+type WorkspaceCloner interface {
+	CloneTree(context.Context, gatewaycontrol.CloneRequest) error
 }
 
 // RepairReport is one restore-time repair pass over the data plane
