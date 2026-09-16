@@ -21,6 +21,7 @@ package mount
 
 import (
 	"context"
+	"syscall"
 	"time"
 )
 
@@ -31,6 +32,13 @@ type Paths struct {
 	StateDir   string
 	CacheDir   string
 	TokenFile  string
+}
+
+// QuotaAdmission is implemented by Supervisor. The runtime interface keeps
+// the mount lifecycle package independent of the JuiceFS metadata package.
+type QuotaAdmission interface {
+	Admit(context.Context) syscall.Errno
+	Proactive()
 }
 
 // MetaPath is the restored SQLite metadata database.
@@ -223,6 +231,8 @@ type Volume interface {
 	// meta.TestTheCeilingIsReadPerOperationSoAGrantNeedsNoRemount and
 	// vfs.TestPloriGrantAppliesLiveThroughTheVFS).
 	ApplyGrant(ctx context.Context, bytes, inodes int64) error
+	// SetQuotaAdmission installs the supervisor-owned waiter before serving.
+	SetQuotaAdmission(QuotaAdmission)
 	// QuotaTrips is how many operations the VOLUME ceiling has refused since
 	// this process started. It is monotonic, so the supervisor can tell "the
 	// grant ran out since the last tick" from "the grant ran out once, an hour

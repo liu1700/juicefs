@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -87,6 +88,9 @@ type Supervisor struct {
 	lastBarrier     BarrierResult
 	lastTxID        string
 	grantApplied    int64
+	admissionRenew  chan struct{}
+	quotaFlight     *quotaFlight
+	proactiveEpoch  int64
 	pendingAck      int64
 	quotaTrips      uint64
 	restoredUnclean bool
@@ -108,13 +112,10 @@ type Supervisor struct {
 	// operation until a LARGER ceiling is applied. It is one half of
 	// health.json's quota_exhausted.
 	ceilingRefused bool
-	// growDenied is true from the moment a grow this worker asked for produced
-	// no more room until a larger ceiling is applied. Three answers say it and
-	// they are one fact — the account is at its budget (over_budget on the
-	// renew), the allocator reissued the ceiling the volume already had, or a
-	// renew carrying the request came back with neither. It is the other half
-	// of quota_exhausted.
-	growDenied           bool
+	// growDenied is set only by an authoritative account-capacity refusal.
+	growDenied bool
+	// growAsked holds off another allocation while an issued grant still needs
+	// to be persisted locally. It never implies capacity exhaustion.
 	growAsked            bool
 	lastUsage            Usage
 	lastRenewOK          bool
@@ -368,6 +369,7 @@ func (s *Supervisor) joinServe(serveErr <-chan error) error {
 // ---------------------------------------------------------------- startup ---
 
 func (s *Supervisor) start(ctx context.Context) (err error) {
+	s.admissionRenew = make(chan struct{}, 1)
 	s.deadline = NewDeadline(s.Spec.LeaseExpiresAt, s.Spec.WriteStopMargin.D(), s.now())
 	s.drain = NewDrainModel(DefaultDrainPerBlock)
 	// The spec does not carry the lease TTL, so seed it from what is left of
@@ -457,6 +459,7 @@ func (s *Supervisor) start(ctx context.Context) (err error) {
 		return fatalf(CodeRestoreFailed, ErrCodeRestoreFailed, false, "open restored metadata: %s", err)
 	}
 	s.vol = vol
+	vol.SetQuotaAdmission(s)
 
 	if err := vol.IntegrityCheck(ctx); err != nil {
 		s.restoreFailure("integrity", s.restoreContext, err)
@@ -1195,6 +1198,13 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	renewedAt := s.now()
 	for {
 		select {
+		case <-s.admissionRenew:
+			// Reuse the existing renewal timer and retry path. An event advances
+			// the next request; it does not start a second renewal goroutine.
+			if s.admissionPending() {
+				retrying = true
+				renew.Reset(0)
+			}
 		case <-stopped:
 			s.log("sigterm")
 			return s.shutdown(context.Background(), ReasonShutdown)
@@ -1310,7 +1320,8 @@ func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool, usa
 	renewCtx, cancel := context.WithTimeout(ctx, due.Sub(before))
 	defer cancel()
 	s.noteQuotaTrips()
-	resp, err := s.Deps.CP.RenewLease(renewCtx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, s.renewRequest())
+	request := s.renewRequest()
+	resp, err := s.Deps.CP.RenewLease(renewCtx, s.Spec.StorageVolumeID, s.Spec.FenceEpoch, request)
 	if err == nil {
 		err = resp.notOurs(s.Spec.StorageVolumeID, s.Spec.FenceEpoch)
 	}
@@ -1326,6 +1337,9 @@ func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool, usa
 		return renewResult{fatal: s.deadlineFence()}
 	}
 	if err != nil {
+		s.mu.Lock()
+		s.growAsked = false // the request failed; do not latch a missing answer
+		s.mu.Unlock()
 		s.setRenewOK(false)
 		s.log("renew_failed", "error", err.Error())
 		s.writeHealth()
@@ -1337,16 +1351,27 @@ func (s *Supervisor) renew(ctx context.Context, ticks int, reportUsage bool, usa
 	s.deadline.Update(resp.LeaseExpiresAt, s.Spec.WriteStopMargin.D(), before)
 	s.publishWriteExpiry()
 	s.retuneBacklog()
+	s.mu.Lock()
+	beforeBytes, beforeInodes := s.grantBytes, s.grantInodes
+	s.mu.Unlock()
 	if resp.Grant.Epoch > s.appliedGrant() {
 		s.applyGrant(ctx, resp.Grant)
-	} else if resp.OverBudget {
+	}
+	s.mu.Lock()
+	grew := s.grantBytes > beforeBytes || s.grantInodes > beforeInodes
+	unapplied := resp.Grant.Epoch > s.grantApplied
+	if !unapplied {
+		s.growAsked = false
+	}
+	s.mu.Unlock()
+	if request.Grow && resp.OverBudget && !grew && !unapplied {
 		s.growRefused()
 	}
 	if reportUsage && ticks%DefaultUsageReportEvery == 0 {
 		s.startUsageObservation(usageCtx, usageResults)
 	}
 	s.writeHealth()
-	return renewResult{renewedAt: before}
+	return renewResult{renewedAt: before, retry: s.admissionPending()}
 }
 
 func (s *Supervisor) deadlineFence() *Fatal {
@@ -1699,30 +1724,17 @@ func (s *Supervisor) applyGrant(ctx context.Context, g GrantSpec) {
 	if g.Epoch > g.AckedEpoch {
 		s.pendingAck = g.Epoch
 	}
-	// A LARGER ceiling is the answer to whatever refused the last write, so the
-	// refusal, the denial and the outstanding request all close here. If the
-	// new ceiling is still too small the very next refusal reopens them.
-	//
-	// A new epoch that is not larger is not that answer. The allocator caps a
-	// grow at `current + available` (storagequota Policy.growTo), so an account
-	// with nothing left answers a grow with the ceiling the volume already had
-	// — a new epoch carrying the same numbers. Reading that as "grown" is what
-	// kept quota_exhausted false on a volume that was 100 % full and had
-	// nowhere to go (PLO-468): the epoch moved every renew and wiped the state
-	// the flag is made of. It is recorded as a denial instead, and the request
-	// is re-armed the way growRefused re-arms it, because the way out of a full
-	// account is the user buying disk and nothing else will ask again.
+	waitMS := s.quotaWaitMSLocked()
 	grew := g.Bytes > s.grantBytes || g.Inodes > s.grantInodes
 	s.grantBytes, s.grantInodes = g.Bytes, g.Inodes
 	s.growAsked = false
 	if grew {
 		s.ceilingRefused = false
 		s.growDenied = false
-	} else {
-		s.growDenied = true
+		s.finishQuotaFlightLocked(0)
 	}
 	s.mu.Unlock()
-	s.log("grant_applied", "epoch", g.Epoch, "bytes", g.Bytes, "inodes", g.Inodes)
+	s.log("grant_applied", "epoch", g.Epoch, "bytes", g.Bytes, "inodes", g.Inodes, "admission_wait_ms", waitMS)
 }
 
 // noteQuotaTrips samples the metadata engine's refusal counter. A counter
@@ -1750,53 +1762,107 @@ func (s *Supervisor) markMounted() {
 	s.mu.Unlock()
 }
 
-// renewRequest is what this tick tells the control-plane beyond "I am here":
-// the grant epoch it has applied since the last renew, whether it needs more
-// room, and whether it is mounted yet.
-//
-// The Grow flag is raised at most once per grant epoch. The ceiling refuses
-// every write of a filesystem that is full — a `git clone` against a full
-// volume trips it thousands of times a second — so a request per refusal would
-// be a request storm against a per-owner advisory lock. One per epoch is
-// enough because the answer to the request is a new epoch.
+// renewRequest attaches pending allocation demand to the holder's authenticated
+// renewal. An unchanged grant without OverBudget is a transient answer.
 func (s *Supervisor) renewRequest() RenewRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	req := RenewRequest{AckedGrantEpoch: s.pendingAck, Mounted: s.mounted}
-	// A request that is still outstanding when the next tick comes round has
-	// already been answered: the response arrives on the same call that carried
-	// it, and every answer that gave this volume room clears growAsked on its
-	// way through applyGrant or growRefused. So an outstanding request here is
-	// one the allocator answered with nothing — the third of quota_exhausted's
-	// three denials, and the only one that leaves no other trace.
-	if s.growAsked {
-		s.growDenied = true
-	}
-	if s.ceilingRefused && !s.growAsked {
+	if (s.quotaFlight != nil || s.ceilingRefused) && !s.growAsked {
 		req.Grow = true
 		s.growAsked = true
 	}
 	return req
 }
 
-// growRefused records that the account could not fund the last request, which
-// re-arms it.
-//
-// Re-arming looks like the storm the once-per-epoch rule exists to prevent, and
-// is not: the request rides a renew that was going to happen anyway, so it
-// costs no round trip, and it is bounded at one per renew interval per volume
-// that is genuinely full. It is also the only way out of the state. Buying disk
-// raises the account budget, and the billing hook's Rebalance reclaims and
-// compacts — it does not GROW a volume that is already at its ceiling
-// (storagequota.Rebalance). So an Agent that asked once, was refused, and never
-// asked again would stay stuck after the user paid to unstick it.
+// quotaFlight retains its result after completion, so a later write can open
+// another request without changing the answer existing waiters observe.
+type quotaFlight struct {
+	done    chan struct{}
+	result  syscall.Errno
+	started time.Time
+}
+
+func (s *Supervisor) startQuotaFlightLocked() *quotaFlight {
+	if s.quotaFlight != nil {
+		return s.quotaFlight
+	}
+	f := &quotaFlight{done: make(chan struct{}), started: time.Now()}
+	if s.fenced {
+		f.result = syscall.EROFS
+		close(f.done)
+		return f
+	}
+	s.quotaFlight = f
+	select {
+	case s.admissionRenew <- struct{}{}:
+	default:
+	}
+	return f
+}
+
+// Proactive starts at most one speculative request per applied grant. A
+// rejected prefetch never blocks writes that still fit, and Admit always opens
+// a fresh request when a later write actually needs capacity (including after
+// a purchase).
+func (s *Supervisor) Proactive() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.proactiveEpoch == s.grantApplied || s.fenced {
+		return
+	}
+	s.proactiveEpoch = s.grantApplied
+	s.startQuotaFlightLocked()
+}
+
+func (s *Supervisor) admissionPending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.quotaFlight != nil
+}
+
+func (s *Supervisor) finishQuotaFlightLocked(result syscall.Errno) {
+	if f := s.quotaFlight; f != nil {
+		f.result = result
+		close(f.done)
+		s.quotaFlight = nil
+	}
+}
+
+func (s *Supervisor) quotaWaitMSLocked() int64 {
+	if s.quotaFlight == nil {
+		return 0
+	}
+	return time.Since(s.quotaFlight.started).Milliseconds()
+}
+
 func (s *Supervisor) growRefused() {
 	s.mu.Lock()
+	waitMS := s.quotaWaitMSLocked()
 	s.growAsked = false
 	s.growDenied = true
+	s.finishQuotaFlightLocked(syscall.ENOSPC)
 	epoch := s.grantApplied
 	s.mu.Unlock()
-	s.log("grant_over_budget", "epoch", epoch)
+	s.log("grant_over_budget", "epoch", epoch, "admission_wait_ms", waitMS)
+}
+
+// Admit runs after the refused metadata transaction has returned. Cancellation
+// releases only this waiter; the shared allocation remains useful to others.
+func (s *Supervisor) Admit(ctx context.Context) syscall.Errno {
+	if ctx.Err() != nil {
+		return syscall.EINTR
+	}
+	s.mu.Lock()
+	s.ceilingRefused = true
+	f := s.startQuotaFlightLocked()
+	s.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return syscall.EINTR
+	case <-f.done:
+		return f.result
+	}
 }
 
 // usageTotals refreshes cheap metadata counters without enumerating trash. A failed
@@ -1900,6 +1966,7 @@ func (s *Supervisor) fenceAndStop(f *Fatal, reason string) *Fatal {
 	}
 	s.mu.Lock()
 	s.fenced = true
+	s.finishQuotaFlightLocked(syscall.EROFS)
 	s.mu.Unlock()
 	if stopErr := s.shutdown(context.Background(), reason); stopErr.Exit == CodeBarrierIncomplete {
 		// Losing data is the more serious of the two facts, so it wins the
@@ -1974,6 +2041,7 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 	}
 	s.mu.Lock()
 	s.fenced = true
+	s.finishQuotaFlightLocked(syscall.EROFS)
 	s.mu.Unlock()
 
 	// 2 + 3. drain and run the remote durability barrier

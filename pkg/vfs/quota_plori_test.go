@@ -20,6 +20,8 @@
 package vfs
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -28,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -56,6 +59,46 @@ type heldQuotaWriteMeta struct {
 	release chan struct{}
 	once    sync.Once
 }
+
+// delayedQuotaAdmission models the supervisor's per-flight waiter. The first
+// commit remains in VFS while the test applies the new persisted ceiling.
+type delayedQuotaAdmission struct {
+	entered chan struct{}
+	release chan struct{}
+	m       meta.Meta
+	once    sync.Once
+}
+
+func (a *delayedQuotaAdmission) Admit(context.Context) syscall.Errno {
+	a.once.Do(func() { close(a.entered) })
+	<-a.release
+	if err := meta.PloriApplyGrant(a.m, 64<<20, 16384); err != nil {
+		return syscall.EIO
+	}
+	return 0
+}
+func (*delayedQuotaAdmission) Proactive() {}
+
+// purchasedQuotaAdmission models an authoritative refusal followed by the
+// account receiving capacity. A later operation must begin a fresh admission
+// instead of inheriting the previous operation's ENOSPC result.
+type purchasedQuotaAdmission struct {
+	m         meta.Meta
+	purchased atomic.Bool
+	calls     atomic.Int32
+}
+
+func (a *purchasedQuotaAdmission) Admit(context.Context) syscall.Errno {
+	a.calls.Add(1)
+	if !a.purchased.Load() {
+		return syscall.ENOSPC
+	}
+	if err := meta.PloriApplyGrant(a.m, 64<<20, 16384); err != nil {
+		return syscall.EIO
+	}
+	return 0
+}
+func (*purchasedQuotaAdmission) Proactive() {}
 
 func (m *heldQuotaWriteMeta) Write(ctx meta.Context, inode meta.Ino, indx uint32, off uint32, slice meta.Slice, mtime time.Time) syscall.Errno {
 	m.once.Do(func() { close(m.entered) })
@@ -125,6 +168,125 @@ func TestPloriGrantAppliesLiveThroughTheVFS(t *testing.T) {
 	defer v.Release(ctx, fe.Inode, fh)
 	if e := writeAndFlush(t, v, ctx, fe.Inode, fh, 0, make([]byte, 1<<20)); e != 0 {
 		t.Errorf("write after the grant = %s, want it to succeed", e)
+	}
+}
+
+// TestPloriQuotaAdmissionRetainsTheUploadedSliceUntilGrowth is the regression
+// for the disk-full symptom: the commit waits and retries its original slice,
+// instead of setting the file's permanent error and scheduling store.Remove.
+func TestPloriQuotaAdmissionRetainsTheUploadedSliceUntilGrowth(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+	if err := meta.PloriApplyGrant(v.Meta, quotaTestCeiling, 16384); err != nil {
+		t.Fatal(err)
+	}
+	// Create captures the metadata client in its fileWriter. Install admission
+	// before opening it so the delayed commit below uses the decorated client.
+	rawMeta := v.Meta
+	wrapped := meta.PloriWithQuotaAdmission(rawMeta)
+	a := &delayedQuotaAdmission{entered: make(chan struct{}), release: make(chan struct{}), m: rawMeta}
+	meta.PloriSetQuotaAdmission(wrapped, a)
+	v.Meta = wrapped
+	v.writer.(*dataWriter).m = wrapped
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(a.release) }) }
+	t.Cleanup(release)
+	fe, fh, st := v.Create(ctx, 1, "wait-for-growth", 0644, 0, syscall.O_RDWR)
+	if st != 0 {
+		t.Fatal(st)
+	}
+	defer v.Release(ctx, fe.Inode, fh)
+	// Leave one 1-MiB commit outside the 8-MiB ceiling. checkQuota refuses
+	// only growth beyond capacity, so exactly eight 1-MiB slices still fit.
+	buf := make([]byte, 1<<20)
+	for i := range 8 {
+		if st := writeAndFlush(t, v, ctx, fe.Inode, fh, uint64(i)*uint64(len(buf)), buf); st != 0 {
+			t.Fatal(st)
+		}
+	}
+	original := bytes.Repeat([]byte{0xa5}, len(buf))
+	done := make(chan syscall.Errno, 1)
+	go func() { done <- writeAndFlush(t, v, ctx, fe.Inode, fh, 8<<20, original) }()
+	select {
+	case <-a.entered:
+	case <-time.After(5 * time.Second):
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+		t.Fatal("commit did not wait for quota admission")
+	}
+	release()
+	select {
+	case st := <-done:
+		if st != 0 {
+			t.Fatalf("fsync after growth = %s", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("retry did not finish")
+	}
+	got := make([]byte, len(original))
+	if n, st := v.Read(ctx, fe.Inode, got, 8<<20, fh); st != 0 || n != len(got) || !bytes.Equal(got, original) {
+		t.Fatalf("retained uploaded slice read back n=%d err=%s equal=%t", n, st, bytes.Equal(got, original))
+	}
+	if st := writeAndFlush(t, v, ctx, fe.Inode, fh, 9<<20, []byte("still healthy")); st != 0 {
+		t.Fatalf("retained writer was poisoned after admission: %s", st)
+	}
+}
+
+// TestPloriQuotaAdmissionRecoversAfterAPurchase keeps the same mounted VFS
+// across a definitive ENOSPC and a later capacity purchase. The file that has
+// already returned ENOSPC remains failed; a fresh write opens a fresh flight.
+func TestPloriQuotaAdmissionRecoversAfterAPurchase(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+	if err := meta.PloriApplyGrant(v.Meta, quotaTestCeiling, 16384); err != nil {
+		t.Fatal(err)
+	}
+	rawMeta := v.Meta
+	wrapped := meta.PloriWithQuotaAdmission(rawMeta)
+	a := &purchasedQuotaAdmission{m: rawMeta}
+	meta.PloriSetQuotaAdmission(wrapped, a)
+	v.Meta = wrapped
+	v.writer.(*dataWriter).m = wrapped
+
+	failed, failedFH, st := v.Create(ctx, 1, "full-before-purchase", 0644, 0, syscall.O_RDWR)
+	if st != 0 {
+		t.Fatal(st)
+	}
+	defer v.Release(ctx, failed.Inode, failedFH)
+	buf := make([]byte, 1<<20)
+	for i := range 8 {
+		if st := writeAndFlush(t, v, ctx, failed.Inode, failedFH, uint64(i)*uint64(len(buf)), buf); st != 0 {
+			t.Fatal(st)
+		}
+	}
+	if st := writeAndFlush(t, v, ctx, failed.Inode, failedFH, 8<<20, buf); st != syscall.ENOSPC {
+		t.Fatalf("write before purchase = %s, want ENOSPC", st)
+	}
+	if got := a.calls.Load(); got != 1 {
+		t.Fatalf("denied admission calls = %d, want 1", got)
+	}
+
+	// This is the allocator's fresh budget observation after a purchase. The
+	// next refused operation is intentionally a new metadata transaction.
+	a.purchased.Store(true)
+	healthy, healthyFH, st := v.Create(ctx, 1, "after-purchase", 0644, 0, syscall.O_RDWR)
+	if st != 0 {
+		t.Fatalf("create after purchase = %s", st)
+	}
+	defer v.Release(ctx, healthy.Inode, healthyFH)
+	content := []byte("fresh admission after a purchase")
+	if st := writeAndFlush(t, v, ctx, healthy.Inode, healthyFH, 0, content); st != 0 {
+		t.Fatalf("fresh write after purchase = %s", st)
+	}
+	if got := a.calls.Load(); got != 2 {
+		t.Fatalf("admission calls after purchase = %d, want 2", got)
+	}
+	read := make([]byte, len(content))
+	if n, st := v.Read(ctx, healthy.Inode, read, 0, healthyFH); st != 0 || n != len(read) || !bytes.Equal(read, content) {
+		t.Fatalf("post-purchase content read back n=%d err=%s equal=%t", n, st, bytes.Equal(read, content))
 	}
 }
 

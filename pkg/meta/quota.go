@@ -289,11 +289,11 @@ func (m *baseMeta) syncVolumeStat(ctx Context, used, inodes int64) error {
 // function variable for the same reason writeBarrier is one: pkg/meta must not
 // grow a dependency on the mount supervisor, and the default build must behave
 // exactly as upstream does.
-var volumeQuotaHook func()
+var volumeQuotaHook func(Context)
 
-func volumeQuotaTripped() {
+func volumeQuotaTripped(ctx Context) {
 	if volumeQuotaHook != nil {
-		volumeQuotaHook()
+		volumeQuotaHook(ctx)
 	}
 }
 
@@ -310,11 +310,11 @@ func (m *baseMeta) checkQuota(ctx Context, space, inodes int64, uid, gid uint32,
 
 	format := m.getFormat()
 	if space > 0 && format.Capacity > 0 && atomic.LoadInt64(&m.usedSpace)+atomic.LoadInt64(&m.newSpace)+space > int64(format.Capacity) {
-		volumeQuotaTripped()
+		volumeQuotaTripped(ctx)
 		return syscall.ENOSPC
 	}
 	if inodes > 0 && format.Inodes > 0 && atomic.LoadInt64(&m.usedInodes)+atomic.LoadInt64(&m.newInodes)+inodes > int64(format.Inodes) {
-		volumeQuotaTripped()
+		volumeQuotaTripped(ctx)
 		return syscall.ENOSPC
 	}
 	if !format.DirStats {

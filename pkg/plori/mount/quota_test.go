@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -109,6 +110,17 @@ func countGrows(reqs []RenewRequest) int {
 		}
 	}
 	return n
+}
+
+type joinedAdmissionContext struct {
+	context.Context
+	joined chan struct{}
+	once   sync.Once
+}
+
+func (c *joinedAdmissionContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.joined) })
+	return c.Context.Done()
 }
 
 // TestTheSpecsGrantIsAppliedBeforeTheMountServes closes the window a resumed
@@ -228,12 +240,109 @@ func TestAQuotaTripAsksToGrowOncePerEpoch(t *testing.T) {
 	}
 	waitFor(t, 10*time.Second, func() bool { return len(cp.renewRequests()) >= before+8 }, "timed out waiting for three more renews")
 
-	if got := countGrows(cp.renewRequests()); got != 1 {
-		t.Errorf("%d grow requests across %d renews on one grant epoch, want 1",
-			got, len(cp.renewRequests()))
+	if got := countGrows(cp.renewRequests()); got < 2 {
+		t.Errorf("%d grow requests after transient unchanged answers, want retries", got)
 	}
-	if h := readHealth(t, sup); !h.QuotaExhausted {
-		t.Error("health.json must report quota_exhausted while the ceiling is refusing writes")
+	if h := readHealth(t, sup); h.QuotaExhausted {
+		t.Error("unchanged grant without over_budget must not report account exhaustion")
+	}
+}
+
+func TestQuotaFlightKeepsItsDenialWhenANewFlightStarts(t *testing.T) {
+	sup := newSup(t, testSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	sup.admissionRenew = make(chan struct{}, 1)
+	old := make(chan syscall.Errno, 1)
+	go func() { old <- sup.Admit(context.Background()) }()
+	<-sup.admissionRenew
+	sup.mu.Lock()
+	sup.finishQuotaFlightLocked(syscall.ENOSPC)
+	sup.mu.Unlock()
+	// A new blocked operation may immediately probe after a purchase; it must
+	// not overwrite the result held by the old flight's done channel.
+	newDone := make(chan syscall.Errno, 1)
+	go func() { newDone <- sup.Admit(context.Background()) }()
+	<-sup.admissionRenew
+	if got := <-old; got != syscall.ENOSPC {
+		t.Fatalf("old flight = %s", got)
+	}
+	sup.mu.Lock()
+	sup.finishQuotaFlightLocked(0)
+	sup.mu.Unlock()
+	if got := <-newDone; got != 0 {
+		t.Fatalf("new flight = %s", got)
+	}
+}
+
+func TestQuotaFlightConcurrentWaitersShareOneRenew(t *testing.T) {
+	sup := newSup(t, testSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	sup.admissionRenew = make(chan struct{}, 1)
+	results := make(chan syscall.Errno, 2)
+	// Admit evaluates Done only after it has released sup.mu and captured the
+	// shared flight. These notifications therefore prove both waiters joined
+	// before the test completes the flight.
+	newJoinedContext := func() *joinedAdmissionContext {
+		return &joinedAdmissionContext{Context: context.Background(), joined: make(chan struct{})}
+	}
+	first, second := newJoinedContext(), newJoinedContext()
+	go func() { results <- sup.Admit(first) }()
+	go func() { results <- sup.Admit(second) }()
+	<-sup.admissionRenew
+	<-first.joined
+	<-second.joined
+	select {
+	case <-sup.admissionRenew:
+		t.Fatal("two waiters queued two renews")
+	default:
+	}
+	sup.mu.Lock()
+	sup.finishQuotaFlightLocked(0)
+	sup.mu.Unlock()
+	if <-results != 0 || <-results != 0 {
+		t.Fatal("shared flight did not admit both waiters")
+	}
+}
+
+// TestProactiveQuotaGrowthUsesTheSameCoalescedRenew shows the 80%-usage hook
+// does not wait for an ENOSPC and does not create a separate control-plane
+// path. Several committed operations can signal it, but one grant generation
+// produces one renewal carrying Grow.
+func TestProactiveQuotaGrowthUsesTheSameCoalescedRenew(t *testing.T) {
+	vol := healthyVolume()
+	spec := testSpec()
+	// The immediate admission/proactive signal must bypass this normal lease
+	// cadence; a short test interval cannot prove that property.
+	spec.LeaseRenewInterval = Duration(20 * time.Second)
+	spec.Grant = GrantSpec{Bytes: 256 << 20, Inodes: 16384, Epoch: 2, AckedEpoch: 2}
+	cp := &fakeCP{grant: spec.Grant, onGrow: func(g GrantSpec) GrantSpec {
+		g.Bytes += 64 << 20
+		g.Epoch++
+		return g
+	}}
+	sup := newSup(t, spec, &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	t.Cleanup(func() { stop <- syscall.SIGTERM; <-done })
+	waitFor(t, 10*time.Second, func() bool {
+		sup.mu.Lock()
+		mounted := sup.mounted
+		sup.mu.Unlock()
+		return mounted
+	}, "timed out waiting for the mount to become ready")
+	started := time.Now()
+	for range 100 {
+		sup.Proactive()
+	}
+	waitFor(t, 10*time.Second, func() bool { return countGrows(cp.renewRequests()) > 0 }, "timed out waiting for proactive grow")
+	elapsed := time.Since(started)
+	t.Logf("proactive quota growth completed its renewal request in %s with a normal interval of %s", elapsed, spec.LeaseRenewInterval.D())
+	if elapsed >= time.Second {
+		t.Fatalf("proactive quota grow took %s; it must bypass the 20-second lease interval", elapsed)
+	}
+	before := countGrows(cp.renewRequests())
+	waitFor(t, 10*time.Second, func() bool { return len(vol.appliedGrants()) >= 2 }, "timed out applying proactive grant")
+	if got := countGrows(cp.renewRequests()); got != before {
+		t.Errorf("coalesced proactive signals produced %d grow renews, want %d", got, before)
 	}
 }
 
@@ -381,7 +490,7 @@ func TestAGrantThatIsNotLargerIsNotAWayOut(t *testing.T) {
 	spec.Grant = GrantSpec{Bytes: 64 << 20, Inodes: 16384, Epoch: 2, AckedEpoch: 2}
 	// An allocator with nothing to give: every grow is answered with the same
 	// ceiling under the next epoch.
-	cp := &fakeCP{grant: spec.Grant, onGrow: func(g GrantSpec) GrantSpec {
+	cp := &fakeCP{grant: spec.Grant, overBudget: true, onGrow: func(g GrantSpec) GrantSpec {
 		g.Epoch++
 		return g
 	}}
@@ -418,6 +527,7 @@ func TestAGrantThatIsNotLargerIsNotAWayOut(t *testing.T) {
 	// Buying disk is the way out, and it is the only thing that clears it.
 	cp.mu.Lock()
 	cp.onGrow = nil
+	cp.overBudget = false
 	// Next epoch after whatever the re-issuing allocator has reached by now —
 	// it moved the epoch on every grow, and reading it back under the same lock
 	// RenewLease takes is the only way to be sure this one is newer.
