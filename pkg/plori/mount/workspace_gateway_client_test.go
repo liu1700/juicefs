@@ -12,6 +12,9 @@ import (
 	"time"
 )
 
+// Gateway storage routes use the same JSON HTTP 200 contract as the control-plane
+// Issuer handlers. A 204 would not satisfy Client.post, even when a caller discards
+// the body, because 204 is not the published success status for these routes.
 func TestGatewayWriterUsesOnlyItsAuthenticatedRoute(t *testing.T) {
 	var got string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -19,7 +22,7 @@ func TestGatewayWriterUsesOnlyItsAuthenticatedRoute(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer test-token" {
 			t.Error("missing authentication")
 		}
-		w.WriteHeader(http.StatusNoContent)
+		w.WriteHeader(http.StatusOK)
 	}))
 	defer server.Close()
 	token := filepath.Join(t.TempDir(), "token")
