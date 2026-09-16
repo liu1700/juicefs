@@ -47,6 +47,15 @@ func workspaceControlClient(socket string) *http.Client {
 	}}
 }
 
+func workspaceControlRootSocket(t *testing.T) string {
+	t.Helper()
+	state := t.TempDir()
+	if err := os.Chmod(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(state, "workspace-control.sock")
+}
+
 func TestWorkspaceControlRootRefusesSymlinkStateDir(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root-owned temporary state directory; run the compiled test binary with sudo -n")
@@ -92,7 +101,7 @@ func TestWorkspaceControlRootPeerStrictBarrierWire(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root peer credentials; run the compiled test binary with sudo -n")
 	}
-	socket := filepath.Join(t.TempDir(), "workspace-control.sock")
+	socket := workspaceControlRootSocket(t)
 	identity := workspaceControlIdentity()
 	server, err := newWorkspaceControlServer(context.Background(), socket, identity, func() bool { return true })
 	if err != nil {
@@ -149,7 +158,7 @@ func TestWorkspaceControlRootCloseCancelsPendingRequest(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root peer credentials; run the compiled test binary with sudo -n")
 	}
-	socket := filepath.Join(t.TempDir(), "workspace-control.sock")
+	socket := workspaceControlRootSocket(t)
 	identity := workspaceControlIdentity()
 	server, err := newWorkspaceControlServer(context.Background(), socket, identity, func() bool { return true })
 	if err != nil {
@@ -197,7 +206,7 @@ func TestWorkspaceControlRootSlowWorkKeepsReplyWritable(t *testing.T) {
 	if os.Getuid() != 0 {
 		t.Skip("requires root peer credentials; run the compiled test binary with sudo -n")
 	}
-	socket := filepath.Join(t.TempDir(), "workspace-control.sock")
+	socket := workspaceControlRootSocket(t)
 	identity := workspaceControlIdentity()
 	server, err := newWorkspaceControlServer(context.Background(), socket, identity, func() bool { return true })
 	if err != nil {
