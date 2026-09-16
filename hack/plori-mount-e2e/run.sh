@@ -88,8 +88,8 @@ spec = {
   "storage_volume_id": "$VOLUME_ID",
   "format_uuid": format_uuid,
   "generation": 1,
-  # An unformatted volume is `allocating`, and that lease IS the formatting
-  # lease (PLO-373); once the control-plane has a Format.UUID it is `active`.
+  # An unformatted volume is allocating, and that lease is the formatting
+  # lease (PLO-373); once the control-plane has a Format.UUID it is active.
   "volume_state": "allocating" if not format_uuid else "active",
   "fence_epoch": epoch,
   "lease_expires_at": expires.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),

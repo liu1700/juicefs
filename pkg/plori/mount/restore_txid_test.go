@@ -666,11 +666,9 @@ func TestRestoreForwardAfterRealL0RetentionKeepsDurableRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("litestream version: %v: %s", err, version)
 	}
-	// The production pin is a fork build of v0.5.17 (`v0.5.17-plori.3` in
-	// deploy/docker/storage-worker.Dockerfile), so the gate is the base
-	// version, not an exact string.
-	if got := strings.TrimSpace(string(version)); !strings.HasPrefix(got, "v0.5.17") {
-		t.Fatalf("litestream version = %q, want the pinned v0.5.17 line", got)
+	// Real fixtures may use upstream v0.5.17 or the exact runtime fork.
+	if got := strings.TrimSpace(string(version)); got != "v0.5.17" && got != "0.5.17" && got != "v0.5.17-plori.3" {
+		t.Fatalf("litestream version = %q, want v0.5.17, 0.5.17, or runtime v0.5.17-plori.3", got)
 	}
 	sqlite, err := exec.LookPath("sqlite3")
 	if err != nil {
