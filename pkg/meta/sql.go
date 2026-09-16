@@ -1318,6 +1318,25 @@ func (m *dbMeta) txn(f func(s *xorm.Session) error, inodes ...Ino) error {
 	return lastErr
 }
 
+// cloneTxn reuses txn's engine-specific locking and retry behavior while
+// checking clone authority inside every transaction attempt. A refusal from
+// either check reaches xorm before Commit and rolls that attempt back.
+func (m *dbMeta) cloneTxn(ctx Context, f func(s *xorm.Session) error, inodes ...Ino) error {
+	return m.txn(func(s *xorm.Session) error {
+		s.Context(ctx)
+		if st := m.cloneAllowed(ctx); st != 0 {
+			return st
+		}
+		if err := f(s); err != nil {
+			return err
+		}
+		if st := m.cloneAllowed(ctx); st != 0 {
+			return st
+		}
+		return nil
+	}, inodes...)
+}
+
 func (m *dbMeta) roTxn(ctx context.Context, f func(s *xorm.Session) error) error {
 	start := time.Now()
 	defer func() { m.txDist.Observe(time.Since(start).Seconds()) }()
@@ -5430,7 +5449,7 @@ func (m *dbMeta) validateCloneTarget(ctx Context, s xorm.Interface, ino Ino) (no
 }
 
 func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, attr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
-	return errno(m.txn(func(s *xorm.Session) error {
+	return errno(m.cloneTxn(ctx, func(s *xorm.Session) error {
 		n := node{Inode: srcIno}
 		ok, err := s.ForUpdate().Get(&n)
 		if err != nil {
@@ -5587,7 +5606,7 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		}
 	}
 
-	err := m.txn(func(s *xorm.Session) error {
+	err := m.cloneTxn(ctx, func(s *xorm.Session) error {
 		nowNano := time.Now().UnixNano()
 		*result = batchCloneResult{deltas: make(ugQuotaDeltas)}
 
@@ -5807,7 +5826,7 @@ func (m *dbMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 }
 
 func (m *dbMeta) doAttachDirNode(ctx Context, parent Ino, inode Ino, name string) syscall.Errno {
-	return errno(m.txn(func(s *xorm.Session) error {
+	return errno(m.cloneTxn(ctx, func(s *xorm.Session) error {
 		// must lock parent node first to avoid deadlock
 		var n = node{Inode: parent}
 		ok, err := s.ForUpdate().Get(&n)

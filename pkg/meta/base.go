@@ -1915,6 +1915,9 @@ func (m *baseMeta) BatchUnlink(ctx Context, parent Ino, entries []*Entry, count 
 }
 
 func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, count *uint64) syscall.Errno {
+	if st := m.cloneAllowed(ctx); st != 0 {
+		return st
+	}
 	if len(entries) == 0 {
 		return 0
 	}
@@ -1928,6 +1931,9 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		}
 		if count != nil {
 			atomic.AddUint64(count, uint64(r.inodes))
+		}
+		if st = m.cloneAllowed(ctx); st != 0 {
+			return st
 		}
 	}
 	return st
@@ -3407,8 +3413,8 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 		return syscall.EPERM
 	}
 
-	if m.readOnly() {
-		return syscall.EROFS
+	if st := m.cloneAllowed(ctx); st != 0 {
+		return st
 	}
 	if name == "" {
 		return syscall.ENOENT
@@ -3451,24 +3457,57 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 	if attr.Typ == TypeDirectory {
 		eno = m.cloneEntry(ctx, srcIno, parent, name, &dstIno, cmode, cumask, count, true, concurrent)
 		if eno == 0 {
-			eno = m.en.doAttachDirNode(ctx, parent, dstIno, name)
+			if eno = m.cloneAllowed(ctx); eno == 0 {
+				eno = m.en.doAttachDirNode(ctx, parent, dstIno, name)
+			}
 		}
-		if eno != 0 && dstIno != 0 {
+		if eno != 0 && dstIno != 0 && m.cloneAllowed(ctx) == 0 {
 			if eno := m.en.doCleanupDetachedNode(ctx, dstIno); eno != 0 {
 				logger.Errorf("remove detached tree (%d): %s", dstIno, eno)
 			}
 		}
 	} else {
-		eno = m.cloneEntry(ctx, srcIno, parent, name, nil, cmode, cumask, count, true, concurrent)
+		eno = m.cloneEntry(ctx, srcIno, parent, name, &dstIno, cmode, cumask, count, true, concurrent)
 	}
-	if eno == 0 {
-		m.updateDirStat(ctx, parent, int64(attr.Length), align4K(attr.Length), 1)
-		m.updateDirQuota(ctx, parent, int64(sum.Size), int64(sum.Dirs)+int64(sum.Files))
+	published := eno == 0
+	accountingCtx := ctx
+	if ctx.Canceled() {
+		accountingCtx = WrapWithoutCancel(context.WithoutCancel(ctx), ctx.Pid(), ctx.Uid(), ctx.Gids())
+	}
+	if !published && dstIno != 0 && m.cloneAllowed(ctx) != 0 {
+		var publishedIno Ino
+		var publishedAttr Attr
+		published = m.en.doLookup(accountingCtx, parent, name, &publishedIno, &publishedAttr) == 0 && publishedIno == dstIno
+	}
+	if published {
+		m.updateDirStat(accountingCtx, parent, int64(attr.Length), align4K(attr.Length), 1)
+		m.updateDirQuota(accountingCtx, parent, int64(sum.Size), int64(sum.Dirs)+int64(sum.Files))
+		if eno == 0 {
+			if eno = m.cloneAllowed(ctx); eno != 0 {
+				return eno
+			}
+		}
 	}
 	return eno
 }
 
+// cloneAllowed rejects clone work once its request is canceled or this client
+// has lost dynamic write authority. Callers use it before each new clone step
+// and before publishing a directory clone.
+func (m *baseMeta) cloneAllowed(ctx Context) syscall.Errno {
+	if ctx.Canceled() {
+		return errno(ctx.Err())
+	}
+	if m.readOnly() {
+		return syscall.EROFS
+	}
+	return 0
+}
+
 func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, dstIno *Ino, cmode uint8, cumask uint16, count *uint64, top bool, concurrent chan struct{}) syscall.Errno {
+	if st := m.cloneAllowed(ctx); st != 0 {
+		return st
+	}
 	ino, err := m.nextInode()
 	if err != nil {
 		return errno(err)
@@ -3484,6 +3523,9 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	m.en.updateStats(align4K(attr.Length), 1)
 	atomic.AddUint64(count, 1)
 	m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, align4K(attr.Length), 1)
+	if eno = m.cloneAllowed(ctx); eno != 0 {
+		return eno
+	}
 	if attr.Typ != TypeDirectory {
 		return 0
 	}
