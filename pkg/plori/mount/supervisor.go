@@ -84,6 +84,15 @@ type Supervisor struct {
 	// bound (PLO-383).
 	drain *DrainModel
 
+	// barrierMu serialises the two callers of vol.Barrier: the periodic barrier,
+	// which since PLO-913 runs off the run loop, and the ordered stop's own. The
+	// stop must never start a second barrier on top of one already flushing, and
+	// with the periodic barrier no longer holding the loop goroutine that is no
+	// longer guaranteed by construction. Waiting here costs the stop nothing it
+	// did not already pay: before PLO-913 the stop could not even be noticed
+	// until the periodic barrier returned.
+	barrierMu sync.Mutex
+
 	mu              sync.Mutex
 	lastBarrier     BarrierResult
 	lastTxID        string
@@ -1193,6 +1202,12 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 	credential := time.NewTicker(s.Deps.Credentials.Interval())
 	defer credential.Stop()
 
+	// One periodic barrier may be in flight at a time, and it runs off this
+	// goroutine (PLO-913). Its completion comes back through this channel, so
+	// the barrier ticker knows when it may start another.
+	barrierDone := make(chan struct{}, 1)
+	barrierRunning := false
+
 	ticks := 0
 	retrying := false
 	renewedAt := s.now()
@@ -1278,10 +1293,15 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 		case <-health.C:
 			// The replication check runs on the health tick and not on its
 			// own, because health.json is where its verdict is published and
-			// because this select is the supervisor's only goroutine: a
-			// check here cannot overlap a barrier, a credential reload or a
-			// stop, which is what makes the repair safe to attempt from it
-			// (PLO-411).
+			// because this select is where every one of the supervisor's
+			// periodic decisions is made: a check here cannot overlap a
+			// credential reload or a stop, which is what makes the repair safe
+			// to attempt from it (PLO-411). Since PLO-913 it CAN overlap a
+			// periodic barrier, which is the point of that change — the barrier
+			// is a flush against the chunk store and the repair is a restart of
+			// the metadata replicator beside it, so the two touch nothing in
+			// common. The stop is still exclusive with the barrier, through
+			// barrierMu.
 			if f := s.checkReplication(ctx); f != nil {
 				return f
 			}
@@ -1303,7 +1323,33 @@ func (s *Supervisor) loop(ctx context.Context, stopped <-chan struct{}, serveErr
 			}
 
 		case <-barrier.C:
-			s.runBarrier(ctx)
+			// Not on this goroutine (PLO-913). A barrier's flush is not
+			// interruptible — ploriVolume.Barrier calls the VFS FlushAll, which
+			// takes no context — so a barrier draining a saturated writeback
+			// backlog ran here for as long as the flush took, and for that whole
+			// time this select could not renew the lease, could not run the
+			// one-second deadline guard and could not rewrite health.json. Under
+			// a sustained write in production that stopped the heartbeat for
+			// 62-67 s against a 60 s staleness bound, so the executor fenced
+			// three consecutive healthy mounts, and it stopped the renewal the
+			// mount needs to keep the authority it was flushing under.
+			//
+			// One at a time: a tick that finds a barrier still running skips,
+			// and the next tick five seconds later starts the next one. That is
+			// what the period already meant — the backlog a barrier did not
+			// reach is drained by the following one.
+			if barrierRunning {
+				s.log("barrier_skipped", "reason", "a barrier is still running", "pending_blocks", s.vol.PendingBlocks())
+				continue
+			}
+			barrierRunning = true
+			go func() {
+				defer func() { barrierDone <- struct{}{} }()
+				s.runBarrier(ctx)
+			}()
+
+		case <-barrierDone:
+			barrierRunning = false
 		}
 	}
 }
@@ -1582,7 +1628,9 @@ func (s *Supervisor) runBarrier(ctx context.Context) {
 	// workload, right now. Sampling anything else would be a model; this is an
 	// observation (PLO-383).
 	pendingBefore, startedAt := s.vol.PendingBlocks(), s.now()
+	s.barrierMu.Lock()
 	res, err := s.vol.Barrier(bctx)
+	s.barrierMu.Unlock()
 	if err != nil {
 		s.log("barrier_failed", "error", err.Error())
 		return
@@ -2066,7 +2114,12 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 		pendingBefore = s.vol.PendingBlocks()
 		startedAt := s.now()
 		var err error
+		// After the fence above, and behind any periodic barrier still flushing
+		// (PLO-913): new writes have already stopped, so waiting here only lets
+		// the earlier flush finish the work this one would otherwise repeat.
+		s.barrierMu.Lock()
 		res, err = s.vol.Barrier(ctx)
+		s.barrierMu.Unlock()
 		if err != nil {
 			incomplete = fmt.Errorf("durability barrier: %w", err)
 			s.log("shutdown_barrier_failed", "error", err.Error(),
