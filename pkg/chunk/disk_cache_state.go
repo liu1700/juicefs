@@ -38,7 +38,6 @@ var (
 	probeDur  = 500 * time.Millisecond
 	probeDir  = "probe"
 	probeData = []byte{1, 2, 3}
-	probeBuff = make([]byte, 3)
 )
 
 var (
@@ -258,7 +257,8 @@ func (dc *unstableDC) doProbe(key string, page *Page) {
 		return
 	}
 	defer reader.Close()
-	_, _ = reader.ReadAt(probeBuff, 0)
+	probeBuffer := make([]byte, len(probeData))
+	_, _ = reader.ReadAt(probeBuffer, 0)
 	dc.cache.remove(key, false)
 }
 
