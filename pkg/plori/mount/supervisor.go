@@ -118,9 +118,17 @@ type Supervisor struct {
 	grantBytes  int64
 	grantInodes int64
 	// ceilingRefused is true from the moment the volume ceiling refuses an
-	// operation until a LARGER ceiling is applied. It is one half of
-	// health.json's quota_exhausted.
+	// operation until a LARGER ceiling is applied, or until a usage reading
+	// shows the volume back under its ceiling with less in it than the refusal
+	// saw. It is one half of health.json's quota_exhausted.
 	ceilingRefused bool
+	// refusedUsage is the usage reading held when the CURRENT refusal episode
+	// began. It is the only thing the worker can compare a later reading
+	// against to tell "the user deleted something and the space came back" from
+	// "the volume has been this full all along": the ceiling itself does not
+	// move when files are removed, and a delete into the trash frees nothing at
+	// all. Meaningful only while ceilingRefused is true.
+	refusedUsage Usage
 	// growDenied is set only by an authoritative account-capacity refusal.
 	growDenied bool
 	// growAsked holds off another allocation while an issued grant still needs
@@ -1762,8 +1770,20 @@ func (s *Supervisor) reportDurablePoint(ctx context.Context, res BarrierResult, 
 // the same grant and tries again. That is the correct retry: the ceiling the
 // control-plane issued is not enforced until this succeeds, and pretending
 // otherwise would let the allocator hand the difference to a sibling.
+//
+// A failed apply also has to give growAsked back. The latch means "an issued
+// grant is still on its way into local state, so do not ask for another one",
+// and an apply that failed ends that state: nothing is on its way any more.
+// Leaving it set was PLO-873's first half. renewRequest only attaches Grow when
+// growAsked is clear, and renew only clears it when the answered grant IS
+// applied (the `unapplied` branch below), so one failed apply silenced the Grow
+// flag for the rest of the process — and with it the OverBudget answer that
+// growRefused needs to end a waiting writer's flight.
 func (s *Supervisor) applyGrant(ctx context.Context, g GrantSpec) {
 	if err := s.vol.ApplyGrant(ctx, g.Bytes, g.Inodes); err != nil {
+		s.mu.Lock()
+		s.growAsked = false
+		s.mu.Unlock()
 		s.log("grant_apply_failed", "epoch", g.Epoch, "error", err.Error())
 		return
 	}
@@ -1796,8 +1816,52 @@ func (s *Supervisor) noteQuotaTrips() {
 	defer s.mu.Unlock()
 	if n > s.quotaTrips {
 		s.quotaTrips = n
-		s.ceilingRefused = true
+		s.noteCeilingRefusedLocked()
 	}
+}
+
+// noteCeilingRefusedLocked opens a refusal episode, or leaves the open one
+// alone. The usage reading is captured on the EDGE rather than on every
+// refusal, because it is the reference point noteUsageLocked measures a later
+// reading against: re-sampling it while the episode runs would move the
+// reference down behind the deletes it exists to notice.
+func (s *Supervisor) noteCeilingRefusedLocked() {
+	if s.ceilingRefused {
+		return
+	}
+	s.ceilingRefused = true
+	s.refusedUsage = s.lastUsage
+}
+
+// noteUsageLocked ends a refusal episode that a usage reading has outlived.
+//
+// The worker cannot watch deletes — the metadata engine charges and refunds its
+// counters without telling anyone, and the only thing this process reads is the
+// periodic total. So the test is on that total, and it is two-sided: less in the
+// volume than the refusal saw (space genuinely came back, which a delete into
+// the trash does NOT do), and under the ceiling in force (the volume is no
+// longer against it). Either half alone is not enough — a volume that shrank
+// from 40 GiB over a 20 GiB ceiling to 30 GiB is still full, and a volume that
+// has always been half empty was never in this episode.
+//
+// It clears both halves of quota_exhausted, because both are claims about a
+// state that has ended, and it admits whoever is waiting: their retry of the
+// refused metadata operation is the cheapest available test of whether the room
+// is real, and the engine's own answer decides it.
+func (s *Supervisor) noteUsageLocked() {
+	if !s.ceilingRefused || s.grantBytes <= 0 || s.grantInodes <= 0 {
+		return
+	}
+	u := s.lastUsage
+	if u.Bytes >= s.refusedUsage.Bytes && u.Inodes >= s.refusedUsage.Inodes {
+		return
+	}
+	if u.Bytes >= s.grantBytes || u.Inodes >= s.grantInodes {
+		return
+	}
+	s.ceilingRefused = false
+	s.growDenied = false
+	s.finishQuotaFlightLocked(0)
 }
 
 // markMounted records that this worker has published a serving filesystem. It
@@ -1895,21 +1959,64 @@ func (s *Supervisor) growRefused() {
 	s.log("grant_over_budget", "epoch", epoch, "admission_wait_ms", waitMS)
 }
 
+// admissionBound is how long Admit may hold a write. See AdmissionRenewRounds
+// for why it is counted in renew intervals. MountSpec.Validate refuses a
+// non-positive interval, so this is always a positive duration.
+func (s *Supervisor) admissionBound() time.Duration {
+	return AdmissionRenewRounds * s.Spec.LeaseRenewInterval.D()
+}
+
 // Admit runs after the refused metadata transaction has returned. Cancellation
 // releases only this waiter; the shared allocation remains useful to others.
+//
+// It ALWAYS answers. The write that reaches here has been refused by the volume
+// ceiling and is holding a FUSE request open, so the one outcome that is not
+// allowed is silence: before PLO-873 this waited on ctx.Done() and the flight,
+// and the data commit path calls it with meta.Background(), which is never
+// cancelled. A grant conversation that stalled — an apply that could not be
+// persisted, a poke that was dropped, a control-plane that answers renewals but
+// never the request — left the writer blocked for the life of the mount, and
+// the Agent's job with it. Two things bound it:
+//
+//   - a timer of admissionBound(). Past it the answer is the ceiling's own
+//     errno, which is what the filesystem would have returned all along.
+//   - growDenied, checked before waiting at all. The allocator's last word on
+//     this episode was "no more room", and nothing the worker can observe has
+//     changed since: no larger ceiling has been applied (applyGrant clears the
+//     flag when one is) and no usage reading has shown space coming back
+//     (noteUsageLocked clears it when one does). This writer would spend the
+//     whole bound to be told what the last one was already told. It is told now.
+//
+// The prompt refusal still opens the request before returning. The way out of a
+// full account is the user buying disk, and only a renew carrying Grow will
+// notice that they did (TestAGrowTheAccountCannotFundIsAskedAgain), so refusing
+// must not also stop asking.
 func (s *Supervisor) Admit(ctx context.Context) syscall.Errno {
 	if ctx.Err() != nil {
 		return syscall.EINTR
 	}
 	s.mu.Lock()
-	s.ceilingRefused = true
+	s.noteCeilingRefusedLocked()
+	// Not when the mount is fenced: startQuotaFlightLocked hands back a flight
+	// that already carries EROFS, and a fenced writer's errno is that, not a
+	// full disk.
+	denied := s.growDenied && !s.fenced
 	f := s.startQuotaFlightLocked()
 	s.mu.Unlock()
+	if denied {
+		return syscall.ENOSPC
+	}
+	bound := s.admissionBound()
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
 		return syscall.EINTR
 	case <-f.done:
 		return f.result
+	case <-timer.C:
+		s.log("admission_bound_reached", "waited", bound.String())
+		return syscall.ENOSPC
 	}
 }
 
@@ -1924,6 +2031,7 @@ func (s *Supervisor) usageTotals(ctx context.Context) (Usage, bool) {
 	}
 	s.mu.Lock()
 	s.lastUsage = u
+	s.noteUsageLocked()
 	s.mu.Unlock()
 	return u, true
 }
@@ -1955,6 +2063,7 @@ func (s *Supervisor) finishUsageObservation(ctx context.Context, observed usageO
 	}
 	s.mu.Lock()
 	s.lastUsage = observed.usage
+	s.noteUsageLocked()
 	s.mu.Unlock()
 	s.postUsage(ctx, observed.usage)
 }
