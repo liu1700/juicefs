@@ -127,6 +127,16 @@ type RepairReport struct {
 	Elapsed time.Duration `json:"elapsed"`
 }
 
+// The wire values of `usage_basis` in health.json and the usage report.
+const (
+	// UsageBasisLogical4K is the upstream rule: align4K(length) per file and 4 KiB
+	// per directory, symlink and empty file (meta.QuotaBasisLogical).
+	UsageBasisLogical4K = "logical_4k"
+	// UsageBasisSliceData is the stored slice data, shared slices counted once
+	// (meta.QuotaBasisSliceData).
+	UsageBasisSliceData = "slice_data"
+)
+
 // Usage is the volume's consumption as the metadata engine sees it.
 //
 // TrashBytes/TrashInodes are the part of Bytes/Inodes that a deleted file is still
@@ -140,8 +150,16 @@ type RepairReport struct {
 // no trash number at all, and the product then says nothing about the trash rather than
 // guessing at it.
 type Usage struct {
+	// Bytes is the figure the volume ceiling is enforced against, counted on Basis.
 	Bytes  int64
 	Inodes int64
+	// Basis names how Bytes and TrashBytes are counted: UsageBasisLogical4K or
+	// UsageBasisSliceData. It is empty when the volume does not name a basis; Bytes is
+	// then the logical figure, and Basis and LogicalBytes are not published.
+	Basis string
+	// LogicalBytes is the 4 KiB-aligned length total (the engine's usedSpace counter),
+	// reported for display next to Bytes. Meaningful only when Basis is set.
+	LogicalBytes int64
 	// TrashKnown is false when the trash walk failed. The two numbers below are then
 	// meaningless and are not reported.
 	TrashKnown  bool

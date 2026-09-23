@@ -2740,6 +2740,7 @@ func (s *Supervisor) writeHealth() {
 		PendingBlocks:        s.vol.PendingBlocks(),
 		LastBarrierAt:        s.lastBarrier.BarrierAt,
 		UsedBytes:            s.lastUsage.Bytes,
+		UsageBasis:           s.lastUsage.Basis,
 		UsedInodes:           s.lastUsage.Inodes,
 		GrantEpochApplied:    s.grantApplied,
 		// The whole predicate, in one place and evaluated from the state the
@@ -2755,6 +2756,10 @@ func (s *Supervisor) writeHealth() {
 		RestoreMS:         s.restoreMS,
 		MountMS:           s.mountMS,
 		ReadyMS:           s.readyMS,
+	}
+	if s.lastUsage.Basis != "" {
+		logical := s.lastUsage.LogicalBytes
+		h.LogicalBytes = &logical
 	}
 	h.ReplicationCheckedAt = s.replCheckedAt.UTC()
 	if counter, ok := s.Deps.Replicator.(ReplicatorRestartCounter); ok {

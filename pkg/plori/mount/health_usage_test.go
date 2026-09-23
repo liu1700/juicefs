@@ -21,6 +21,7 @@ package mount
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"syscall"
@@ -268,6 +269,67 @@ func TestAnUnreadableUsageKeepsTheLastFigureRatherThanPublishingZero(t *testing.
 	for _, u := range cp.reportedUsages() {
 		if u.Bytes == 0 {
 			t.Error("a failed reading was reported to the control-plane as an empty volume")
+		}
+	}
+}
+
+// healthFields reads health.json as raw fields, so a test can tell an absent field
+// from a zero one.
+func healthFields(t *testing.T, sup *Supervisor) map[string]json.RawMessage {
+	t.Helper()
+	data, err := os.ReadFile(sup.Paths.HealthPath())
+	if err != nil {
+		t.Fatalf("read health.json: %s", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("decode health.json: %s", err)
+	}
+	return fields
+}
+
+// A slice_data volume publishes its basis and the logical figure next to
+// used_bytes, and used_bytes is the basis figure: the number the ceiling is
+// enforced against, not the logical one.
+func TestHealthJSONAndTheUsageReportCarryTheUsageBasis(t *testing.T) {
+	vol := healthyVolume()
+	want := Usage{Bytes: 3 << 20, Inodes: 41, Basis: UsageBasisSliceData, LogicalBytes: 300 << 20}
+	vol.setUsage(want, nil)
+	cp := &fakeCP{}
+	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
+	runningSup(t, sup)
+
+	waitFor(t, 20*time.Second, func() bool {
+		h, ok := healthWhenWritten(sup)
+		return ok && h.UsageBasis == UsageBasisSliceData
+	}, "health.json never carried the usage basis")
+	h, _ := healthWhenWritten(sup)
+	if h.UsedBytes != want.Bytes || h.LogicalBytes == nil || *h.LogicalBytes != want.LogicalBytes {
+		t.Errorf("health.json used_bytes=%d logical_bytes=%v, want %d / %d", h.UsedBytes, h.LogicalBytes, want.Bytes, want.LogicalBytes)
+	}
+	waitFor(t, 20*time.Second, func() bool { return len(cp.reportedUsages()) > 0 },
+		"the worker never reported usage")
+	if got := cp.reportedUsages()[0]; got.Basis != want.Basis || got.LogicalBytes != want.LogicalBytes || got.Bytes != want.Bytes {
+		t.Errorf("usage report = %+v, want the basis fields of %+v", got, want)
+	}
+}
+
+// A volume that names no basis publishes neither field, and used_bytes is then the
+// logical figure as before.
+func TestHealthJSONOmitsTheBasisAVolumeDoesNotName(t *testing.T) {
+	vol := healthyVolume()
+	vol.setUsage(Usage{Bytes: 4 << 20, Inodes: 7}, nil)
+	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	runningSup(t, sup)
+
+	waitFor(t, 10*time.Second, func() bool {
+		h, ok := healthWhenWritten(sup)
+		return ok && h.UsedBytes == 4<<20
+	}, "health.json never carried the volume's usage")
+	fields := healthFields(t, sup)
+	for _, field := range []string{"usage_basis", "logical_bytes"} {
+		if _, ok := fields[field]; ok {
+			t.Errorf("health.json carries %s for a volume that names no basis", field)
 		}
 	}
 }

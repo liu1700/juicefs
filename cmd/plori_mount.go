@@ -816,7 +816,17 @@ func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, 
 	if st := p.m.StatFS(metaCtx, meta.RootInode, &total, &avail, &iused, &iavail); st != 0 {
 		return pmount.Usage{}, st
 	}
+	// StatFS reports used space on the quota basis in force (meta.PloriQuotaBasis),
+	// so Bytes is the figure the ceiling is enforced against. On the logical basis
+	// it is also the logical figure; on slice_data the logical figure comes from
+	// the engine's logical counters, for display only.
 	u := pmount.Usage{Bytes: int64(total - avail), Inodes: int64(iused)}
+	sliceData := meta.PloriQuotaBasis(p.m) == meta.QuotaBasisSliceData
+	if sliceData {
+		u.Basis, u.LogicalBytes = pmount.UsageBasisSliceData, meta.PloriLogicalBytes(p.m)
+	} else {
+		u.Basis, u.LogicalBytes = pmount.UsageBasisLogical4K, u.Bytes
+	}
 	// Not once the stop has begun. The ordered stop detaches the mount and
 	// closes the metadata session (shutdown step 4), and a trash walk after
 	// that is a real Readdir against a session that is gone. It returns EIO,
@@ -846,7 +856,12 @@ func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, 
 	if !withTrash {
 		return u, nil
 	}
-	t, err := meta.PloriMeasureTrash(p.m, metaCtx, 0)
+	// The breakdown is counted on the same basis as Bytes, so it stays a subset.
+	measure := meta.PloriMeasureTrash
+	if sliceData {
+		measure = meta.PloriMeasureTrashSliceData
+	}
+	t, err := measure(p.m, metaCtx, 0)
 	if err != nil {
 		logger.Warnf("plori: measuring the trash of %s failed, reporting usage without the breakdown: %s", p.identity.Name, err)
 		return u, nil
