@@ -78,9 +78,8 @@ type Health struct {
 	// QuotaExhausted is true while the volume is against its ceiling AND no
 	// grow is possible: the ceiling has refused an operation, and the grow the
 	// worker asked for came back with no more room — the account at its budget
-	// (over_budget), the allocator reissuing the ceiling the volume already
-	// had, or a renew that answered with neither. It clears when a LARGER
-	// ceiling is applied.
+	// (over_budget), or the allocator reissuing the ceiling the volume already
+	// had.
 	//
 	// Both halves, because either alone is ordinary: a volume that trips once
 	// and is grown a second later is not stuck, and an account at its budget
@@ -89,6 +88,26 @@ type Health struct {
 	// idle and one that is stuck against a ceiling the account cannot raise —
 	// which, with a grant conversation that is otherwise invisible, is
 	// otherwise indistinguishable from a healthy mount.
+	//
+	// It goes false again on either of the two things that make a write
+	// possible again, and on nothing else:
+	//
+	//   - a LARGER ceiling is applied (Supervisor.applyGrant). Not a new grant
+	//     epoch: an allocator with nothing to give re-issues the same numbers
+	//     under a fresh epoch, and reading that as relief is what left the flag
+	//     flickering off on a volume that was still full.
+	//   - a usage reading shows LESS in the volume than the reading held when
+	//     the refusal began, AND under the ceiling in force
+	//     (Supervisor.noteUsageLocked). That is a delete whose space actually
+	//     came back; a delete into the trash frees nothing and moves neither
+	//     number, so it correctly leaves the flag set. The reading is the
+	//     periodic one behind used_bytes/used_inodes in this same document, so
+	//     the flag clears within one health interval of the space returning,
+	//     not at the instant of the unlink.
+	//
+	// It is read outside this process: plori-runtime's executor ends a turn
+	// with a disk-full message on it, so a flag that stayed true after the
+	// volume was emptied would end healthy turns.
 	QuotaExhausted bool `json:"quota_exhausted"`
 	Fenced         bool `json:"fenced"`
 	// CredentialRefreshFailed is true while the worker is running on the last

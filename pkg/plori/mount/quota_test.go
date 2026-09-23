@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -588,4 +589,308 @@ func TestQuotaAdmissionUsesFUSECancellationContract(t *testing.T) {
 			sup.mu.Unlock()
 		})
 	}
+}
+
+// ---------------------------------------------------- the admission bound ---
+//
+// PLO-873. A write refused by the volume ceiling holds a FUSE request open
+// while Admit decides what to tell it, and the data commit path passes
+// meta.Background() (pkg/vfs/writer.go), which is never cancelled. So the wait
+// has to end on its own. On staging it did not: health.json reported
+// quota_exhausted while writers stayed blocked for the life of the mount and
+// the Agent's job never finished.
+
+// admitWithin runs Admit on its own goroutine and returns its errno, failing
+// the test rather than hanging when the wait never ends. On the parent commit
+// every one of these waits is unbounded, so the guard is what turns "the mount
+// is wedged" into a test failure with a message.
+func admitWithin(t *testing.T, sup *Supervisor, limit time.Duration, what string) syscall.Errno {
+	t.Helper()
+	got := make(chan syscall.Errno, 1)
+	go func() { got <- sup.Admit(context.Background()) }()
+	select {
+	case st := <-got:
+		return st
+	case <-time.After(limit):
+		t.Fatalf("%s: the write was still parked after %s with nothing left to answer it", what, limit)
+		return 0
+	}
+}
+
+// TestAParkedWriteIsAnsweredWhenNoRenewEverDoes is the invariant the rest of
+// this section rests on: Admit always answers.
+//
+// Nothing here renews, applies a grant or refuses one — the supervisor is not
+// running, which is the shape of every stall the state machine can reach (an
+// apply that will not persist, a dropped admission poke, a control-plane that
+// answers renewals and never the request). The ceiling's own errno is the right
+// answer at that point, because it is what the filesystem would have returned
+// if nobody had tried to grow it.
+func TestAParkedWriteIsAnsweredWhenNoRenewEverDoes(t *testing.T) {
+	sup := newSup(t, testSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	sup.admissionRenew = make(chan struct{}, 1)
+	bound := sup.admissionBound()
+
+	started := time.Now()
+	got := admitWithin(t, sup, 20*bound+5*time.Second, "an unanswered grow request")
+	elapsed := time.Since(started)
+
+	if got != syscall.ENOSPC {
+		t.Fatalf("a write parked against the ceiling was answered %s, want ENOSPC", got)
+	}
+	// The bound is a wait, not a rejection: a mount whose renew is merely slow
+	// must still get its grant rather than a full disk.
+	if elapsed+5*time.Millisecond < bound {
+		t.Errorf("the wait ended after %s, short of the %s bound", elapsed, bound)
+	}
+}
+
+// TestAWriterArrivingAfterARefusalIsNotParkedAgain is the second half of the
+// answer. A bound alone would make every writer behind a refused account pay it
+// in turn, so a full volume would serve one ENOSPC per bound instead of one per
+// write.
+//
+// growDenied is what the allocator's last word left behind, and it survives
+// only while nothing the worker can observe has changed: applyGrant clears it
+// when a larger ceiling lands, noteUsageLocked when a usage reading shows space
+// coming back. While it stands, waiting cannot produce a different answer.
+func TestAWriterArrivingAfterARefusalIsNotParkedAgain(t *testing.T) {
+	sup := newSup(t, testSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	sup.admissionRenew = make(chan struct{}, 1)
+	// What growRefused leaves behind when the account is at its budget.
+	sup.mu.Lock()
+	sup.ceilingRefused, sup.growDenied = true, true
+	sup.mu.Unlock()
+
+	started := time.Now()
+	got := admitWithin(t, sup, 20*sup.admissionBound()+5*time.Second,
+		"a writer arriving after a refusal")
+	elapsed := time.Since(started)
+
+	if got != syscall.ENOSPC {
+		t.Fatalf("a writer arriving after a refusal was answered %s, want ENOSPC", got)
+	}
+	if elapsed >= sup.admissionBound() {
+		t.Errorf("waited %s for an answer that was already known; the %s bound must not be paid again", elapsed, sup.admissionBound())
+	}
+	// Refusing must not also stop asking. The way out of a full account is the
+	// user buying disk, and only a renew carrying Grow will notice that they
+	// did (TestAGrowTheAccountCannotFundIsAskedAgain).
+	select {
+	case <-sup.admissionRenew:
+	default:
+		t.Error("the refusal did not poke the renew loop, so nothing will ask the allocator again")
+	}
+	if !sup.admissionPending() {
+		t.Error("the refusal left no grow request outstanding")
+	}
+}
+
+// TestALargerGrantAdmitsAWriterARefusalWouldHaveTurnedAway walks the whole
+// episode, and is the safety argument for the rule above: the refusal is a
+// statement about a state, not a verdict on the volume. A larger ceiling ends
+// the state, and the next writer is treated as if the refusal had never
+// happened.
+func TestALargerGrantAdmitsAWriterARefusalWouldHaveTurnedAway(t *testing.T) {
+	vol := healthyVolume()
+	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	sup.vol = vol
+	sup.admissionRenew = make(chan struct{}, 1)
+	sup.mu.Lock()
+	sup.ceilingRefused, sup.growDenied = true, true
+	sup.grantBytes, sup.grantInodes = 64<<20, 16384
+	sup.mu.Unlock()
+
+	if got := admitWithin(t, sup, 20*sup.admissionBound()+5*time.Second,
+		"a writer during the refusal"); got != syscall.ENOSPC {
+		t.Fatalf("a writer during the refusal was answered %s, want ENOSPC", got)
+	}
+	<-sup.admissionRenew
+
+	// The user buys disk and the allocator answers the outstanding request with
+	// a ceiling this volume did not have.
+	sup.applyGrant(context.Background(), GrantSpec{Bytes: 128 << 20, Inodes: 32768, Epoch: 3})
+	sup.mu.Lock()
+	refused, denied := sup.ceilingRefused, sup.growDenied
+	sup.mu.Unlock()
+	if refused || denied {
+		t.Fatalf("a larger ceiling left ceiling_refused=%v grow_denied=%v; both describe a state that has ended", refused, denied)
+	}
+
+	// A writer arriving now is not turned away on sight: it opens a request and
+	// is admitted by the next ceiling that gives it room.
+	admitted := make(chan syscall.Errno, 1)
+	go func() { admitted <- sup.Admit(context.Background()) }()
+	waitFor(t, 5*time.Second, sup.admissionPending, "the writer never opened a grow request")
+	sup.applyGrant(context.Background(), GrantSpec{Bytes: 256 << 20, Inodes: 65536, Epoch: 4})
+	select {
+	case got := <-admitted:
+		if got != 0 {
+			t.Fatalf("a writer waiting when a larger ceiling landed was answered %s, want admission", got)
+		}
+	case <-time.After(20*sup.admissionBound() + 5*time.Second):
+		t.Fatal("a larger ceiling did not admit the writer waiting for it")
+	}
+}
+
+// TestAFailedApplyDoesNotLatchTheGrowRequest is PLO-873's first half, and the
+// reason the parked writers had nothing to wait for.
+//
+// growAsked means "an issued grant is on its way into local state, do not ask
+// for another"; renewRequest attaches Grow only when it is clear, and renew
+// only clears it when the answered grant IS applied. An apply that fails leaves
+// neither true: nothing is on its way, and the flag was latched for the life of
+// the process. From there no renew carried Grow, so no answer could carry
+// OverBudget, so growRefused never ran and the flight never ended.
+func TestAFailedApplyDoesNotLatchTheGrowRequest(t *testing.T) {
+	vol := healthyVolume()
+	vol.grantErr = errors.New("metadata is read-only")
+	cp := &fakeCP{grant: GrantSpec{Bytes: 10 << 30, Inodes: 1000000, Epoch: 2, AckedEpoch: 1}}
+	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
+
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	t.Cleanup(func() { stop <- syscall.SIGTERM; <-done })
+
+	waitFor(t, 10*time.Second, func() bool { return len(cp.renewRequests()) > 0 }, "timed out waiting for the first renew")
+	vol.quotaTrips.Add(1)
+	waitFor(t, 10*time.Second, func() bool { return countGrows(cp.renewRequests()) >= 3 },
+		"the grow request was asked once and then never again: a failed apply latched growAsked")
+}
+
+// TestSpaceComingBackAfterARefusalClearsTheExhaustedState is the other way out
+// of a full volume, and the one the worker had no way to notice.
+//
+// A grant that cannot grow is not the only thing that makes a write possible
+// again — the user deleting files does too, and the ceiling does not move when
+// they do. The only figure this process holds is the periodic usage reading
+// behind used_bytes, so that is what the test is on: less in the volume than
+// the refusal saw, and under the ceiling in force.
+//
+// plori-runtime's executor reads quota_exhausted and ends the turn with a
+// disk-full message, so a flag that stays true after the volume is emptied ends
+// healthy turns.
+func TestSpaceComingBackAfterARefusalClearsTheExhaustedState(t *testing.T) {
+	vol := healthyVolume()
+	// A volume against its ceiling, which is where the refusal happens.
+	vol.setUsage(Usage{Bytes: 64 << 20, Inodes: 16384}, nil)
+	spec := testSpec()
+	spec.Grant = GrantSpec{Bytes: 64 << 20, Inodes: 16384, Epoch: 2, AckedEpoch: 2}
+	cp := &fakeCP{grant: spec.Grant, overBudget: true}
+	sup := newSup(t, spec, &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
+
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	t.Cleanup(func() { stop <- syscall.SIGTERM; <-done })
+
+	waitFor(t, 10*time.Second, func() bool { return len(cp.renewRequests()) > 0 }, "timed out waiting for the first renew")
+	vol.quotaTrips.Add(1)
+	waitFor(t, 10*time.Second, func() bool {
+		h, ok := healthWhenWritten(sup)
+		return ok && h.QuotaExhausted
+	}, "health.json never reported quota_exhausted for a full volume on an account at its budget")
+
+	// The user deletes and empties the trash. Nothing tells the worker; the
+	// next usage reading is simply smaller.
+	vol.setUsage(Usage{Bytes: 8 << 20, Inodes: 64}, nil)
+	waitFor(t, 10*time.Second, func() bool {
+		h, ok := healthWhenWritten(sup)
+		return ok && !h.QuotaExhausted
+	}, "quota_exhausted stayed set after the volume emptied; nothing but a larger ceiling can clear it")
+
+	// And it stays cleared: an account still at its budget is not, on its own,
+	// an exhausted volume.
+	before := len(cp.renewRequests())
+	waitFor(t, 10*time.Second, func() bool { return len(cp.renewRequests()) >= before+4 },
+		"timed out waiting for four more renews")
+	if h := readHealth(t, sup); h.QuotaExhausted {
+		t.Error("quota_exhausted came back on a volume with room, without a new refusal")
+	}
+}
+
+// TestSpaceStillAboveTheCeilingDoesNotClearTheExhaustedState is the other side
+// of that reading, and why it is two-sided. A volume compacted from far over
+// its ceiling to just over it has had space returned and is still full: a write
+// arriving now is refused exactly as before, and an operator told otherwise is
+// told the Agent recovered.
+func TestSpaceStillAboveTheCeilingDoesNotClearTheExhaustedState(t *testing.T) {
+	vol := healthyVolume()
+	vol.setUsage(Usage{Bytes: 96 << 20, Inodes: 20000}, nil)
+	spec := testSpec()
+	spec.Grant = GrantSpec{Bytes: 64 << 20, Inodes: 16384, Epoch: 2, AckedEpoch: 2}
+	cp := &fakeCP{grant: spec.Grant, overBudget: true}
+	sup := newSup(t, spec, &fakeFS{vol: vol}, cp, &fakeReplicator{}, &fakeFencer{})
+
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+	t.Cleanup(func() { stop <- syscall.SIGTERM; <-done })
+
+	waitFor(t, 10*time.Second, func() bool { return len(cp.renewRequests()) > 0 }, "timed out waiting for the first renew")
+	vol.quotaTrips.Add(1)
+	waitFor(t, 10*time.Second, func() bool {
+		h, ok := healthWhenWritten(sup)
+		return ok && h.QuotaExhausted
+	}, "health.json never reported quota_exhausted for a full volume on an account at its budget")
+
+	// Smaller than the refusal saw, still above the ceiling.
+	vol.setUsage(Usage{Bytes: 72 << 20, Inodes: 18000}, nil)
+	before := len(cp.renewRequests())
+	waitFor(t, 10*time.Second, func() bool { return len(cp.renewRequests()) >= before+20 },
+		"timed out waiting for twenty more renews")
+	if h := readHealth(t, sup); !h.QuotaExhausted {
+		t.Error("quota_exhausted cleared on a volume that is still over its ceiling")
+	}
+}
+
+// TestABoundedAdmissionLeavesNoGoroutineBehind is the production symptom read
+// the other way round. Every parked write is a goroutine the mount never gets
+// back, and on staging they accumulated for the life of the process; the timer
+// that bounds the wait must not replace them with one of its own.
+func TestABoundedAdmissionLeavesNoGoroutineBehind(t *testing.T) {
+	sup := newSup(t, testSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+	sup.admissionRenew = make(chan struct{}, 1)
+
+	before := settledGoroutines()
+	const writers = 8
+	var wg sync.WaitGroup
+	for range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sup.Admit(context.Background())
+		}()
+	}
+	finished := make(chan struct{})
+	go func() { wg.Wait(); close(finished) }()
+	select {
+	case <-finished:
+	case <-time.After(20*sup.admissionBound() + 5*time.Second):
+		t.Fatalf("%d writers were still parked; each one is a goroutine this mount never gets back", writers)
+	}
+
+	if after := settledGoroutines(); after > before {
+		t.Errorf("%d goroutines before %d bounded admissions, %d after", before, writers, after)
+	}
+}
+
+// settledGoroutines reads the count once it has stopped moving, so a goroutine
+// that an earlier test is still winding down is not read as this test's.
+func settledGoroutines() int {
+	last := runtime.NumGoroutine()
+	stable := 0
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+		n := runtime.NumGoroutine()
+		if n == last {
+			if stable++; stable == 3 {
+				return n
+			}
+			continue
+		}
+		last, stable = n, 0
+	}
+	return last
 }
