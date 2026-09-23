@@ -322,10 +322,12 @@ the same way and then removes what is left; the cancellation it uses internally
 to stop sibling work ends only that attempt, while a canceled caller still ends
 the call. Claims are never persisted or reported as usage.
 
-The heartbeat refresh of the persisted counters never replaces a newer
-in-memory value with an older one: it is serialized with the flush on SQL and
-KV, and on Redis a store is skipped when a committed delta may have overtaken
-the read (the next heartbeat retries).
+SQL and KV serialize heartbeat counter refresh with the pending-delta flush.
+The single-writer Redis admission client uses the startup counter baseline plus
+its own committed deltas; it does not overwrite them during heartbeat refresh.
+This avoids counting a remote commit and its local update twice, including a
+delete. Other writers and online counter repair are outside this contract;
+restart the sole client after offline repair.
 
 The bound is per metadata client, which is the whole writer on this profile,
 on each engine. It is logical 4 KiB accounting only; physical object bytes can

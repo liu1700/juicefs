@@ -318,13 +318,11 @@ type baseMeta struct {
 	pendingInodes    int64
 	unreservedSpace  int64
 	unreservedInodes int64
-	// usedGen advances before every in-memory change that an engine makes to
-	// usedSpace/usedInodes outside refresh and flush. Only Redis does so: its
-	// updateStats adds committed deltas there directly. refreshUsage uses it
-	// to discard a remote read that such a change may have overtaken.
-	usedGen atomic.Uint64
+	// singleWriterRedis keeps the startup baseline plus local committed deltas.
+	// Guarded by fsStatsLock; enabled before the admission wrapper serves calls.
+	singleWriterRedis bool
 
-	parentMu       sync.Mutex        // protect dirParents
+	parentMu        sync.Mutex        // protect dirParents
 	quotaMu         sync.RWMutex      // protect dirQuotas
 	quotasFlushLock sync.Mutex        // prevent concurrent doFlushQuotas
 	dirParents      map[Ino]Ino       // directory inode -> parent inode
@@ -1002,43 +1000,26 @@ func (m *baseMeta) refresh(ctx Context) {
 	}
 }
 
-// refreshUsage reloads the persisted volume counters without ever replacing a
-// newer in-memory value with an older remote one.
-//
-// SQL and KV: committed deltas wait in newSpace and reach the persisted counter
-// and usedSpace only through doFlushStats. fsStatsLock is held from the read
-// to the store, so no flush commits in between (it would move a delta into
-// usedSpace that this store then overwrites). The lock order matches
-// doFlushStats: fsStatsLock, then the engine, then volMu.
-//
-// Redis: a mutation commits its counter increment remotely and then adds the
-// same delta to usedSpace in memory (redisMeta.updateStats). If the remote
-// read precedes the commit and the in-memory add precedes the store, storing
-// the read loses the delta until the next heartbeat. updateStats advances
-// usedGen before its add; the store is skipped if usedGen moved since before
-// the read, and is a compare-and-swap against the value loaded after it, so an
-// add that lands between that load and the store fails the swap. Every
-// interleaving then either keeps the in-memory value or stores a read that
-// already includes the delta; at worst a delta read remotely is also added
-// afterwards, a transient overcount the next refresh corrects. A skipped
-// refresh is retried at the next heartbeat.
+// refreshUsage serializes SQL/KV counter refresh with their pending-delta
+// flush. A single-writer Redis admission client instead retains its startup
+// baseline and committed local deltas. Redis commits remotely before updating
+// memory: rereading in that interval can count either growth or deletion twice.
+// A generation checked only around updateStats cannot close that interval.
 func (m *baseMeta) refreshUsage() {
 	m.fsStatsLock.Lock()
 	defer m.fsStatsLock.Unlock()
-	gen := m.usedGen.Load()
+	if m.singleWriterRedis {
+		return
+	}
 	used, usedErr := m.en.getCounter(usedSpace)
 	inodes, inodesErr := m.en.getCounter(totalInodes)
 	runVolumeTestHook(&refreshUsageTestHook)
 	m.volMu.Lock()
-	curUsed, curInodes := atomic.LoadInt64(&m.usedSpace), atomic.LoadInt64(&m.usedInodes)
-	if m.usedGen.Load() == gen {
-		runVolumeTestHook(&refreshStoreTestHook)
-		if usedErr == nil {
-			atomic.CompareAndSwapInt64(&m.usedSpace, curUsed, used)
-		}
-		if inodesErr == nil {
-			atomic.CompareAndSwapInt64(&m.usedInodes, curInodes, inodes)
-		}
+	if usedErr == nil {
+		atomic.StoreInt64(&m.usedSpace, used)
+	}
+	if inodesErr == nil {
+		atomic.StoreInt64(&m.usedInodes, inodes)
 	}
 	m.volMu.Unlock()
 	if usedErr != nil {
@@ -1047,6 +1028,15 @@ func (m *baseMeta) refreshUsage() {
 	if inodesErr != nil {
 		logger.Warnf("Get counter %s: %s", totalInodes, inodesErr)
 	}
+}
+
+// enableSingleWriterCounters must precede serving admission-wrapped mutations.
+// Startup NewSession still loads the durable counters. Other metadata clients
+// and online counter repair are outside this single-writer contract.
+func (m *baseMeta) enableSingleWriterCounters(redis bool) {
+	m.fsStatsLock.Lock()
+	m.singleWriterRedis = redis
+	m.fsStatsLock.Unlock()
 }
 
 func (m *baseMeta) CleanStaleSessions(ctx Context) {

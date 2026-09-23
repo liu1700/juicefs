@@ -70,7 +70,6 @@ func volumeReservationFrom(ctx Context) *volumeReservation {
 var (
 	volumeTransferTestHook atomic.Pointer[func()]
 	refreshUsageTestHook   atomic.Pointer[func()] // after the remote read
-	refreshStoreTestHook   atomic.Pointer[func()] // after the generation check, before the swap
 )
 
 func runVolumeTestHook(h *atomic.Pointer[func()]) {

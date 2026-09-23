@@ -2003,18 +2003,38 @@ func (s *Supervisor) growRefused() {
 // Admit runs after the refused metadata transaction has returned. Cancellation
 // releases only this waiter; the shared allocation remains useful to others.
 func (s *Supervisor) Admit(ctx context.Context) syscall.Errno {
-	if ctx.Err() != nil {
+	// JuiceFS metadata contexts expose Canceled separately. In particular,
+	// fuseContext.Err always returns EINTR and its Done channel is nil, even
+	// before cancellation. Use its cancellation contract for admission waits.
+	canceled := func() bool { return ctx.Err() != nil }
+	var tick <-chan time.Time
+	if c, ok := ctx.(interface{ Canceled() bool }); ok {
+		canceled = c.Canceled
+		timer := time.NewTicker(100 * time.Millisecond)
+		defer timer.Stop()
+		tick = timer.C
+	}
+	if canceled() {
 		return syscall.EINTR
 	}
 	s.mu.Lock()
 	s.ceilingRefused = true
 	f := s.startQuotaFlightLocked()
 	s.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		return syscall.EINTR
-	case <-f.done:
-		return f.result
+	for {
+		select {
+		case <-ctx.Done():
+			return syscall.EINTR
+		case <-tick:
+			if canceled() {
+				return syscall.EINTR
+			}
+		case <-f.done:
+			if canceled() {
+				return syscall.EINTR
+			}
+			return f.result
+		}
 	}
 }
 

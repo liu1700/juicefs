@@ -836,7 +836,6 @@ func (m *redisMeta) parseEntry(buf []byte) (uint8, Ino) {
 }
 
 func (m *redisMeta) updateStats(space int64, inodes int64) {
-	m.usedGen.Add(1) // before the add; see baseMeta.refreshUsage
 	atomic.AddInt64(&m.usedSpace, space)
 	atomic.AddInt64(&m.usedInodes, inodes)
 }
@@ -5795,9 +5794,14 @@ func (m *redisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 	if eno := m.emptyDir(ctx, ino, true, nil, rmConcurrent); eno != 0 {
 		return eno
 	}
-	m.updateStats(-align4K(0), -1)
-	return errno(m.txn(ctx, func(tx *redis.Tx) error {
-		_, err := tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+	removed := false
+	err = m.txn(ctx, func(tx *redis.Tx) error {
+		removed = false
+		exists, err := tx.Exists(ctx, m.inodeKey(ino)).Result()
+		if err != nil || exists == 0 {
+			return err
+		}
+		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
 			p.Del(ctx, m.inodeKey(ino))
 			p.Del(ctx, m.xattrKey(ino))
 			p.DecrBy(ctx, m.usedSpaceKey(), align4K(0))
@@ -5810,8 +5814,13 @@ func (m *redisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 			m.genLog(ctx, p, time.Now(), "CLEANUP(%d)", ino)
 			return nil
 		})
+		removed = err == nil
 		return err
-	}, m.inodeKey(ino), m.xattrKey(ino)))
+	}, m.inodeKey(ino), m.xattrKey(ino))
+	if err == nil && removed {
+		m.updateStats(-align4K(0), -1)
+	}
+	return errno(err)
 }
 
 func (m *redisMeta) doFindDetachedNodes(t time.Time) []Ino {

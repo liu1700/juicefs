@@ -57,8 +57,8 @@ func newProcFixture(t *testing.T) *procFixture {
 	p.write("net/tcp6", "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
 	p.process(fixtureWriter, 1, "100\t1", 500)
 	p.process(fixtureChild, fixtureWriter, "205\t2", fixtureTicks)
-	p.process(300, fixtureWriter, "300\t9", 900)      // another child of the writer
-	p.process(301, 50, "301\t2", 901)                 // the same inner PID elsewhere
+	p.process(300, fixtureWriter, "300\t9", 900) // another child of the writer
+	p.process(301, 50, "301\t2", 901)            // the same inner PID elsewhere
 	p.fd(fixtureChild, 3, "socket:["+strconv.Itoa(fixtureInode)+"]")
 	p.fd(fixtureChild, 4, "/state/litestream.yml")
 	p.listen("tcp", loopbackHex(), 9909, fixtureInode)
@@ -161,7 +161,9 @@ func TestLitestreamMetricsChildVouchesOnlyForItsOwnListener(t *testing.T) {
 				p.t.Fatal(err)
 			}
 		},
-		"child exited":                 func(p *procFixture, _ *Litestream) { _ = os.RemoveAll(filepath.Join(p.root, strconv.Itoa(fixtureChild))) },
+		"child exited": func(p *procFixture, _ *Litestream) {
+			_ = os.RemoveAll(filepath.Join(p.root, strconv.Itoa(fixtureChild)))
+		},
 		"invalidated before a restart": func(_ *procFixture, l *Litestream) { l.child.invalidate() },
 		"reaped":                       func(_ *procFixture, l *Litestream) { l.child.forget(1) },
 		"next start not captured yet":  func(_ *procFixture, l *Litestream) { l.child.begin() },

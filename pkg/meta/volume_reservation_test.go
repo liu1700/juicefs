@@ -17,6 +17,7 @@
 package meta
 
 import (
+	"fmt"
 	"path/filepath"
 	"sync/atomic"
 	"syscall"
@@ -677,76 +678,52 @@ func TestVolumeReservationRefreshDoesNotOverwriteAFlush(t *testing.T) {
 	}
 }
 
-// A mutation that commits after refresh's remote read and is counted in
-// memory before refresh's store. On Redis the count lands in usedSpace itself
-// (control: the old store loses it); the generation guard must skip the stale
-// store. On SQL and KV the count lands in newSpace and the store is exact.
-func TestVolumeReservationRefreshKeepsACommitAfterItsRead(t *testing.T) {
-	for _, e := range volresEngines {
-		t.Run(e.name+"/control", func(t *testing.T) {
-			m, b := volresOpen(t, e, volresCapacity, 0)
-			stale, err := b.en.getCounter(usedSpace)
-			if err != nil {
-				t.Fatal(err)
-			}
-			before := volresClaimed(b)
-			ctx := volresCtx(true)
-			var ino Ino
-			if st := m.Mknod(ctx, RootInode, "late", TypeFile, 0644, 022, 0, "", &ino, nil); st != 0 {
-				t.Fatal(st)
-			}
-			volresRelease(b, ctx)
-			atomic.StoreInt64(&b.usedSpace, stale) // the old unguarded store
-			want := before + 4096
-			if e.name == "redis" {
-				want = before // the lost delta the guard exists for
-			}
-			if got := volresClaimed(b); got != want {
-				t.Fatalf("old interleaving counted %d, want %d", got, want)
-			}
-		})
-		t.Run(e.name+"/guarded", func(t *testing.T) {
-			m, b := volresOpen(t, e, volresCapacity, 0)
-			before := volresClaimed(b)
-			var st syscall.Errno
-			hook := func() {
-				ctx := volresCtx(true)
-				var ino Ino
-				st = m.Mknod(ctx, RootInode, "late", TypeFile, 0644, 022, 0, "", &ino, nil)
-				volresRelease(b, ctx)
-			}
-			refreshUsageTestHook.Store(&hook)
-			b.refreshUsage()
-			refreshUsageTestHook.Store(nil)
-			if st != 0 {
-				t.Fatalf("mknod during refresh: %s", st)
-			}
-			if got := volresClaimed(b); got != before+4096 {
-				t.Fatalf("after a commit inside the refresh window %d, want %d", got, before+4096)
-			}
-			b.refreshUsage() // an undisturbed refresh converges on the persisted counter
-			persisted, err := b.en.getCounter(usedSpace)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := atomic.LoadInt64(&b.usedSpace); got != persisted {
-				t.Fatalf("usedSpace %d, persisted %d", got, persisted)
-			}
-		})
-		// The narrowest window: an in-memory update after the generation check
-		// and before the store, from a caller that holds no volMu (every
-		// upstream updateStats caller). The swap must fail on Redis.
-		t.Run(e.name+"/store-window", func(t *testing.T) {
-			_, b := volresOpen(t, e, volresCapacity, 0)
-			before := volresClaimed(b)
-			hook := func() { b.en.updateStats(4096, 1) }
-			refreshStoreTestHook.Store(&hook)
-			b.refreshUsage()
-			refreshStoreTestHook.Store(nil)
-			if got := volresClaimed(b); got != before+4096 {
-				t.Fatalf("after an update inside the store window %d, want %d", got, before+4096)
-			}
-		})
+// A remote Redis commit can precede its local accounting. Replacing the
+// local baseline in that interval counts the delta twice, including deletion.
+func TestVolumeReservationRedisRefreshDoesNotDoubleCountRemoteCommit(t *testing.T) {
+	for _, delta := range []int64{4096, -4096} {
+		for _, guarded := range []bool{false, true} {
+			t.Run(fmt.Sprintf("delta=%d/guarded=%t", delta, guarded), func(t *testing.T) {
+				m, b := volresOpen(t, volresEngines[2], volresCapacity, 0)
+				volresNode(t, m, RootInode, "existing", TypeFile)
+				before := volresClaimed(b)
+				b.enableSingleWriterCounters(guarded)
+				// Same remote-before-local ordering as Redis metadata commits.
+				if _, err := b.en.incrCounter(usedSpace, delta); err != nil {
+					t.Fatal(err)
+				}
+				b.refreshUsage()
+				b.en.updateStats(delta, 0)
+				want := before + 2*delta
+				if guarded {
+					want = before + delta
+				}
+				if got := volresClaimed(b); got != want {
+					t.Fatalf("usage=%d want=%d", got, want)
+				}
+				b.refreshUsage()
+				if got := volresClaimed(b); got != before+delta {
+					t.Fatalf("settled usage=%d want=%d", got, before+delta)
+				}
+			})
+		}
+	}
+}
+
+// Growth committed after an old remote read cannot be lost in strict mode.
+func TestVolumeReservationRedisKeepsLocalCommit(t *testing.T) {
+	m, b := volresOpen(t, volresEngines[2], volresCapacity, 0)
+	b.enableSingleWriterCounters(true)
+	before := volresClaimed(b)
+	ctx := volresCtx(true)
+	var ino Ino
+	if st := m.Mknod(ctx, RootInode, "late", TypeFile, 0644, 022, 0, "", &ino, nil); st != 0 {
+		t.Fatal(st)
+	}
+	volresRelease(b, ctx)
+	b.refreshUsage()
+	if got := volresClaimed(b); got != before+4096 {
+		t.Fatalf("usage=%d want=%d", got, before+4096)
 	}
 }
 
@@ -820,4 +797,36 @@ func TestVolumeReservationClaimsTheTrashBucket(t *testing.T) {
 			t.Fatalf("pending %d/%d", s, i)
 		}
 	})
+}
+
+func TestVolumeReservationRedisFailedDetachedCleanupKeepsUsage(t *testing.T) {
+	m, b := volresOpen(t, volresEngines[2], volresCapacity, 0)
+	r := m.(*redisMeta)
+	ino := volresNode(t, m, RootInode, "detached", TypeDirectory)
+	if err := r.rdb.HDel(Background(), r.entryKey(RootInode), "detached").Err(); err != nil {
+		t.Fatal(err)
+	}
+	b.enableSingleWriterCounters(true)
+	before := volresClaimed(b)
+	// A concrete transaction refusal after successful lookup/empty enumeration.
+	r.conf.ReadOnly = true
+	if st := r.doCleanupDetachedNode(Background(), ino); st != syscall.EROFS {
+		t.Fatalf("cleanup=%s want EROFS", st)
+	}
+	r.conf.ReadOnly = false
+	if got := volresClaimed(b); got != before {
+		t.Fatalf("failed cleanup freed usage: %d want %d", got, before)
+	}
+	if st := r.doCleanupDetachedNode(Background(), ino); st != 0 {
+		t.Fatal(st)
+	}
+	if got := volresClaimed(b); got != before-4096 {
+		t.Fatalf("successful cleanup usage=%d want=%d", got, before-4096)
+	}
+	if st := r.doCleanupDetachedNode(Background(), ino); st != 0 {
+		t.Fatal(st)
+	}
+	if got := volresClaimed(b); got != before-4096 {
+		t.Fatalf("replayed cleanup usage=%d want=%d", got, before-4096)
+	}
 }

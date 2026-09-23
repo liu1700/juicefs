@@ -50,7 +50,10 @@ type ploriAdmissionMeta struct {
 
 // PloriWithQuotaAdmission decorates the metadata client used by one mount.
 // Nil admission preserves the ordinary JuiceFS ENOSPC behavior.
-func PloriWithQuotaAdmission(m Meta) Meta { return &ploriAdmissionMeta{Meta: m} }
+func PloriWithQuotaAdmission(m Meta) Meta {
+	m.getBase().enableSingleWriterCounters(m.Name() == "redis")
+	return &ploriAdmissionMeta{Meta: m}
+}
 
 func PloriSetQuotaAdmission(m Meta, a PloriQuotaAdmission) {
 	if wrapped, ok := m.(*ploriAdmissionMeta); ok {
