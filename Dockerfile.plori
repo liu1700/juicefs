@@ -38,7 +38,7 @@ COPY --from=scan-build /src/juicefs.plori.scan /juicefs.scan
 FROM ${RUNTIME_IMAGE}
 
 RUN apk add --no-cache \
-        ca-certificates=20260611-r0 \
+        ca-certificates=20260909-r0 \
         fuse3=3.16.2-r1 \
         libcrypto3=3.5.8-r0 \
         libssl3=3.5.8-r0 \
