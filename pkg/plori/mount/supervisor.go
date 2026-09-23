@@ -91,15 +91,6 @@ type Supervisor struct {
 	// bound (PLO-383).
 	drain *DrainModel
 
-	// barrierMu serialises the two callers of vol.Barrier: the periodic barrier,
-	// which since PLO-913 runs off the run loop, and the ordered stop's own. The
-	// stop must never start a second barrier on top of one already flushing, and
-	// with the periodic barrier no longer holding the loop goroutine that is no
-	// longer guaranteed by construction. Waiting here costs the stop nothing it
-	// did not already pay: before PLO-913 the stop could not even be noticed
-	// until the periodic barrier returned.
-	barrierMu sync.Mutex
-
 	mu              sync.Mutex
 	lastBarrier     BarrierResult
 	lastTxID        string
@@ -2398,12 +2389,10 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 		pendingBefore = s.vol.PendingBlocks()
 		startedAt := s.now()
 		var err error
-		// After the fence above, and behind any periodic barrier still flushing
-		// (PLO-913): new writes have already stopped, so waiting here only lets
-		// the earlier flush finish the work this one would otherwise repeat.
-		s.barrierMu.Lock()
+		// No periodic barrier can be flushing here (PLO-913): stopWorkers above
+		// joined the barrier lane before this stop reached the fence, and a stop
+		// that could not join it returned without a final barrier.
 		res, err = s.vol.Barrier(ctx)
-		s.barrierMu.Unlock()
 		if err != nil {
 			incomplete = fmt.Errorf("durability barrier: %w", err)
 			s.log("shutdown_barrier_failed", "error", err.Error(),
