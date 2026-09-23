@@ -555,7 +555,13 @@ func (c *fuseAdmissionContext) Canceled() bool { return c.stopped.Load() }
 func TestQuotaAdmissionUsesFUSECancellationContract(t *testing.T) {
 	for _, cancel := range []bool{false, true} {
 		t.Run(fmt.Sprintf("cancel=%t", cancel), func(t *testing.T) {
-			sup := newSup(t, testSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+			// The admission bound (PLO-873) is AdmissionRenewRounds renew
+			// intervals. With testSpec's 50 ms interval it would end the wait at
+			// 150 ms, close to the 100 ms cancellation poll. A long interval
+			// keeps the bound out of this test, which is about cancellation.
+			spec := testSpec()
+			spec.LeaseRenewInterval = Duration(10 * time.Second)
+			sup := newSup(t, spec, &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
 			sup.admissionRenew = make(chan struct{}, 1)
 			ctx := &fuseAdmissionContext{Context: context.Background()}
 			done := make(chan syscall.Errno, 1)
