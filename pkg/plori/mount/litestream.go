@@ -103,6 +103,18 @@ type Litestream struct {
 	// is what the tests that do not assert on it want.
 	Log func(event string, kv ...any)
 
+	// MetricsAddr is written into the replicate config, never the restore
+	// config, and turns on Litestream's Prometheus listener there. Only the
+	// Workspace gateway sets it (WorkspaceLitestreamMetricsAddr): its writer
+	// shares the loopback of one trusted container. Every other mount leaves it
+	// empty; an M1 worker runs in the node's host network namespace, where a
+	// loopback listener would be reachable from the whole node.
+	MetricsAddr string
+
+	// child identifies the supervised child for the metrics ownership gauge
+	// (litestream_metrics.go).
+	child litestreamChildState
+
 	cmd                 *exec.Cmd
 	done                chan error
 	lastRestoreAttempts []string
@@ -192,7 +204,7 @@ const (
 // environment, which keeps the one bucket-wide key off disk (threat-model
 // F-11: a config file is one more place a debug dump can read it from).
 func (l *Litestream) WriteConfig(spec *MountSpec, opts MountOptions) error {
-	return l.writeConfig(l.ConfigPath, spec, opts, strings.TrimSuffix(spec.MetaPrefix, "/"))
+	return l.writeConfig(l.ConfigPath, spec, opts, strings.TrimSuffix(spec.MetaPrefix, "/"), l.MetricsAddr)
 }
 
 // writeRestoreConfig points the same database at a DIFFERENT prefix, the one
@@ -200,14 +212,15 @@ func (l *Litestream) WriteConfig(spec *MountSpec, opts MountOptions) error {
 // file, so the replicating child is never a moment away from writing into the
 // prefix it is only supposed to read.
 func (l *Litestream) writeRestoreConfig(spec *MountSpec, opts MountOptions, sourcePrefix string) error {
-	return l.writeConfig(l.restoreConfigPath(), spec, opts, strings.TrimSuffix(sourcePrefix, "/"))
+	return l.writeConfig(l.restoreConfigPath(), spec, opts, strings.TrimSuffix(sourcePrefix, "/"), "")
 }
 
 func (l *Litestream) restoreConfigPath() string { return l.ConfigPath + ".restore" }
 
-func (l *Litestream) writeConfig(path string, spec *MountSpec, opts MountOptions, replicaPrefix string) error {
+func (l *Litestream) writeConfig(path string, spec *MountSpec, opts MountOptions, replicaPrefix, metricsAddr string) error {
 	l.spec, l.opts = spec, opts
 	var cfg litestreamConfig
+	cfg.Addr = metricsAddr
 	cfg.Socket.Enabled = true
 	cfg.Socket.Path = l.SocketPath
 	cfg.Socket.Permissions = 0600
@@ -520,12 +533,27 @@ func (l *Litestream) Start(ctx context.Context) error {
 	// wait. Leaving it out of the signalled group is what lets that sequence
 	// run at all.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// The metrics gauge names this start before the child exists, so no scrape
+	// can attribute a listener to an earlier child after this point.
+	seq, epoch := l.child.begin()
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start litestream: %w", err)
 	}
 	l.cmd = cmd
 	l.done = make(chan error, 1)
-	go func() { l.done <- cmd.Wait() }()
+	if l.MetricsAddr != "" {
+		// Before the reaper starts: an unreaped child keeps its PID, so the
+		// kernel identity captured here is this child's.
+		if err := l.child.capture(seq, epoch, cmd.Process.Pid); err != nil {
+			l.logf("litestream_metrics_unattested", "error", err.Error())
+		}
+	}
+	done := l.done
+	go func() {
+		err := cmd.Wait()
+		l.child.forget(seq)
+		done <- err
+	}()
 
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -537,10 +565,12 @@ func (l *Litestream) Start(ctx context.Context) error {
 			l.done = nil
 			return fmt.Errorf("litestream exited during startup: %w", err)
 		case <-ctx.Done():
+			l.child.invalidate()
 			return ctx.Err()
 		case <-time.After(50 * time.Millisecond):
 		}
 		if time.Now().After(deadline) {
+			l.child.invalidate()
 			return errors.New("litestream control socket did not appear within 30s")
 		}
 	}
@@ -725,6 +755,7 @@ func (e *controlStatusError) Error() string {
 // cmd/litestream/main.go:186-190), so this never sends one; if the wait times
 // out the process is killed and the caller reports the barrier incomplete.
 func (l *Litestream) Stop(ctx context.Context) error {
+	l.child.invalidate()
 	if l.cmd == nil || l.done == nil {
 		return nil
 	}
@@ -752,6 +783,7 @@ func (l *Litestream) Stop(ctx context.Context) error {
 // from: no barrier ran, so that history can reference blocks the object store
 // never received (PLO-323 F-1).
 func (l *Litestream) Abort(ctx context.Context) error {
+	l.child.invalidate()
 	if l.cmd == nil || l.done == nil {
 		return nil
 	}
@@ -811,6 +843,7 @@ func (l *Litestream) Probe(ctx context.Context) error {
 // unconditional because starting a second replicator on one database is the
 // one outcome worse than a lagging replica.
 func (l *Litestream) Restart(ctx context.Context) error {
+	l.child.invalidate()
 	if l.cmd != nil && l.done != nil {
 		_ = l.cmd.Process.Kill()
 		select {
@@ -876,6 +909,7 @@ func (l *Litestream) ReloadCredentials(ctx context.Context) error {
 	if l.cmd == nil || l.done == nil {
 		return nil // not replicating yet; Start will read the current key
 	}
+	l.child.invalidate()
 	sync, cancel := context.WithTimeout(ctx, 10*time.Second)
 	syncErr := l.SyncAndWait(sync)
 	cancel()

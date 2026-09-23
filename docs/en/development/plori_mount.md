@@ -304,6 +304,52 @@ one node-level Litestream watching many databases, which v0.5.17 supports
 natively; whether a per-volume replica prefix can be expressed under a single
 directory-watch config is the open question there.
 
+## Volume ceiling admission
+
+Every metadata call made through the admission wrapper carries an in-memory
+volume reservation (`pkg/meta/volume_reservation.go`). The ceiling check claims
+the space and inodes it admits; the claim is replaced by the committed amount
+when the counters are updated, and released when the call returns, before any
+wait for a larger grant. A second call can therefore not be admitted into space
+an earlier call has checked but not yet counted. Clone claims its whole source
+at the preflight and charges every clone transaction against that claim before
+it commits; a charge the ceiling refuses fails the clone with `ENOSPC` and is
+not retried, because part of the clone may already exist. Creating the hour's
+trash bucket (4 KiB and one inode, on the first unlink, rmdir or rename of the
+hour) is claimed the same way; at a full grant that call waits for admission
+and never bypasses the trash. A recursive remove that is refused partway waits
+the same way and then removes what is left; the cancellation it uses internally
+to stop sibling work ends only that attempt, while a canceled caller still ends
+the call. Claims are never persisted or reported as usage.
+
+The heartbeat refresh of the persisted counters never replaces a newer
+in-memory value with an older one: it is serialized with the flush on SQL and
+KV, and on Redis a store is skipped when a committed delta may have overtaken
+the read (the next heartbeat retries).
+
+The bound is per metadata client, which is the whole writer on this profile,
+on each engine. It is logical 4 KiB accounting only; physical object bytes can
+exceed it.
+
+## Workspace gateway Litestream metrics
+
+With `--workspace-gateway` only, the replicate config sets `addr:
+"127.0.0.1:9909"`; restore configs and every other worker keep `addr: ""` (an
+M1 worker runs in the node's network namespace). The port is never published.
+Pinned Litestream also serves `/debug/pprof` on it; only the gateway
+container's own processes can reach it.
+
+Litestream binds that address in the background and keeps running if the bind
+fails, so the port alone does not identify the child. The writer exports
+`juicefs_plori_litestream_metrics_child` on its private `metrics.sock`: the
+start sequence of its supervised child while that child, and only it, holds the
+one TCP listener on the port, and `0` otherwise (not started, stopping,
+restarting, unreadable `/proc`, or any other listener). The child is resolved
+in `/proc` once per start, before it can be reaped, by its parent PID and its
+innermost `NSpid`; its kernel start time and socket ownership are re-checked on
+every scrape. A collector brackets a Litestream scrape between two reads of
+this gauge and uses the sample only when both are equal and non-zero.
+
 ## Not implemented
 
 * ~~**Restore-time missing-block repair.**~~ Implemented by PLO-320 in

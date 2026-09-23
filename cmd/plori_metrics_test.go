@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -70,5 +71,42 @@ func TestPrivateMetricsServesOnlyThroughStateSocket(t *testing.T) {
 	}
 	if _, err := os.Stat(socket); !os.IsNotExist(err) {
 		t.Fatalf("metrics socket remains after close: %v", err)
+	}
+}
+
+// The Runtime collector matches this exact, unlabeled family name; a JuiceFS
+// prefix or the mount's common labels would make it look missing.
+func TestLitestreamMetricsChildGaugeIsExactAndUnlabeled(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "metrics.sock")
+	registry := prometheus.NewRegistry()
+	var child atomic.Uint64
+	child.Store(3)
+	registerLitestreamMetricsChild(registry, child.Load)
+	s, err := startPrivateMetrics(socket, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	client := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	}}}
+	scrape := func() string {
+		resp, err := client.Get("http://metrics/metrics")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	if body := scrape(); !strings.Contains(body, "\njuicefs_plori_litestream_metrics_child 3\n") {
+		t.Fatalf("gauge missing or labeled:\n%s", body)
+	}
+	child.Store(0)
+	if body := scrape(); !strings.Contains(body, "\njuicefs_plori_litestream_metrics_child 0\n") {
+		t.Fatalf("gauge is not read per scrape:\n%s", body)
 	}
 }

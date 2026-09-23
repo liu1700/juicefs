@@ -199,7 +199,7 @@ func (m *baseMeta) updateParentStat(ctx Context, inode, parent Ino, length, spac
 	if length == 0 && space == 0 {
 		return
 	}
-	m.en.updateStats(space, 0)
+	m.commitVolume(ctx, nil, space, 0)
 	if !m.getFormat().DirStats {
 		return
 	}
@@ -309,19 +309,32 @@ func (m *baseMeta) checkQuota(ctx Context, space, inodes int64, uid, gid uint32,
 	}
 
 	format := m.getFormat()
-	if space > 0 && format.Capacity > 0 && atomic.LoadInt64(&m.usedSpace)+atomic.LoadInt64(&m.newSpace)+space > int64(format.Capacity) {
-		volumeQuotaTripped(ctx)
-		return syscall.ENOSPC
-	}
-	if inodes > 0 && format.Inodes > 0 && atomic.LoadInt64(&m.usedInodes)+atomic.LoadInt64(&m.newInodes)+inodes > int64(format.Inodes) {
-		volumeQuotaTripped(ctx)
-		return syscall.ENOSPC
+	reservation := volumeReservationFrom(ctx)
+	if reservation != nil {
+		// Check and claim in one step, so no other check can admit the same
+		// free space before this operation's commit is counted.
+		if !m.reserveVolume(reservation, space, inodes) {
+			volumeQuotaTripped(ctx)
+			return syscall.ENOSPC
+		}
+	} else {
+		if space > 0 && format.Capacity > 0 && atomic.LoadInt64(&m.usedSpace)+atomic.LoadInt64(&m.newSpace)+space > int64(format.Capacity) {
+			volumeQuotaTripped(ctx)
+			return syscall.ENOSPC
+		}
+		if inodes > 0 && format.Inodes > 0 && atomic.LoadInt64(&m.usedInodes)+atomic.LoadInt64(&m.newInodes)+inodes > int64(format.Inodes) {
+			volumeQuotaTripped(ctx)
+			return syscall.ENOSPC
+		}
 	}
 	if !format.DirStats {
 		return 0
 	}
 	for _, ino := range parents {
 		if m.checkDirQuota(ctx, ino, space, inodes) {
+			if reservation != nil {
+				m.dropVolumeClaim(reservation)
+			}
 			return syscall.EDQUOT
 		}
 	}

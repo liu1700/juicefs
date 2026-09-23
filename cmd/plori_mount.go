@@ -154,10 +154,18 @@ func ploriMount(c *cli.Context) error {
 		Env: func() []string { return source.Env(os.Environ()) },
 		Log: ploriLog,
 	}
+	fs := &ploriFS{paths: paths, credentials: credentials, inPod: mode == mountModeInPod}
+	if workspaceGateway {
+		// Loopback of the gateway's one trusted container only. Every other
+		// worker keeps Litestream's metrics listener off (litestream.go).
+		ls.MetricsAddr = pmount.WorkspaceLitestreamMetricsAddr
+		fs.litestreamMetricsChild = ls.MetricsChild
+	}
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
 	}
 	opts := spec.Options(os.Getenv)
+	fs.opts = opts
 	if len(opts.Ignored) > 0 {
 		// An option this worker does not know is the control-plane tuning
 		// something it does not have, not authority it cannot honour, so it
@@ -205,7 +213,7 @@ func ploriMount(c *cli.Context) error {
 		Options:          opts,
 		WorkspaceGateway: workspaceGateway,
 		Deps: pmount.Deps{
-			FS:                   &ploriFS{paths: paths, opts: opts, credentials: credentials, inPod: mode == mountModeInPod},
+			FS:                   fs,
 			CP:                   cp,
 			Replicator:           replicator,
 			Fencer:               fencer,
@@ -328,6 +336,9 @@ type ploriFS struct {
 	opts        pmount.MountOptions
 	credentials *pmount.CredentialWatcher
 	inPod       bool
+	// litestreamMetricsChild is set only for the Workspace gateway writer. It
+	// backs pmount.LitestreamMetricsChildGauge on the private metrics socket.
+	litestreamMetricsChild func() uint64
 }
 
 // metaURI is the local SQLite metadata engine. It is deliberately a plain
@@ -519,6 +530,9 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 	// 68, whereas this path has to survive a rotation without stopping.
 	blob = &watchCredential{ObjectStorage: blob, w: f.credentials}
 	registerer, registry := wrapRegister(c, f.paths.MountPoint, format.Name)
+	if f.inPod && f.litestreamMetricsChild != nil {
+		registerLitestreamMetricsChild(registry, f.litestreamMetricsChild)
+	}
 	var metrics *privateMetricsServer
 	if f.inPod {
 		metrics, err = startPrivateMetrics(f.paths.MetricsPath(), registry)

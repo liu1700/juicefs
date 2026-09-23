@@ -836,6 +836,7 @@ func (m *redisMeta) parseEntry(buf []byte) (uint8, Ino) {
 }
 
 func (m *redisMeta) updateStats(space int64, inodes int64) {
+	m.usedGen.Add(1) // before the add; see baseMeta.refreshUsage
 	atomic.AddInt64(&m.usedSpace, space)
 	atomic.AddInt64(&m.usedInodes, inodes)
 }
@@ -1752,7 +1753,7 @@ func (m *redisMeta) doCleanupChangelog(ctx Context, maxAge time.Duration, maxLin
 func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash, inode Ino
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -1945,7 +1946,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 		entries = entries[batchSize:]
 		var trash Ino
 		if len(skipCheckTrash) == 0 || !skipCheckTrash[0] {
-			if st := m.checkTrash(parent, &trash); st != 0 {
+			if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 				return st
 			}
 		}
@@ -2300,7 +2301,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldAttr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash Ino
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -2432,7 +2433,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 		keys[0], keys[2] = keys[2], keys[0]
 	}
 	if !exchange {
-		if st := m.checkTrash(parentDst, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parentDst, &trash); st != 0 {
 			return st
 		}
 	}
@@ -2484,7 +2485,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 				keys = append(keys, m.entryKey(dino))
 			}
 			if !exchange {
-				if st := m.checkTrash(parentDst, &trash); st != 0 {
+				if st := m.checkTrash(ctx, parentDst, &trash); st != 0 {
 					return st
 				}
 			}
@@ -5339,6 +5340,9 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 		if eno := m.Access(ctx, srcIno, MODE_MASK_R, &attr); eno != 0 {
 			return eno
 		}
+		if eno := m.chargeVolume(ctx, ino, align4K(attr.Length), 1); eno != 0 {
+			return eno
+		}
 		attr.Parent = parent
 		now := time.Now()
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
@@ -5722,6 +5726,11 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				}
 				validInfos = append(validInfos, info)
 			}
+			if len(infos) > 0 {
+				if eno := m.chargeVolume(ctx, infos[0].dstIno, batchResult.space, batchResult.inodes); eno != 0 {
+					return eno
+				}
+			}
 
 			_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
 				for _, info := range validInfos {
@@ -5768,6 +5777,9 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 			result.inodes += batchResult.inodes
 			for _, q := range batchResult.deltas {
 				result.deltas.add(q)
+			}
+			if len(infos) > 0 {
+				result.chargeKeys = append(result.chargeKeys, infos[0].dstIno)
 			}
 		}
 	}

@@ -1522,10 +1522,15 @@ func (m *dbMeta) doFlushStats() {
 			logger.Warnf("update stats: %s", err)
 		}
 		if err == nil {
+			// A reservation check reads used+new under volMu; it must never see
+			// the flushed delta in neither counter.
+			m.volMu.Lock()
 			atomic.AddInt64(&m.newSpace, -newSpace)
+			runVolumeTestHook(&volumeTransferTestHook)
 			atomic.AddInt64(&m.usedSpace, newSpace)
 			atomic.AddInt64(&m.newInodes, -newInodes)
 			atomic.AddInt64(&m.usedInodes, newInodes)
+			m.volMu.Unlock()
 		}
 	}
 }
@@ -2022,7 +2027,7 @@ func (m *dbMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 func (m *dbMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash Ino
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -2208,7 +2213,7 @@ func (m *dbMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 func (m *dbMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, attr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash Ino
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -2363,7 +2368,7 @@ func (m *dbMeta) getNodes(s *xorm.Session, nodes ...*node) error {
 
 func (m *dbMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode, tInode *Ino, attr, tAttr *Attr) syscall.Errno {
 	var trash Ino
-	if st := m.checkTrash(parentDst, &trash); st != 0 {
+	if st := m.checkTrash(ctx, parentDst, &trash); st != 0 {
 		return st
 	}
 	exchange := flags == RenameExchange
@@ -2882,7 +2887,7 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		entries = entries[batchSize:]
 		var trash Ino
 		if len(skipCheckTrash) == 0 || !skipCheckTrash[0] {
-			if st := m.checkTrash(parent, &trash); st != 0 {
+			if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 				return st
 			}
 		}
@@ -5467,6 +5472,9 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		if eno := m.Access(ctx, srcIno, MODE_MASK_R, attr); eno != 0 {
 			return eno
 		}
+		if eno := m.chargeVolume(ctx, ino, align4K(n.Length), 1); eno != 0 {
+			return eno
+		}
 
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
 			n.Uid = ctx.Uid()
@@ -5689,6 +5697,9 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 				Inodes: 1,
 			})
 		}
+		if eno := m.chargeVolume(ctx, cloneInfos[0].dstIno, result.space, result.inodes); eno != 0 {
+			return eno
+		}
 
 		if err := mustInsert(s, nodesIns...); err != nil {
 			return err
@@ -5779,6 +5790,7 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	if err != nil {
 		return errno(err)
 	}
+	result.chargeKeys = []Ino{cloneInfos[0].dstIno}
 	return 0
 }
 

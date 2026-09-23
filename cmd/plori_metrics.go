@@ -25,9 +25,21 @@ import (
 	"net/http"
 	"os"
 
+	pmount "github.com/juicedata/juicefs/pkg/plori/mount"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// registerLitestreamMetricsChild exposes pmount.LitestreamMetricsChildGauge on
+// the bare registry, so the name is exact and carries no labels. It is an
+// observation for the Runtime collector only; nothing in the writer's health or
+// authority reads it.
+func registerLitestreamMetricsChild(registry *prometheus.Registry, child func() uint64) {
+	registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: pmount.LitestreamMetricsChildGauge,
+		Help: "Start sequence of the supervised Litestream child while it alone holds the loopback metrics listener, else 0.",
+	}, func() float64 { return float64(child()) }))
+}
 
 // privateMetricsServer exposes this mount's registry through a state-dir
 // socket. The root supervisor owns the 0700 state directory; mode 0600 keeps

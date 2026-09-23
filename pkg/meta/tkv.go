@@ -626,16 +626,23 @@ func (m *kvMeta) updateStats(space int64, inodes int64) {
 func (m *kvMeta) doFlushStats() {
 	if space := atomic.LoadInt64(&m.newSpace); space != 0 {
 		if v, err := m.incrCounter(usedSpace, space); err == nil {
+			// A reservation check reads used+new under volMu; it must never see
+			// the flushed delta in neither counter.
+			m.volMu.Lock()
 			atomic.AddInt64(&m.newSpace, -space)
+			runVolumeTestHook(&volumeTransferTestHook)
 			atomic.StoreInt64(&m.usedSpace, v)
+			m.volMu.Unlock()
 		} else {
 			logger.Warnf("Update space stats: %s", err)
 		}
 	}
 	if inodes := atomic.LoadInt64(&m.newInodes); inodes != 0 {
 		if v, err := m.incrCounter(totalInodes, inodes); err == nil {
+			m.volMu.Lock()
 			atomic.AddInt64(&m.newInodes, -inodes)
 			atomic.StoreInt64(&m.usedInodes, v)
+			m.volMu.Unlock()
 		} else {
 			logger.Warnf("Update inodes stats: %s", err)
 		}
@@ -1565,7 +1572,7 @@ func (m *kvMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 func (m *kvMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash Ino
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -1751,7 +1758,7 @@ func (m *kvMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		entries = entries[batchSize:]
 		var trash Ino
 		if len(skipCheckTrash) == 0 || !skipCheckTrash[0] {
-			if st := m.checkTrash(parent, &trash); st != 0 {
+			if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 				return st
 			}
 		}
@@ -2031,7 +2038,7 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 		parentLocks = nil // trash parent attributes are not updated, so sibling removals are independent.
 	}
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -2139,7 +2146,7 @@ func (m *kvMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldA
 
 func (m *kvMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode, tInode *Ino, attr, tAttr *Attr) syscall.Errno {
 	var trash Ino
-	if st := m.checkTrash(parentDst, &trash); st != 0 {
+	if st := m.checkTrash(ctx, parentDst, &trash); st != 0 {
 		return st
 	}
 	exchange := flags == RenameExchange
@@ -4437,6 +4444,9 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		if eno := m.Access(ctx, srcIno, MODE_MASK_R, &attr); eno != 0 {
 			return eno
 		}
+		if eno := m.chargeVolume(ctx, ino, align4K(attr.Length), 1); eno != 0 {
+			return eno
+		}
 		attr.Parent = parent
 		now := time.Now()
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
@@ -4594,7 +4604,7 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		}
 	}
 
-	return errno(m.txn(ctx, func(tx *kvTxn) error {
+	err := m.txn(ctx, func(tx *kvTxn) error {
 		now := time.Now()
 		*result = batchCloneResult{deltas: make(ugQuotaDeltas)}
 
@@ -4714,6 +4724,9 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 				Inodes: 1,
 			})
 		}
+		if eno := m.chargeVolume(ctx, cloneInfos[0].dstIno, result.space, result.inodes); eno != 0 {
+			return eno
+		}
 
 		// copy file chunks and update slice refs
 		refCounts := make(map[string]int) // sliceKey -> delta
@@ -4752,7 +4765,12 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		}
 
 		return nil
-	}, dstParent))
+	}, dstParent)
+	if err != nil {
+		return errno(err)
+	}
+	result.chargeKeys = []Ino{cloneInfos[0].dstIno}
+	return 0
 }
 
 func (m *kvMeta) doAttachDirNode(ctx Context, parent Ino, inode Ino, name string) syscall.Errno {

@@ -221,6 +221,9 @@ type batchCloneResult struct {
 	space  int64
 	inodes int64
 	deltas ugQuotaDeltas
+	// chargeKeys name the volume charges of the transactions that committed
+	// (volume_reservation.go). In memory only.
+	chargeKeys []Ino
 }
 
 func ugKey(uid, gid uint32) uint64 {
@@ -307,7 +310,21 @@ type baseMeta struct {
 	fsStatsLock sync.Mutex
 	*fsStat
 
-	parentMu        sync.Mutex        // protect dirParents
+	// volMu guards the volume reservations (volume_reservation.go) and makes
+	// every move between usedSpace, newSpace and the pending claims atomic for
+	// a reservation check. It is a leaf: nothing blocks while holding it.
+	volMu            sync.Mutex
+	pendingSpace     int64
+	pendingInodes    int64
+	unreservedSpace  int64
+	unreservedInodes int64
+	// usedGen advances before every in-memory change that an engine makes to
+	// usedSpace/usedInodes outside refresh and flush. Only Redis does so: its
+	// updateStats adds committed deltas there directly. refreshUsage uses it
+	// to discard a remote read that such a change may have overtaken.
+	usedGen atomic.Uint64
+
+	parentMu       sync.Mutex        // protect dirParents
 	quotaMu         sync.RWMutex      // protect dirQuotas
 	quotasFlushLock sync.Mutex        // prevent concurrent doFlushQuotas
 	dirParents      map[Ino]Ino       // directory inode -> parent inode
@@ -971,16 +988,7 @@ func (m *baseMeta) refresh(ctx Context) {
 			}
 		}
 
-		if v, err := m.en.getCounter(usedSpace); err == nil {
-			atomic.StoreInt64(&m.usedSpace, v)
-		} else {
-			logger.Warnf("Get counter %s: %s", usedSpace, err)
-		}
-		if v, err := m.en.getCounter(totalInodes); err == nil {
-			atomic.StoreInt64(&m.usedInodes, v)
-		} else {
-			logger.Warnf("Get counter %s: %s", totalInodes, err)
-		}
+		m.refreshUsage()
 		m.loadQuotas()
 
 		if m.conf.ReadOnly || m.conf.NoBGJob || m.conf.Heartbeat == 0 {
@@ -991,6 +999,53 @@ func (m *baseMeta) refresh(ctx Context) {
 		} else if ok {
 			go m.CleanStaleSessions(ctx)
 		}
+	}
+}
+
+// refreshUsage reloads the persisted volume counters without ever replacing a
+// newer in-memory value with an older remote one.
+//
+// SQL and KV: committed deltas wait in newSpace and reach the persisted counter
+// and usedSpace only through doFlushStats. fsStatsLock is held from the read
+// to the store, so no flush commits in between (it would move a delta into
+// usedSpace that this store then overwrites). The lock order matches
+// doFlushStats: fsStatsLock, then the engine, then volMu.
+//
+// Redis: a mutation commits its counter increment remotely and then adds the
+// same delta to usedSpace in memory (redisMeta.updateStats). If the remote
+// read precedes the commit and the in-memory add precedes the store, storing
+// the read loses the delta until the next heartbeat. updateStats advances
+// usedGen before its add; the store is skipped if usedGen moved since before
+// the read, and is a compare-and-swap against the value loaded after it, so an
+// add that lands between that load and the store fails the swap. Every
+// interleaving then either keeps the in-memory value or stores a read that
+// already includes the delta; at worst a delta read remotely is also added
+// afterwards, a transient overcount the next refresh corrects. A skipped
+// refresh is retried at the next heartbeat.
+func (m *baseMeta) refreshUsage() {
+	m.fsStatsLock.Lock()
+	defer m.fsStatsLock.Unlock()
+	gen := m.usedGen.Load()
+	used, usedErr := m.en.getCounter(usedSpace)
+	inodes, inodesErr := m.en.getCounter(totalInodes)
+	runVolumeTestHook(&refreshUsageTestHook)
+	m.volMu.Lock()
+	curUsed, curInodes := atomic.LoadInt64(&m.usedSpace), atomic.LoadInt64(&m.usedInodes)
+	if m.usedGen.Load() == gen {
+		runVolumeTestHook(&refreshStoreTestHook)
+		if usedErr == nil {
+			atomic.CompareAndSwapInt64(&m.usedSpace, curUsed, used)
+		}
+		if inodesErr == nil {
+			atomic.CompareAndSwapInt64(&m.usedInodes, curInodes, inodes)
+		}
+	}
+	m.volMu.Unlock()
+	if usedErr != nil {
+		logger.Warnf("Get counter %s: %s", usedSpace, usedErr)
+	}
+	if inodesErr != nil {
+		logger.Warnf("Get counter %s: %s", totalInodes, inodesErr)
 	}
 }
 
@@ -1700,7 +1755,7 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 	attr.Full = true
 	st := m.en.doMknod(ctx, parent, name, _type, mode, cumask, path, inode, attr)
 	if st == 0 {
-		m.en.updateStats(space, inodes)
+		m.commitVolume(ctx, nil, space, inodes)
 		m.updateDirStat(ctx, parent, 0, space, inodes)
 		m.updateDirQuota(ctx, parent, space, inodes)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, space, inodes)
@@ -1923,8 +1978,14 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	}
 	var r batchCloneResult
 	st := m.en.doBatchClone(ctx, srcParent, dstParent, entries, cmode, cumask, &r)
+	if st != 0 && len(r.chargeKeys) > 0 && volumeReservationFrom(ctx) != nil {
+		// Redis commits a large batch in several transactions. Count the ones
+		// that committed before the failure so their charges are not released
+		// as if nothing had been written.
+		m.commitVolume(ctx, r.chargeKeys, r.space, r.inodes)
+	}
 	if st == 0 {
-		m.en.updateStats(r.space, r.inodes)
+		m.commitVolume(ctx, r.chargeKeys, r.space, r.inodes)
 		m.updateDirQuota(cloneAccountingContext(ctx), dstParent, r.space, r.inodes)
 		for _, q := range r.deltas {
 			m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
@@ -3094,7 +3155,13 @@ func (m *baseMeta) toTrash(parent Ino) bool {
 	return m.getFormat().TrashDays > 0
 }
 
-func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
+// checkTrash resolves the hourly trash bucket for a deletion from parent,
+// creating it when this is the first deletion of the hour. The new bucket is
+// volume growth (4 KiB and one inode). With a volume reservation in ctx it is
+// claimed against the ceiling first; a refusal is ENOSPC through the volume
+// quota hook, before the caller's own transaction starts, so the caller can
+// wait for a larger grant and retry. The trash is never bypassed.
+func (m *baseMeta) checkTrash(ctx Context, parent Ino, trash *Ino) syscall.Errno {
 	if !m.toTrash(parent) {
 		return 0
 	}
@@ -3109,16 +3176,26 @@ func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
 
 	st := m.en.doLookup(Background(), TrashInode, name, trash, nil)
 	if st == syscall.ENOENT {
-		attr := Attr{Typ: TypeDirectory, Nlink: 2, Length: 4 << 10, Parent: TrashInode, Full: true}
-		st = m.en.doMknod(Background(), TrashInode, name, TypeDirectory, 0555, 0, "", trash, &attr)
-		if st == 0 {
-			m.en.updateStats(align4K(0), 1)
+		claimed := volumeReservationFrom(ctx) != nil
+		if claimed && !m.claimVolumeGrowth(align4K(0), 1) {
+			volumeQuotaTripped(ctx)
+			st = syscall.ENOSPC
+		} else {
+			attr := Attr{Typ: TypeDirectory, Nlink: 2, Length: 4 << 10, Parent: TrashInode, Full: true}
+			st = m.en.doMknod(Background(), TrashInode, name, TypeDirectory, 0555, 0, "", trash, &attr)
+			if claimed {
+				m.settleVolumeGrowth(align4K(0), 1, st == 0)
+			} else if st == 0 {
+				m.en.updateStats(align4K(0), 1)
+			}
 		}
 	}
 
 	m.Lock()
 	if st != 0 && st != syscall.EEXIST {
-		logger.Warnf("create subTrash %s: %s", name, st)
+		if st != syscall.ENOSPC { // a ceiling refusal created nothing
+			logger.Warnf("create subTrash %s: %s", name, st)
+		}
 	} else if *trash <= TrashInode {
 		logger.Warnf("invalid trash inode: %d", *trash)
 		st = syscall.EBADF
@@ -3442,7 +3519,13 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 		return eno
 	}
 	var sum Summary
-	eno = m.GetSummary(ctx, srcIno, &sum, true, false)
+	// With a volume reservation every clone transaction is charged before it
+	// commits, so the preflight claim only decides whether the clone can be
+	// refused up front instead of midway. A strict walk sizes it from the same
+	// attributes the clone transactions copy, rather than from directory
+	// statistics that can drift.
+	strict := volumeReservationFrom(ctx) != nil
+	eno = m.GetSummary(ctx, srcIno, &sum, true, strict)
 	if eno != 0 {
 		return eno
 	}
@@ -3515,7 +3598,7 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	if eno != 0 {
 		return eno
 	}
-	m.en.updateStats(align4K(attr.Length), 1)
+	m.commitVolume(ctx, []Ino{ino}, align4K(attr.Length), 1)
 	atomic.AddUint64(count, 1)
 	m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, align4K(attr.Length), 1)
 	if attr.Typ != TypeDirectory {
