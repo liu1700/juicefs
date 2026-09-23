@@ -35,17 +35,13 @@ type volresEngine struct {
 	open  func(t *testing.T) (Meta, error)
 }
 
-var volresEngines = []volresEngine{
-	{name: "sqlite3", open: func(t *testing.T) (Meta, error) {
-		return newSQLMeta("sqlite3", filepath.Join(t.TempDir(), "volres.db"), testConfig())
-	}},
-	{name: "memkv", reset: true, open: func(t *testing.T) (Meta, error) {
-		return newKVMeta("memkv", "jfs-volres", testConfig())
-	}},
-	{name: "redis", reset: true, open: func(t *testing.T) (Meta, error) {
-		return newRedisMeta("redis", "127.0.0.1:6379/8", testConfig())
-	}},
-}
+var volresSQLiteEngine = volresEngine{name: "sqlite3", open: func(t *testing.T) (Meta, error) {
+	return newSQLMeta("sqlite3", filepath.Join(t.TempDir(), "volres.db"), testConfig())
+}}
+
+var volresRedisEngine = volresEngine{name: "redis", reset: true, open: func(t *testing.T) (Meta, error) {
+	return newRedisMeta("redis", "127.0.0.1:6379/8", testConfig())
+}}
 
 // volresOpen formats a volume and loads its counters without starting a
 // session, so no background flush or refresh interleaves with a scenario.
@@ -510,7 +506,7 @@ func TestVolumeReservationCanceledCloneReleasesClaim(t *testing.T) {
 // own claim (no self refusal), a retried transaction replaces its own charge,
 // separate calls add up, and release returns everything.
 func TestVolumeReservationLedgerRules(t *testing.T) {
-	_, b := volresOpen(t, volresEngines[0], volresCapacity, 0)
+	_, b := volresOpen(t, volresSQLiteEngine, volresCapacity, 0)
 	free := int64(volresCapacity) - volresClaimed(b)
 
 	one := newVolumeReservation()
@@ -684,7 +680,7 @@ func TestVolumeReservationRedisRefreshDoesNotDoubleCountRemoteCommit(t *testing.
 	for _, delta := range []int64{4096, -4096} {
 		for _, guarded := range []bool{false, true} {
 			t.Run(fmt.Sprintf("delta=%d/guarded=%t", delta, guarded), func(t *testing.T) {
-				m, b := volresOpen(t, volresEngines[2], volresCapacity, 0)
+				m, b := volresOpen(t, volresRedisEngine, volresCapacity, 0)
 				volresNode(t, m, RootInode, "existing", TypeFile)
 				before := volresClaimed(b)
 				b.enableSingleWriterCounters(guarded)
@@ -712,7 +708,7 @@ func TestVolumeReservationRedisRefreshDoesNotDoubleCountRemoteCommit(t *testing.
 
 // Growth committed after an old remote read cannot be lost in strict mode.
 func TestVolumeReservationRedisKeepsLocalCommit(t *testing.T) {
-	m, b := volresOpen(t, volresEngines[2], volresCapacity, 0)
+	m, b := volresOpen(t, volresRedisEngine, volresCapacity, 0)
 	b.enableSingleWriterCounters(true)
 	before := volresClaimed(b)
 	ctx := volresCtx(true)
@@ -800,7 +796,7 @@ func TestVolumeReservationClaimsTheTrashBucket(t *testing.T) {
 }
 
 func TestVolumeReservationRedisFailedDetachedCleanupKeepsUsage(t *testing.T) {
-	m, b := volresOpen(t, volresEngines[2], volresCapacity, 0)
+	m, b := volresOpen(t, volresRedisEngine, volresCapacity, 0)
 	r := m.(*redisMeta)
 	ino := volresNode(t, m, RootInode, "detached", TypeDirectory)
 	if err := r.rdb.HDel(Background(), r.entryKey(RootInode), "detached").Err(); err != nil {
