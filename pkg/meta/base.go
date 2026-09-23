@@ -321,6 +321,14 @@ type baseMeta struct {
 	// singleWriterRedis keeps the startup baseline plus local committed deltas.
 	// Guarded by fsStatsLock; enabled before the admission wrapper serves calls.
 	singleWriterRedis bool
+	// sliceData selects QuotaBasisSliceData (volume_reservation.go). It is set
+	// once, before the mount serves, and never cleared.
+	sliceData atomic.Bool
+	// dataSpace is the committed slice data in slice_data mode: the recount at
+	// open plus every committed change since. It is changed only under volMu
+	// and never reread from the engine while the mount runs, because this
+	// process is the only writer.
+	dataSpace atomic.Int64
 
 	parentMu        sync.Mutex        // protect dirParents
 	quotaMu         sync.RWMutex      // protect dirQuotas
@@ -1282,6 +1290,11 @@ func (m *baseMeta) statRootFs(ctx Context, totalspace, availspace, iused, iavail
 
 	used += atomic.LoadInt64(&m.newSpace)
 	inodes += atomic.LoadInt64(&m.newInodes)
+	if m.sliceData.Load() {
+		// df reports the number the byte ceiling is compared against, so avail
+		// is what a write can still be admitted for.
+		used = m.dataSpace.Load()
+	}
 	if used < 0 {
 		used = 0
 	}
@@ -2292,6 +2305,10 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 	var attr Attr
 	st := m.en.doWrite(ctx, inode, indx, off, slice, mtime, &numSlices, &delta, &attr)
 	if st == 0 {
+		if m.sliceData.Load() {
+			// The write inserted one chunk_ref row with refs 1 (doWrite).
+			m.commitVolumeData(ctx, int64(slice.Size))
+		}
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
 		if numSlices%100 == 99 || numSlices > 350 {

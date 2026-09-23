@@ -49,10 +49,76 @@ type ploriAdmissionMeta struct {
 }
 
 // PloriWithQuotaAdmission decorates the metadata client used by one mount.
-// Nil admission preserves the ordinary JuiceFS ENOSPC behavior.
+// Nil admission preserves the ordinary JuiceFS ENOSPC behavior. The volume
+// byte ceiling keeps the logical basis.
 func PloriWithQuotaAdmission(m Meta) Meta {
 	m.getBase().enableSingleWriterCounters(m.Name() == "redis")
 	return &ploriAdmissionMeta{Meta: m}
+}
+
+// ploriDataSpaceDrift is the recount minus the persisted ploriDataSpace row at
+// the last slice_data open of this process, 0 when the row did not exist yet.
+// A non-zero value after a clean stop means a reference path changed refs
+// without the counter (plori_data_space.go).
+var ploriDataSpaceDrift atomic.Int64
+
+// PloriDataSpaceDrift is the drift found by the last slice_data recount in
+// this process. The mount exports it as a gauge.
+func PloriDataSpaceDrift() int64 { return ploriDataSpaceDrift.Load() }
+
+// PloriWithQuotaBasis is PloriWithQuotaAdmission with the quota basis the
+// mount options name (QuotaBasisLogical or QuotaBasisSliceData; empty means
+// logical). slice_data needs the SQL engine; any other engine, and an unknown
+// basis, is an error, so a mount never runs on a basis it was not asked for.
+//
+// For slice_data it recounts the slice data, rewrites the ploriDataSpace row
+// and logs the drift. It must run before NewSession, which starts the
+// background jobs that change slice references.
+func PloriWithQuotaBasis(m Meta, basis string) (Meta, error) {
+	switch basis {
+	case "", QuotaBasisLogical:
+	case QuotaBasisSliceData:
+		en, ok := m.getBase().en.(interface {
+			ploriEnableSliceData() (recount, drift int64, existed bool, err error)
+		})
+		if !ok {
+			return nil, fmt.Errorf("quota basis %s needs the SQL metadata engine, not %s", basis, m.Name())
+		}
+		recount, drift, existed, err := en.ploriEnableSliceData()
+		if err != nil {
+			return nil, fmt.Errorf("recount slice data: %w", err)
+		}
+		ploriDataSpaceDrift.Store(drift)
+		switch {
+		case !existed:
+			logger.Infof("plori: quota basis %s, slice data %d bytes (counter created)", basis, recount)
+		case drift != 0:
+			logger.Warnf("plori: quota basis %s, slice data %d bytes, the persisted counter differed by %d bytes", basis, recount, drift)
+		default:
+			logger.Infof("plori: quota basis %s, slice data %d bytes, no drift", basis, recount)
+		}
+	default:
+		return nil, fmt.Errorf("unknown quota basis %q", basis)
+	}
+	return PloriWithQuotaAdmission(m), nil
+}
+
+// PloriQuotaBasis is the basis the volume byte ceiling of m is compared
+// against: QuotaBasisSliceData after PloriWithQuotaBasis enabled it, else
+// QuotaBasisLogical. StatFS reports used space on the same basis.
+func PloriQuotaBasis(m Meta) string {
+	if m.getBase().sliceData.Load() {
+		return QuotaBasisSliceData
+	}
+	return QuotaBasisLogical
+}
+
+// PloriLogicalBytes is the logical used space (usedSpace plus the unflushed
+// delta) from this process's counters, whatever the basis. In logical mode it
+// is the number StatFS reports once the counters are loaded.
+func PloriLogicalBytes(m Meta) int64 {
+	b := m.getBase()
+	return atomic.LoadInt64(&b.usedSpace) + atomic.LoadInt64(&b.newSpace)
 }
 
 func PloriSetQuotaAdmission(m Meta, a PloriQuotaAdmission) {

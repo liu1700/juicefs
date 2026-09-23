@@ -892,3 +892,272 @@ func TestVolumeReservationRedisFailedDetachedCleanupKeepsUsage(t *testing.T) {
 		t.Fatalf("replayed cleanup usage=%d want=%d", got, before-4096)
 	}
 }
+
+// The slice_data cases below run on SQLite only: the basis is kept by the SQL
+// engine (plori_data_space.go). The byte ceiling is compared with the slice
+// data, and only Write claims bytes.
+
+// dsWriteHook pauses a write after its transaction committed and before
+// baseMeta.Write counts it.
+type dsWriteHook struct {
+	engine
+	afterWrite func(ino Ino)
+}
+
+func (e *dsWriteHook) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	st := e.engine.doWrite(ctx, inode, indx, off, slice, mtime, numSlices, delta, attr)
+	if st == 0 && e.afterWrite != nil {
+		e.afterWrite(inode)
+	}
+	return st
+}
+
+func dsArms(t *testing.T, run func(t *testing.T, reserved bool)) {
+	for _, reserved := range []bool{false, true} {
+		arm := "control"
+		if reserved {
+			arm = "reserved"
+		}
+		t.Run(arm, func(t *testing.T) { run(t, reserved) })
+	}
+}
+
+// The ceiling is inclusive, and an overwrite inside the file length is
+// admitted against the size of the slice it stores.
+func TestVolumeReservationSliceDataAllowsExactCapacity(t *testing.T) {
+	dsArms(t, func(t *testing.T, reserved bool) {
+		m, _ := dsOpen(t, 3*dsMiB, 1<<20, 0)
+		f := dsFile(t, m, RootInode, "f")
+		ctx := volresCtx(reserved)
+		defer volresRelease(m.baseMeta, ctx)
+		if st := dsWrite(m, ctx, f, 0, 2*dsMiB); st != 0 {
+			t.Fatal(st)
+		}
+		volresRelease(m.baseMeta, ctx)
+		if st := dsWrite(m, ctx, f, 0, dsMiB); st != 0 {
+			t.Fatalf("overwrite to the exact ceiling: %s", st)
+		}
+		volresRelease(m.baseMeta, ctx)
+		if used := volresClaimed(m.baseMeta); used != 3*dsMiB {
+			t.Fatalf("used %d, want exact capacity %d", used, 3*dsMiB)
+		}
+		if st := dsWrite(m, ctx, f, 0, 4096); st != syscall.ENOSPC {
+			t.Fatalf("overwrite beyond the ceiling = %s, want ENOSPC", st)
+		}
+		volresRelease(m.baseMeta, ctx)
+		dsCheck(t, m, 3*dsMiB, "after the refusal")
+		if s, i := volresPending(m.baseMeta); s != 0 || i != 0 {
+			t.Fatalf("pending %d/%d", s, i)
+		}
+	})
+}
+
+// A write that committed but is not yet counted stays visible to the next
+// check through its claim. Both writes are overwrites inside the file length,
+// which the logical basis would not charge at all.
+func TestVolumeReservationSliceDataCoversCommittedUncountedWrite(t *testing.T) {
+	dsArms(t, func(t *testing.T, reserved bool) {
+		const capacity = 14 * dsMiB
+		m, _ := dsOpen(t, capacity, 1<<20, 0)
+		a := dsFile(t, m, RootInode, "a")
+		b := dsFile(t, m, RootInode, "b")
+		dsMustWrite(t, m, a, 0, 4*dsMiB)
+		dsMustWrite(t, m, b, 0, 4*dsMiB)
+
+		committed, resume := make(chan struct{}), make(chan struct{})
+		var paused atomic.Bool
+		h := &dsWriteHook{afterWrite: func(ino Ino) {
+			if ino == a && paused.CompareAndSwap(false, true) {
+				close(committed)
+				<-resume
+			}
+		}}
+		old := m.en
+		h.engine = old
+		m.en = h
+		t.Cleanup(func() { m.en = old })
+
+		ctxA, ctxB := volresCtx(reserved), volresCtx(reserved)
+		done := make(chan syscall.Errno, 1)
+		go func() { done <- dsWrite(m, ctxA, a, 0, 4*dsMiB) }()
+		<-committed
+		stB := dsWrite(m, ctxB, b, 0, 4*dsMiB)
+		close(resume)
+		if st := <-done; st != 0 {
+			t.Fatalf("first overwrite: %s", st)
+		}
+		volresRelease(m.baseMeta, ctxA, ctxB)
+		used := dsCheck(t, m, -1, "after both writes")
+		if !reserved {
+			if stB != 0 || used <= capacity {
+				t.Fatalf("control arm did not reach the window: second=%s used=%d", stB, used)
+			}
+			return
+		}
+		if stB != syscall.ENOSPC {
+			t.Fatalf("second overwrite = %s, want ENOSPC", stB)
+		}
+		if used > capacity {
+			t.Fatalf("slice data %d exceeds capacity %d", used, capacity)
+		}
+		if s, i := volresPending(m.baseMeta); s != 0 || i != 0 {
+			t.Fatalf("pending after release = %d/%d", s, i)
+		}
+	})
+}
+
+// The logical flush moves newSpace into usedSpace; the slice_data claim total
+// does not move with it.
+func TestVolumeReservationSliceDataFlushKeepsTheDataBasis(t *testing.T) {
+	m, _ := dsOpen(t, 64*dsMiB, 1<<20, 0)
+	dsMustWrite(t, m, dsFile(t, m, RootInode, "f"), 0, 5*dsMiB)
+	if got := volresClaimed(m.baseMeta); got != 5*dsMiB {
+		t.Fatalf("claimed %d before the flush, want %d", got, 5*dsMiB)
+	}
+	if atomic.LoadInt64(&m.newSpace) == 0 {
+		t.Fatal("setup: nothing to flush")
+	}
+	m.doFlushStats()
+	if atomic.LoadInt64(&m.newSpace) != 0 {
+		t.Fatal("flush left newSpace")
+	}
+	if got := volresClaimed(m.baseMeta); got != 5*dsMiB {
+		t.Fatalf("claimed %d after the flush, want %d", got, 5*dsMiB)
+	}
+	dsCheck(t, m, 5*dsMiB, "after the flush")
+}
+
+// A clone of a tree larger than the free space is admitted and charges no
+// bytes; its inodes are still charged per copy.
+func TestVolumeReservationSliceDataCloneLargerThanFreeSpace(t *testing.T) {
+	dsArms(t, func(t *testing.T, reserved bool) {
+		const capacity = 12 * dsMiB
+		m, _ := dsOpen(t, capacity, 1<<20, 0)
+		src := dsDir(t, m, RootInode, "src")
+		dsMustWrite(t, m, dsFile(t, m, src, "f"), 0, 8*dsMiB)
+		_, inodesBefore := m.volumeClaimed()
+		for i := 0; i < 3; i++ {
+			ctx := volresCtx(reserved)
+			if st := dsClone(m, ctx, RootInode, src, fmt.Sprintf("copy%d", i)); st != 0 {
+				t.Fatalf("clone %d of 8 MiB with 4 MiB free: %s", i, st)
+			}
+			volresRelease(m.baseMeta, ctx)
+		}
+		space, inodes := m.volumeClaimed()
+		if space != 8*dsMiB {
+			t.Fatalf("claimed %d after three clones, want %d", space, 8*dsMiB)
+		}
+		if inodes != inodesBefore+6 {
+			t.Fatalf("inodes %d after three clones of two entries, want %d", inodes, inodesBefore+6)
+		}
+		if logical := dsLogical(m); logical <= capacity {
+			t.Fatalf("logical counter %d, want above the ceiling %d", logical, capacity)
+		}
+		if s, i := volresPending(m.baseMeta); s != 0 || i != 0 {
+			t.Fatalf("pending %d/%d", s, i)
+		}
+		dsCheck(t, m, 8*dsMiB, "after the clones")
+	})
+}
+
+// The inode ceiling still refuses a clone in slice_data mode.
+func TestVolumeReservationSliceDataCloneNearInodeCeiling(t *testing.T) {
+	dsArms(t, func(t *testing.T, reserved bool) {
+		m, _ := dsOpen(t, 64*dsMiB, 1<<20, 0)
+		src := dsDir(t, m, RootInode, "src")
+		for i := 0; i < 3; i++ {
+			dsMustWrite(t, m, dsFile(t, m, src, fmt.Sprintf("f%d", i)), 0, 4096)
+		}
+		_, used := m.volumeClaimed()
+		f := *m.getFormat()
+		f.Inodes = uint64(used + 3) // the clone needs 4
+		m.setFormat(&f)
+		trips := volresCountTrips(t)
+		ctx := volresCtx(reserved)
+		if st := dsClone(m, ctx, RootInode, src, "copy"); st != syscall.ENOSPC {
+			t.Fatalf("clone past the inode ceiling = %s, want ENOSPC", st)
+		}
+		volresRelease(m.baseMeta, ctx)
+		if trips.Load() != 1 {
+			t.Fatalf("volume quota trips %d, want 1", trips.Load())
+		}
+		if _, inodes := m.volumeClaimed(); inodes != used {
+			t.Fatalf("inodes %d after the refusal, want %d", inodes, used)
+		}
+		if s, i := volresPending(m.baseMeta); s != 0 || i != 0 {
+			t.Fatalf("pending %d/%d", s, i)
+		}
+	})
+}
+
+// A canceled clone releases its inode claim and adds no slice data.
+func TestVolumeReservationSliceDataCanceledCloneReleasesClaim(t *testing.T) {
+	m, _ := dsOpen(t, 64*dsMiB, 1<<20, 0)
+	src := dsDir(t, m, RootInode, "src")
+	dsMustWrite(t, m, dsFile(t, m, src, "f"), 0, dsMiB)
+	ctx := volresCtx(true)
+	volresInstall(t, m.baseMeta, &volresHook{beforeCloneEntry: func(top bool) {
+		if top {
+			ctx.Cancel()
+		}
+	}})
+	space, inodes := m.volumeClaimed()
+	if st := dsClone(m, ctx, RootInode, src, "dst"); st != syscall.EINTR {
+		t.Fatalf("canceled clone = %s, want EINTR", st)
+	}
+	volresRelease(m.baseMeta, ctx)
+	if s, i := volresPending(m.baseMeta); s != 0 || i != 0 {
+		t.Fatalf("pending after canceled clone = %d/%d", s, i)
+	}
+	if s, i := m.volumeClaimed(); s != space || i != inodes {
+		t.Fatalf("claimed %d/%d after canceled clone, want %d/%d", s, i, space, inodes)
+	}
+	dsCheck(t, m, dsMiB, "after the canceled clone")
+}
+
+// Concurrent writes near the ceiling admit at most the capacity. Run with
+// -race.
+func TestVolumeReservationSliceDataConcurrentWritesStayUnderCapacity(t *testing.T) {
+	const (
+		writers = 16
+		size    = dsMiB
+		fit     = 5
+	)
+	capacity := uint64(fit*size + size/2)
+	m, _ := dsOpen(t, capacity, 1<<20, 0)
+	files := make([]Ino, writers)
+	for i := range files {
+		files[i] = dsFile(t, m, RootInode, fmt.Sprintf("f%d", i))
+	}
+	start := make(chan struct{})
+	results := make(chan syscall.Errno, writers)
+	for i := 0; i < writers; i++ {
+		go func(ino Ino) {
+			ctx := volresCtx(true)
+			<-start
+			st := dsWrite(m, ctx, ino, 0, size)
+			volresRelease(m.baseMeta, ctx)
+			results <- st
+		}(files[i])
+	}
+	close(start)
+	var admitted int
+	for i := 0; i < writers; i++ {
+		switch st := <-results; st {
+		case 0:
+			admitted++
+		case syscall.ENOSPC:
+		default:
+			t.Fatalf("write: %s", st)
+		}
+	}
+	if admitted != fit {
+		t.Fatalf("admitted %d writes of %d bytes under %d, want %d", admitted, size, capacity, fit)
+	}
+	if used := dsCheck(t, m, fit*size, "after the concurrent writes"); uint64(used) > capacity {
+		t.Fatalf("slice data %d exceeds capacity %d", used, capacity)
+	}
+	if s, i := volresPending(m.baseMeta); s != 0 || i != 0 {
+		t.Fatalf("pending %d/%d", s, i)
+	}
+}

@@ -668,3 +668,145 @@ func TestPloriAdmissionRemoveStopsForACanceledCaller(t *testing.T) {
 		t.Fatalf("pending after canceled remove = %d/%d", s, i)
 	}
 }
+
+// openSliceDataVolume creates a SQLite volume and opens it the way
+// plori-mount's Serve does: PloriWithQuotaBasis before NewSession.
+func openSliceDataVolume(t *testing.T, capacity, inodes uint64) (*dbMeta, Meta) {
+	t.Helper()
+	m, err := newSQLMeta("sqlite3", filepath.Join(t.TempDir(), "slicedata.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	t.Cleanup(func() { _ = m.Shutdown() })
+	format := testFormat()
+	format.Capacity = capacity
+	format.Inodes = inodes
+	if err := m.Init(format, true); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+	w, err := PloriWithQuotaBasis(m, QuotaBasisSliceData)
+	if err != nil {
+		t.Fatalf("slice_data basis: %s", err)
+	}
+	if err := m.NewSession(true); err != nil {
+		t.Fatalf("open session: %s", err)
+	}
+	return m.(*dbMeta), w
+}
+
+// An overwrite inside the file length is refused at the ceiling in
+// slice_data mode, waits for a grant and is retried once.
+func TestPloriQuotaSliceDataAdmissionRetriesARefusedOverwrite(t *testing.T) {
+	m, w := openSliceDataVolume(t, 64<<20, 65536)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	f := dsFile(t, w, RootInode, "f")
+	if st := dsWrite(w, Background(), f, 0, 4<<20); st != 0 {
+		t.Fatal(st)
+	}
+	ploriGrantExactly(t, m, 0)
+	var attr Attr
+	if st := m.GetAttr(Background(), f, &attr); st != 0 || attr.Length != 4<<20 {
+		t.Fatalf("setup: getattr %s length %d", st, attr.Length)
+	}
+	if st := dsWrite(w, Background(), f, 0, 1<<20); st != 0 {
+		t.Fatalf("overwrite after admission = %s", st)
+	}
+	if got := a.calls.Load(); got != 1 {
+		t.Fatalf("admission calls = %d, want 1", got)
+	}
+	if got := m.dataSpace.Load(); got != 5<<20 {
+		t.Fatalf("slice data %d, want %d", got, 5<<20)
+	}
+	if s, i := ploriPending(m); s != 0 || i != 0 {
+		t.Fatalf("pending after the call = %d/%d", s, i)
+	}
+}
+
+// The 80 percent trigger reads the slice data. Clones push the logical
+// counter far past the ceiling without a prefetch; a write that takes the
+// slice data past 80 percent prefetches.
+func TestPloriQuotaSliceDataPrefetchUsesDataBytes(t *testing.T) {
+	const capacity = 10 << 20
+	m, w := openSliceDataVolume(t, capacity, 65536)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	f := dsFile(t, w, RootInode, "f")
+	if st := dsWrite(w, Background(), f, 0, 4<<20); st != 0 {
+		t.Fatal(st)
+	}
+	for i := 0; i < 5; i++ {
+		if st := dsClone(w, Background(), RootInode, f, "copy"+string(rune('a'+i))); st != 0 {
+			t.Fatalf("clone %d: %s", i, st)
+		}
+	}
+	if logical := PloriLogicalBytes(w); logical <= capacity {
+		t.Fatalf("setup: logical %d, want above the ceiling %d", logical, capacity)
+	}
+	if got := a.prefetches.Load(); got != 0 {
+		t.Fatalf("prefetch below 80 percent of slice data: %d", got)
+	}
+	g := dsFile(t, w, RootInode, "g")
+	if st := dsWrite(w, Background(), g, 0, 4<<20+512<<10); st != 0 {
+		t.Fatal(st)
+	}
+	if got := a.prefetches.Load(); got != 1 {
+		t.Fatalf("prefetch at 80 percent of slice data: %d", got)
+	}
+	if got := a.calls.Load(); got != 0 {
+		t.Fatalf("a successful operation waited for admission: %d", got)
+	}
+}
+
+func TestPloriQuotaBasisSelection(t *testing.T) {
+	for _, basis := range []string{"", QuotaBasisLogical} {
+		m, _ := openQuotaVolume(t, 8<<20, 1024)
+		w, err := PloriWithQuotaBasis(m, basis)
+		if err != nil || PloriQuotaBasis(w) != QuotaBasisLogical {
+			t.Fatalf("basis %q: %v, reported %s", basis, err, PloriQuotaBasis(w))
+		}
+	}
+	m, _ := openQuotaVolume(t, 8<<20, 1024)
+	if _, err := PloriWithQuotaBasis(m, "bogus"); err == nil {
+		t.Fatal("an unknown basis was accepted")
+	}
+	if PloriQuotaBasis(m) != QuotaBasisLogical {
+		t.Fatal("a refused basis changed the mode")
+	}
+	_, w := openSliceDataVolume(t, 8<<20, 1024)
+	if PloriQuotaBasis(w) != QuotaBasisSliceData || PloriDataSpaceDrift() != 0 {
+		t.Fatalf("slice_data mount reports basis %s drift %d", PloriQuotaBasis(w), PloriDataSpaceDrift())
+	}
+	f := dsFile(t, w, RootInode, "f")
+	if st := dsWrite(w, Background(), f, 0, 1<<20); st != 0 {
+		t.Fatal(st)
+	}
+	if st := dsClone(w, Background(), RootInode, f, "g"); st != 0 {
+		t.Fatal(st)
+	}
+	var total, avail, iused, iavail uint64
+	if st := w.StatFS(Background(), RootInode, &total, &avail, &iused, &iavail); st != 0 {
+		t.Fatal(st)
+	}
+	if used := total - avail; used != 1<<20 {
+		t.Fatalf("StatFS used %d, want the slice data %d", used, 1<<20)
+	}
+	if logical := PloriLogicalBytes(w); logical < 2<<20 {
+		t.Fatalf("logical bytes %d, want both copies", logical)
+	}
+}
+
+// slice_data is kept by the SQL engine only; any other engine fails the mount.
+func TestPloriQuotaBasisRefusesRedis(t *testing.T) {
+	m, err := newRedisMeta("redis", "127.0.0.1:6379/8", testConfig())
+	if err != nil {
+		t.Fatalf("create redis meta: %s", err)
+	}
+	t.Cleanup(func() { _ = m.Shutdown() })
+	if _, err := PloriWithQuotaBasis(m, QuotaBasisSliceData); err == nil {
+		t.Fatal("slice_data was accepted on redis")
+	}
+	if PloriQuotaBasis(m) != QuotaBasisLogical {
+		t.Fatal("a refused basis changed the mode")
+	}
+}

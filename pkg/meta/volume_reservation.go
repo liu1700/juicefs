@@ -85,13 +85,85 @@ func positivePart(v int64) int64 {
 	return 0
 }
 
+// Quota bases: what the volume byte ceiling (Format.Capacity) is compared
+// against. A mount chooses one before it serves (PloriWithQuotaBasis).
+//
+// QuotaBasisLogical is the upstream rule: the sum of every inode's length
+// rounded up to 4 KiB, plus 4 KiB per directory, symlink and empty file
+// (usedSpace). A native clone adds the full length of the cloned tree.
+//
+// QuotaBasisSliceData is the stored slice data: the sum of chunk_ref.size over
+// the rows whose refs is above zero (dataSpace). A slice shared by any number
+// of files counts once, and only a Write adds new slice data. It is kept by the
+// SQL engine only. The logical counters are still maintained in this mode, so
+// a later mount in logical mode reads a correct usedSpace.
+const (
+	QuotaBasisLogical   = "logical"
+	QuotaBasisSliceData = "slice_data"
+)
+
+// volumeBytes is the part of a logical space amount that the volume byte
+// ceiling counts. In slice_data mode a logical amount (file length growth, a
+// new inode's 4 KiB, a cloned tree) adds no slice data, so it claims nothing;
+// only Write claims bytes, through checkQuotaData.
+func (m *baseMeta) volumeBytes(space int64) int64 {
+	if m.sliceData.Load() {
+		return 0
+	}
+	return space
+}
+
+// committedSpace is the committed usage the byte ceiling is compared against.
+// It reads atomics only; a caller that compares it with the outstanding claims
+// holds volMu, so no committed amount moves between the two.
+func (m *baseMeta) committedSpace() int64 {
+	if m.sliceData.Load() {
+		return m.dataSpace.Load()
+	}
+	return atomic.LoadInt64(&m.usedSpace) + atomic.LoadInt64(&m.newSpace)
+}
+
+// applyDataSpace counts a committed change of the ploriDataSpace counter row
+// in memory. Paths that change slice references without a volume reservation
+// (deletion, delayed-slice cleanup, compaction, clone and copy_file_range,
+// whose reference changes normally cross no zero) call it after their
+// transaction has committed.
+func (m *baseMeta) applyDataSpace(delta int64) {
+	if delta == 0 {
+		return
+	}
+	m.volMu.Lock()
+	m.dataSpace.Add(delta)
+	m.volMu.Unlock()
+}
+
+// commitVolumeData counts the slice data a committed Write inserted. With a
+// reservation it converts the call's claim into dataSpace in the same critical
+// section, so a check never sees the amount in neither place. It is used only
+// in slice_data mode.
+func (m *baseMeta) commitVolumeData(ctx Context, data int64) {
+	r := volumeReservationFrom(ctx)
+	m.volMu.Lock()
+	defer m.volMu.Unlock()
+	m.dataSpace.Add(data)
+	if r == nil {
+		return
+	}
+	if rest := positivePart(data); rest > 0 {
+		covered := min(rest, r.space)
+		r.space -= covered
+		m.pendingSpace -= covered
+		m.unreservedSpace += rest - covered
+	}
+}
+
 // volumeFitsLocked reports whether space and inodes fit under the ceiling
 // after committed usage, unflushed deltas and every outstanding claim.
 // The caller holds volMu.
 func (m *baseMeta) volumeFitsLocked(space, inodes int64) bool {
 	format := m.getFormat()
 	if space > 0 && format.Capacity > 0 &&
-		atomic.LoadInt64(&m.usedSpace)+atomic.LoadInt64(&m.newSpace)+m.pendingSpace+space > int64(format.Capacity) {
+		m.committedSpace()+m.pendingSpace+space > int64(format.Capacity) {
 		return false
 	}
 	if inodes > 0 && format.Inodes > 0 &&
@@ -144,7 +216,7 @@ func (m *baseMeta) chargeVolume(ctx Context, key Ino, space, inodes int64) sysca
 	if r == nil {
 		return 0
 	}
-	space, inodes = positivePart(space), positivePart(inodes)
+	space, inodes = positivePart(m.volumeBytes(space)), positivePart(inodes)
 	m.volMu.Lock()
 	defer m.volMu.Unlock()
 	if old, ok := r.charges[key]; ok {
@@ -194,7 +266,7 @@ func (m *baseMeta) commitVolume(ctx Context, keys []Ino, space, inodes int64) {
 	}
 	m.pendingSpace -= chargedSpace
 	m.pendingInodes -= chargedInodes
-	if rest := positivePart(space) - chargedSpace; rest > 0 {
+	if rest := positivePart(m.volumeBytes(space)) - chargedSpace; rest > 0 {
 		covered := min(rest, r.space)
 		r.space -= covered
 		m.pendingSpace -= covered
@@ -225,34 +297,38 @@ func (m *baseMeta) releaseVolumeReservation(r *volumeReservation) {
 
 // claimVolumeGrowth claims growth the engine makes on the call's behalf
 // without a ceiling check of its own, such as a new hourly trash bucket.
-// settleVolumeGrowth must follow once the growth committed or failed.
+// settleVolumeGrowth must follow once the growth committed or failed. space
+// is a logical amount; in slice_data mode it claims no bytes (volumeBytes).
 func (m *baseMeta) claimVolumeGrowth(space, inodes int64) bool {
+	claim := m.volumeBytes(space)
 	m.volMu.Lock()
 	defer m.volMu.Unlock()
-	if !m.volumeFitsLocked(space, inodes) {
+	if !m.volumeFitsLocked(claim, inodes) {
 		return false
 	}
-	m.pendingSpace += space
+	m.pendingSpace += claim
 	m.pendingInodes += inodes
 	return true
 }
 
 func (m *baseMeta) settleVolumeGrowth(space, inodes int64, committed bool) {
+	claim := m.volumeBytes(space)
 	m.volMu.Lock()
 	defer m.volMu.Unlock()
 	if committed {
 		m.en.updateStats(space, inodes)
 	}
-	m.pendingSpace -= space
+	m.pendingSpace -= claim
 	m.pendingInodes -= inodes
 }
 
 // volumeClaimed is committed usage, unflushed deltas and outstanding claims,
-// read as one consistent value.
+// read as one consistent value. In slice_data mode the committed usage is
+// dataSpace.
 func (m *baseMeta) volumeClaimed() (space, inodes int64) {
 	m.volMu.Lock()
 	defer m.volMu.Unlock()
-	space = atomic.LoadInt64(&m.usedSpace) + atomic.LoadInt64(&m.newSpace) + m.pendingSpace
+	space = m.committedSpace() + m.pendingSpace
 	inodes = atomic.LoadInt64(&m.usedInodes) + atomic.LoadInt64(&m.newInodes) + m.pendingInodes
 	return
 }
