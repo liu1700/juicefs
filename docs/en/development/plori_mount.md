@@ -350,10 +350,11 @@ then its timestamp. Without either anchor, it restores the latest transaction.
 Without an explicit prefix, `PriorMetaPrefix` selects the prior generation.
 
 Compaction can make an exact TXID unreachable. In that case, restore tries the
-nearest available transaction boundary at or after the TXID. If that boundary
-cannot be selected or restored, it tries the latest transaction. Subsequent
-repair checks for missing blocks and quarantines affected files. A forward
-restore can include transactions after the recorded durable point.
+nearest available transaction boundary at or after the TXID. If no boundary can
+be selected, or that boundary is also unreachable, it tries the latest
+transaction. Other restore failures stop recovery. Subsequent repair checks for
+missing blocks and quarantines affected files. A forward restore can include
+transactions after the recorded durable point.
 
 ## Lifecycle limits
 
