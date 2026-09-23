@@ -102,8 +102,13 @@ func TestWorkspaceControlRootPeerStrictBarrierWire(t *testing.T) {
 		t.Skip("requires root peer credentials; run the compiled test binary with sudo -n")
 	}
 	socket := workspaceControlRootSocket(t)
-	identity := workspaceControlIdentity()
-	server, err := newWorkspaceControlServer(context.Background(), socket, identity, func() bool { return true })
+	sup := newWorkspaceControlSupervisor(t, healthyVolume())
+	sup.Spec = bootstrapSpec()
+	if err := sup.identityMatches(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	identity := gatewaycontrol.Identity{StorageVolumeID: sup.Spec.StorageVolumeID, FormatUUID: sup.vol.Identity().UUID, Generation: int64(sup.Spec.Generation), FenceEpoch: sup.Spec.FenceEpoch}
+	server, err := newWorkspaceControlServer(context.Background(), socket, sup.workspaceIdentity(), func() bool { return true })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +149,8 @@ func TestWorkspaceControlRootPeerStrictBarrierWire(t *testing.T) {
 		t.Fatalf("response = %+v", got)
 	}
 
-	response, err = workspaceControlClient(socket).Post("http://workspace"+gatewaycontrol.BarrierRoute, "application/json", bytes.NewBufferString(`{"storage_volume_id":"vol-1","format_uuid":"12345678-1234-4234-8234-123456789abc","generation":3,"fence_epoch":7,"extra":true}`))
+	unknownField := append(append([]byte(nil), body[:len(body)-1]...), []byte(`,"extra":true}`)...)
+	response, err = workspaceControlClient(socket).Post("http://workspace"+gatewaycontrol.BarrierRoute, "application/json", bytes.NewReader(unknownField))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,6 +279,73 @@ func newWorkspaceControlSupervisor(t *testing.T, volume Volume) *Supervisor {
 	sup.vol = volume
 	sup.deadline = NewDeadline(spec.LeaseExpiresAt, spec.WriteStopMargin.D(), time.Now())
 	return sup
+}
+
+func TestWorkspaceControlUsesVerifiedMountedIdentity(t *testing.T) {
+	for _, fresh := range []bool{true, false} {
+		name := "restored"
+		if fresh {
+			name = "fresh"
+		}
+		t.Run(name, func(t *testing.T) {
+			volume := &workspaceControlVolume{fakeVolume: healthyVolume()}
+			volume.barrier = func(context.Context) (BarrierResult, error) {
+				return BarrierResult{LastSuccessfulBarrierUnixMs: time.Now().UnixMilli()}, nil
+			}
+			sup := newWorkspaceControlSupervisor(t, volume)
+			if fresh {
+				sup.Spec = bootstrapSpec()
+			}
+			if err := sup.identityMatches(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			want := gatewaycontrol.Identity{
+				StorageVolumeID: sup.Spec.StorageVolumeID,
+				FormatUUID:      volume.Identity().UUID,
+				Generation:      int64(sup.Spec.Generation),
+				FenceEpoch:      sup.Spec.FenceEpoch,
+			}
+			if got := sup.workspaceIdentity(); got != want {
+				t.Fatalf("private control identity = %+v, want verified mounted identity %+v", got, want)
+			}
+			for _, mutate := range []func(*gatewaycontrol.Identity){
+				func(id *gatewaycontrol.Identity) { id.FormatUUID = "" },
+				func(id *gatewaycontrol.Identity) { id.FormatUUID = "11111111-1111-1111-1111-111111111111" },
+				func(id *gatewaycontrol.Identity) { id.StorageVolumeID = "other-volume" },
+				func(id *gatewaycontrol.Identity) { id.Generation++ },
+				func(id *gatewaycontrol.Identity) { id.FenceEpoch++ },
+			} {
+				wrong := want
+				mutate(&wrong)
+				for _, request := range []workspaceControlRequest{
+					{ctx: context.Background(), barrier: &gatewaycontrol.BarrierRequest{Identity: wrong}},
+					{ctx: context.Background(), clone: &gatewaycontrol.CloneRequest{Identity: wrong}},
+				} {
+					if reply := sup.runWorkspaceControlRequest(context.Background(), request); reply.err == nil {
+						t.Fatalf("accepted wrong identity %+v", wrong)
+					}
+				}
+			}
+			if got := volume.order(); len(got) != 0 {
+				t.Fatalf("refused identities performed work: %v", got)
+			}
+			barrier := sup.runWorkspaceControlRequest(context.Background(), workspaceControlRequest{
+				ctx: context.Background(), barrier: &gatewaycontrol.BarrierRequest{Identity: want},
+			})
+			if barrier.err != nil || barrier.barrier == nil || barrier.barrier.Identity != want {
+				t.Fatalf("mounted identity barrier = %+v", barrier)
+			}
+			clone := sup.runWorkspaceControlRequest(context.Background(), workspaceControlRequest{
+				ctx: context.Background(), clone: &gatewaycontrol.CloneRequest{Identity: want},
+			})
+			if clone.err != nil || clone.clone == nil || clone.clone.Identity != want || !clone.clone.Cloned {
+				t.Fatalf("mounted identity clone = %+v", clone)
+			}
+			if fresh && sup.Spec.FormatUUID != "" {
+				t.Fatal("private control rewrote the original formatting authority")
+			}
+		})
+	}
 }
 
 func TestWorkspaceControlRejectsMismatchedOrExpiredAuthority(t *testing.T) {

@@ -410,10 +410,12 @@ func (s *workspaceControlServer) beginClose() {
 	_ = s.server.Close()
 }
 
+// Startup verifies the mounted identity and acknowledges any fresh format before
+// opening private control. The original formatting spec has no UUID.
 func (s *Supervisor) workspaceIdentity() gatewaycontrol.Identity {
 	return gatewaycontrol.Identity{
 		StorageVolumeID: s.Spec.StorageVolumeID,
-		FormatUUID:      s.Spec.FormatUUID,
+		FormatUUID:      s.vol.Identity().UUID,
 		Generation:      int64(s.Spec.Generation),
 		FenceEpoch:      s.Spec.FenceEpoch,
 	}
