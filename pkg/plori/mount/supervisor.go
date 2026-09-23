@@ -63,8 +63,12 @@ type Deps struct {
 	// compiled in. It is a function rather than a bool so the check is made
 	// against the live vfs package, not against a value someone set.
 	ControlGateInstalled func() bool
-	Now                  func() time.Time
-	Log                  func(event string, kv ...any)
+	// ControlMetrics records the private workspace operations this writer
+	// executes. cmd sets it only for the Workspace gateway writer; nil records
+	// nothing.
+	ControlMetrics *ControlMetrics
+	Now            func() time.Time
+	Log            func(event string, kv ...any)
 }
 
 // Supervisor owns one volume for the lifetime of the process.

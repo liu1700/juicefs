@@ -41,6 +41,16 @@ func registerLitestreamMetricsChild(registry *prometheus.Registry, child func() 
 	}, func() float64 { return float64(child()) }))
 }
 
+// registerControlMetrics exposes the writer's control telemetry on the bare
+// registry before the private socket serves it. A failure leaves the ready
+// sentinel absent, which the Runtime collector reads as no telemetry rather
+// than zeros, and does not stop the mount.
+func registerControlMetrics(registry *prometheus.Registry, m *pmount.ControlMetrics) {
+	if err := m.Register(registry); err != nil {
+		ploriLog("control_metrics_unregistered", "error", err.Error())
+	}
+}
+
 // privateMetricsServer exposes this mount's registry through a state-dir
 // socket. The root supervisor owns the 0700 state directory; mode 0600 keeps
 // the Agent container out even though it shares the network namespace.

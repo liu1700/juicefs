@@ -474,14 +474,35 @@ func workspaceControlRequestContext(parent, request context.Context) (context.Co
 	}
 }
 
-func (s *Supervisor) runWorkspaceControlRequest(parent context.Context, request workspaceControlRequest) workspaceControlReply {
+// WorkspaceControlRefusal is a private workspace operation the writer declined
+// on authority: the request names another writer, the writer no longer holds
+// its lease, or a clone reaches outside the gateway's private trees. The text
+// is the refusal's own message; the type lets the outcome be classified
+// without reading it.
+type WorkspaceControlRefusal string
+
+func (e WorkspaceControlRefusal) Error() string { return string(e) }
+
+const errWorkspaceLeaseExpired = WorkspaceControlRefusal("writer lease expired")
+
+// runWorkspaceControlRequest executes one private request on the serialized
+// barrier lane. Its time and outcome are recorded here, after the queue wait
+// and only for work that reached the lane; a request refused at the socket or
+// behind a busy lane never executed and is not counted.
+func (s *Supervisor) runWorkspaceControlRequest(parent context.Context, request workspaceControlRequest) (reply workspaceControlReply) {
+	if op, ok := request.operation(); ok {
+		start := time.Now()
+		defer func() {
+			s.Deps.ControlMetrics.observeWorkspace(op, workspaceOperationOutcome(reply.err), time.Since(start))
+		}()
+	}
 	ctx, cancel := workspaceControlRequestContext(parent, request.ctx)
 	defer cancel()
 	if !s.workspaceControlRequestMatches(request) {
-		return workspaceControlReply{err: errors.New("workspace control identity does not match the mounted writer")}
+		return workspaceControlReply{err: WorkspaceControlRefusal("workspace control identity does not match the mounted writer")}
 	}
 	if !s.workspaceControlActive() {
-		return workspaceControlReply{err: errors.New("writer lease expired")}
+		return workspaceControlReply{err: errWorkspaceLeaseExpired}
 	}
 	if request.barrier != nil {
 		result, err := s.runPayloadBarrier(ctx)
@@ -493,7 +514,7 @@ func (s *Supervisor) runWorkspaceControlRequest(parent context.Context, request 
 		}
 		if ctx.Err() != nil || !s.workspaceControlActive() {
 			if ctx.Err() == nil {
-				return workspaceControlReply{err: errors.New("writer lease expired")}
+				return workspaceControlReply{err: errWorkspaceLeaseExpired}
 			}
 			return workspaceControlReply{err: ctx.Err()}
 		}
@@ -519,7 +540,7 @@ func (s *Supervisor) runWorkspaceControlRequest(parent context.Context, request 
 				if leaseCtx.Err() != nil {
 					err = leaseCtx.Err()
 				} else {
-					err = errors.New("writer lease expired")
+					err = errWorkspaceLeaseExpired
 				}
 			}
 			return workspaceControlReply{err: err}
@@ -527,6 +548,19 @@ func (s *Supervisor) runWorkspaceControlRequest(parent context.Context, request 
 		return workspaceControlReply{clone: &gatewaycontrol.CloneResponse{Identity: s.workspaceIdentity(), Cloned: true}}
 	}
 	return workspaceControlReply{err: errors.New("unknown workspace control request")}
+}
+
+// operation names the private operation a request asks for; a request that
+// names none executes nothing and is not counted.
+func (r workspaceControlRequest) operation() (workspaceOperation, bool) {
+	switch {
+	case r.barrier != nil:
+		return workspaceBarrier, true
+	case r.clone != nil:
+		return workspaceClone, true
+	default:
+		return 0, false
+	}
 }
 
 func (s *Supervisor) workspaceControlRequestMatches(request workspaceControlRequest) bool {
@@ -562,7 +596,7 @@ func (s *Supervisor) runPayloadBarrier(ctx context.Context) (BarrierResult, erro
 func (s *Supervisor) workspaceControlLeaseContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	budget := s.deadline.RemainingLease(s.now())
 	if budget <= 0 {
-		return nil, nil, errors.New("writer lease expired")
+		return nil, nil, errWorkspaceLeaseExpired
 	}
 	leaseCtx, cancel := context.WithTimeout(ctx, budget)
 	if err := leaseCtx.Err(); err != nil {

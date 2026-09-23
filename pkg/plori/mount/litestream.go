@@ -111,6 +111,11 @@ type Litestream struct {
 	// loopback listener would be reachable from the whole node.
 	MetricsAddr string
 
+	// ControlMetrics records every `/sync` this child is asked for. Only the
+	// Workspace gateway writer sets it, to its own collector; nil records
+	// nothing.
+	ControlMetrics *ControlMetrics
+
 	// child identifies the supervised child for the metrics ownership gauge
 	// (litestream_metrics.go).
 	child litestreamChildState
@@ -594,7 +599,7 @@ type syncResponse struct {
 // SyncAndWait forces a sync and blocks until it completes — the CLI half of
 // DB.SyncAndWait.
 func (l *Litestream) SyncAndWait(ctx context.Context) error {
-	_, err := syncAndWait(ctx, l.SocketPath, l.DBPath)
+	_, err := l.controlSync(ctx, true)
 	return err
 }
 
@@ -609,7 +614,7 @@ func (l *Litestream) SyncAndWait(ctx context.Context) error {
 // reach. Zero means nothing has been replicated yet, and that is reported as
 // no id rather than as transaction zero.
 func (l *Litestream) TxID(ctx context.Context) (string, error) {
-	resp, err := syncAndWait(ctx, l.SocketPath, l.DBPath)
+	resp, err := l.controlSync(ctx, true)
 	if err != nil {
 		return "", err
 	}
@@ -625,19 +630,26 @@ func (l *Litestream) TxID(ctx context.Context) (string, error) {
 // a 200 whose body is not one complete JSON object says nothing about whether
 // the sync behind it finished, and is refused rather than read as done.
 func syncAndWait(ctx context.Context, socketPath, dbPath string) (syncResponse, error) {
-	body, err := litestreamControl(ctx, socketPath, "/sync", map[string]any{
+	resp, _, err := syncAndWaitCall(ctx, socketPath, dbPath)
+	return resp, err
+}
+
+// syncAndWaitCall is syncAndWait with the call's outcome. A 200 whose body does
+// not decode is not an acknowledgement, so it is other, not ok.
+func syncAndWaitCall(ctx context.Context, socketPath, dbPath string) (syncResponse, controlOutcome, error) {
+	body, outcome, err := litestreamControlCall(ctx, ControlCallTimeout, socketPath, "/sync", map[string]any{
 		"path":    dbPath,
 		"wait":    true,
 		"timeout": 30,
 	})
 	if err != nil {
-		return syncResponse{}, err
+		return syncResponse{}, outcome, err
 	}
 	var resp syncResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return syncResponse{}, fmt.Errorf("decode sync response: %w", err)
+		return syncResponse{}, outcomeOther, fmt.Errorf("decode sync response: %w", err)
 	}
-	return resp, nil
+	return resp, outcome, nil
 }
 
 // replicatedTXID is the replica position in `litestream restore -txid` form, or
@@ -649,8 +661,22 @@ func (r syncResponse) replicatedTXID() string {
 	return fmt.Sprintf("%016x", r.ReplicatedTXID)
 }
 
-func (l *Litestream) control(ctx context.Context, route string, body any) ([]byte, error) {
-	return litestreamControl(ctx, l.SocketPath, route, body)
+// controlSync posts one `/sync` on this child's socket, waiting or not, and
+// records it on the writer's ControlMetrics whatever the answer. The elapsed
+// time covers the dial, the headers, the body and, for a waiting sync, the
+// decode that decides whether the answer was whole.
+func (l *Litestream) controlSync(ctx context.Context, wait bool) (syncResponse, error) {
+	start := time.Now()
+	var resp syncResponse
+	var outcome controlOutcome
+	var err error
+	if wait {
+		resp, outcome, err = syncAndWaitCall(ctx, l.SocketPath, l.DBPath)
+	} else {
+		_, outcome, err = litestreamControlCall(ctx, ControlCallTimeout, l.SocketPath, "/sync", map[string]any{"path": l.DBPath, "wait": false})
+	}
+	l.ControlMetrics.observeSync(outcome, time.Since(start))
+	return resp, err
 }
 
 // ControlCallTimeout bounds one control-socket round trip, headers and body
@@ -678,9 +704,18 @@ func litestreamControl(ctx context.Context, socketPath, route string, body any) 
 // a test can show the bound holds for a caller with no deadline of its own
 // without waiting out ControlCallTimeout.
 func litestreamControlWithin(ctx context.Context, limit time.Duration, socketPath, route string, body any) ([]byte, error) {
+	data, _, err := litestreamControlCall(ctx, limit, socketPath, route, body)
+	return data, err
+}
+
+// litestreamControlCall is litestreamControlWithin with the call's outcome,
+// classified here because only here is the bounded context visible: a non-200
+// is refused, an ended bound is deadline or canceled, anything else that
+// failed is other.
+func litestreamControlCall(ctx context.Context, limit time.Duration, socketPath, route string, body any) ([]byte, controlOutcome, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return nil, err
+		return nil, outcomeOther, err
 	}
 	// A request's context covers the dial, the headers and the body read
 	// (net/http NewRequestWithContext), so this one deadline is the whole bound.
@@ -703,12 +738,12 @@ func litestreamControlWithin(ctx context.Context, limit time.Duration, socketPat
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://litestream"+route, strings.NewReader(string(payload)))
 	if err != nil {
-		return nil, err
+		return nil, outcomeOther, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("litestream control %s: %w", route, err)
+		return nil, controlCallOutcome(ctx, err), fmt.Errorf("litestream control %s: %w", route, err)
 	}
 	defer resp.Body.Close()
 	// A body that ends early is an error, not a shorter answer. The read used to
@@ -726,12 +761,12 @@ func litestreamControlWithin(ctx context.Context, limit time.Duration, socketPat
 		if readErr != nil {
 			msg = fmt.Sprintf("%s (response body incomplete: %v)", msg, readErr)
 		}
-		return nil, &controlStatusError{Route: route, Status: resp.StatusCode, Body: msg}
+		return nil, outcomeRefused, &controlStatusError{Route: route, Status: resp.StatusCode, Body: msg}
 	}
 	if readErr != nil {
-		return nil, fmt.Errorf("litestream control %s: read response: %w", route, readErr)
+		return nil, controlCallOutcome(ctx, readErr), fmt.Errorf("litestream control %s: read response: %w", route, readErr)
 	}
-	return data, nil
+	return data, outcomeOK, nil
 }
 
 // controlStatusError is a non-200 from a control socket. The status code is
@@ -831,7 +866,7 @@ func (l *Litestream) Probe(ctx context.Context) error {
 	}
 	probe, cancel := context.WithTimeout(ctx, ProbeTimeout)
 	defer cancel()
-	_, err := l.control(probe, "/sync", map[string]any{"path": l.DBPath, "wait": false})
+	_, err := l.controlSync(probe, false)
 	return err
 }
 

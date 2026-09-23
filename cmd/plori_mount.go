@@ -155,11 +155,18 @@ func ploriMount(c *cli.Context) error {
 		Log: ploriLog,
 	}
 	fs := &ploriFS{paths: paths, credentials: credentials, inPod: mode == mountModeInPod}
+	var controlMetrics *pmount.ControlMetrics
 	if workspaceGateway {
 		// Loopback of the gateway's one trusted container only. Every other
 		// worker keeps Litestream's metrics listener off (litestream.go).
 		ls.MetricsAddr = pmount.WorkspaceLitestreamMetricsAddr
 		fs.litestreamMetricsChild = ls.MetricsChild
+		// This writer's own control telemetry, created before anything calls
+		// the child so no call goes uncounted. The gateway never runs under
+		// --replicator, so no node-level call is attributed to it.
+		controlMetrics = pmount.NewControlMetrics()
+		ls.ControlMetrics = controlMetrics
+		fs.controlMetrics = controlMetrics
 	}
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
@@ -219,6 +226,7 @@ func ploriMount(c *cli.Context) error {
 			Fencer:               fencer,
 			Credentials:          credentials,
 			ControlGateInstalled: vfs.InternalMsgGateInstalled,
+			ControlMetrics:       controlMetrics,
 			Log:                  ploriLog,
 		},
 	}
@@ -339,6 +347,9 @@ type ploriFS struct {
 	// litestreamMetricsChild is set only for the Workspace gateway writer. It
 	// backs pmount.LitestreamMetricsChildGauge on the private metrics socket.
 	litestreamMetricsChild func() uint64
+	// controlMetrics is set only for the Workspace gateway writer, and is
+	// registered on the same private registry.
+	controlMetrics *pmount.ControlMetrics
 }
 
 // metaURI is the local SQLite metadata engine. It is deliberately a plain
@@ -532,6 +543,9 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 	registerer, registry := wrapRegister(c, f.paths.MountPoint, format.Name)
 	if f.inPod && f.litestreamMetricsChild != nil {
 		registerLitestreamMetricsChild(registry, f.litestreamMetricsChild)
+	}
+	if f.inPod && f.controlMetrics != nil {
+		registerControlMetrics(registry, f.controlMetrics)
 	}
 	var metrics *privateMetricsServer
 	if f.inPod {

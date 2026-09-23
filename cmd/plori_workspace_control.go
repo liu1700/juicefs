@@ -29,12 +29,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/plori/gatewaycontrol"
+	pmount "github.com/juicedata/juicefs/pkg/plori/mount"
 )
 
 // CloneTree is the workspace gateway's one metadata mutation endpoint. The
 // supervisor authenticates and fences the request before it reaches this
 // method. This method deliberately accepts only the gateway's private trees;
-// it is not a general metadata or .control operation bridge.
+// it is not a general metadata or .control operation bridge. Leaving those
+// trees or naming another source inode is a typed WorkspaceControlRefusal; a
+// failure of the filesystem's own state is not.
 func (p *ploriVolume) CloneTree(ctx context.Context, req gatewaycontrol.CloneRequest) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -47,7 +50,7 @@ func (p *ploriVolume) CloneTree(ctx context.Context, req gatewaycontrol.CloneReq
 		return err
 	}
 	if req.SourceNativeInode == 0 {
-		return errors.New("workspace clone: source native inode is required")
+		return pmount.WorkspaceControlRefusal("workspace clone: source native inode is required")
 	}
 
 	metaCtx := meta.WrapContext(ctx)
@@ -61,7 +64,7 @@ func (p *ploriVolume) CloneTree(ctx context.Context, req gatewaycontrol.CloneReq
 		return fmt.Errorf("workspace clone: resolve source: %w", err)
 	}
 	if uint64(sourceInode) != req.SourceNativeInode {
-		return errors.New("workspace clone: source native inode differs")
+		return pmount.WorkspaceControlRefusal("workspace clone: source native inode differs")
 	}
 	destinationInode, err := p.workspaceDirectory(metaCtx, destinationParent)
 	if err != nil {
@@ -116,23 +119,23 @@ func (p *ploriVolume) workspaceCloneDestinationAbsent(ctx meta.Context, parent m
 func workspaceClonePaths(source, destination string) ([]string, []string, string, error) {
 	sourceParts, ok := workspaceControlSegments(source)
 	if !ok {
-		return nil, nil, "", errors.New("workspace clone: source path is not canonical")
+		return nil, nil, "", pmount.WorkspaceControlRefusal("workspace clone: source path is not canonical")
 	}
 	switch {
 	case len(sourceParts) == 2 && sourceParts[0] == "copies" && workspaceControlUUID(sourceParts[1]):
 	case len(sourceParts) == 3 && sourceParts[0] == ".plori-gateway" && sourceParts[1] == "revisions" && workspaceControlUUID(sourceParts[2]):
 	default:
-		return nil, nil, "", errors.New("workspace clone: source is outside the allowed trees")
+		return nil, nil, "", pmount.WorkspaceControlRefusal("workspace clone: source is outside the allowed trees")
 	}
 
 	destinationParts, ok := workspaceControlSegments(destination)
 	if !ok || len(destinationParts) != 3 || destinationParts[0] != ".plori-gateway" || destinationParts[1] != "staging" {
-		return nil, nil, "", errors.New("workspace clone: destination is outside the staging tree")
+		return nil, nil, "", pmount.WorkspaceControlRefusal("workspace clone: destination is outside the staging tree")
 	}
 	name := destinationParts[2]
 	if !(strings.HasPrefix(name, "copy-") && workspaceControlUUID(strings.TrimPrefix(name, "copy-"))) &&
 		!(strings.HasPrefix(name, "revision-") && workspaceControlUUID(strings.TrimPrefix(name, "revision-"))) {
-		return nil, nil, "", errors.New("workspace clone: destination name is not a typed operation UUID")
+		return nil, nil, "", pmount.WorkspaceControlRefusal("workspace clone: destination name is not a typed operation UUID")
 	}
 	return sourceParts, destinationParts[:2], name, nil
 }

@@ -31,6 +31,7 @@ import (
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/plori/gatewaycontrol"
+	pmount "github.com/juicedata/juicefs/pkg/plori/mount"
 	"github.com/juicedata/juicefs/pkg/vfs"
 )
 
@@ -118,12 +119,20 @@ func TestPloriWorkspaceCloneTreeRefusesOutsideMismatchedAndSymlinkRequests(t *te
 		{name: "destination without typed UUID", edit: func(r *gatewaycontrol.CloneRequest) { r.Destination = ".plori-gateway/staging/copy-not-a-uuid" }},
 		{name: "source inode mismatch", edit: func(r *gatewaycontrol.CloneRequest) { r.SourceNativeInode++ }},
 	}
+	// Leaving the private trees or naming another source inode is an authority
+	// refusal the writer's telemetry counts as refused; the filesystem's own
+	// state (a symlink, an existing destination) is not.
+	var refusal pmount.WorkspaceControlRefusal
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			req := valid
 			tc.edit(&req)
-			if err := p.CloneTree(context.Background(), req); err == nil {
+			err := p.CloneTree(context.Background(), req)
+			if err == nil {
 				t.Fatal("CloneTree accepted invalid request")
+			}
+			if !errors.As(err, &refusal) {
+				t.Fatalf("CloneTree refusal %v is not a typed WorkspaceControlRefusal", err)
 			}
 		})
 	}
@@ -133,15 +142,15 @@ func TestPloriWorkspaceCloneTreeRefusesOutsideMismatchedAndSymlinkRequests(t *te
 		t.Fatalf("create source-shaped symlink: %s", st)
 	}
 	symlinkReq := workspaceCloneRequest(symlink, ".plori-gateway/revisions/"+workspaceCloneSourceID, ".plori-gateway/staging/revision-"+workspaceCloneStageID)
-	if err := p.CloneTree(context.Background(), symlinkReq); err == nil {
-		t.Fatal("CloneTree followed a source-shaped symlink")
+	if err := p.CloneTree(context.Background(), symlinkReq); err == nil || errors.As(err, &refusal) {
+		t.Fatalf("source-shaped symlink CloneTree = %v, want an untyped failure", err)
 	}
 
 	if err := p.CloneTree(context.Background(), valid); err != nil {
 		t.Fatalf("first CloneTree: %v", err)
 	}
-	if err := p.CloneTree(context.Background(), valid); err == nil || !strings.Contains(err.Error(), "destination exists") {
-		t.Fatalf("second CloneTree = %v, want destination-exists refusal", err)
+	if err := p.CloneTree(context.Background(), valid); err == nil || !strings.Contains(err.Error(), "destination exists") || errors.As(err, &refusal) {
+		t.Fatalf("second CloneTree = %v, want an untyped destination-exists refusal", err)
 	}
 }
 
