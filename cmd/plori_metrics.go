@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/juicedata/juicefs/pkg/meta"
 	pmount "github.com/juicedata/juicefs/pkg/plori/mount"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -39,6 +40,28 @@ func registerLitestreamMetricsChild(registry *prometheus.Registry, child func() 
 		Name: pmount.LitestreamMetricsChildGauge,
 		Help: "Start sequence of the supervised Litestream child while it alone holds the loopback metrics listener, else 0.",
 	}, func() float64 { return float64(child()) }))
+}
+
+// DataSpaceDriftGauge is the slice_data recount drift of this mount's last
+// open: the recount of the slice data minus the persisted counter row, in
+// bytes (meta.PloriDataSpaceDrift). It is non-zero only when a reference path
+// changed slice references without the counter, or after a restore.
+const DataSpaceDriftGauge = "juicefs_plori_data_space_recount_drift_bytes"
+
+// registerDataSpaceDrift exposes DataSpaceDriftGauge on the bare registry. It
+// is registered only on slice_data mounts.
+func registerDataSpaceDrift(registry *prometheus.Registry) {
+	if registry == nil {
+		return
+	}
+	err := registry.Register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: DataSpaceDriftGauge,
+		Help: "Slice data recount minus the persisted ploriDataSpace counter at the last slice_data open, in bytes.",
+	}, func() float64 { return float64(meta.PloriDataSpaceDrift()) }))
+	var already prometheus.AlreadyRegisteredError
+	if err != nil && !errors.As(err, &already) {
+		ploriLog("data_space_drift_unregistered", "error", err.Error())
+	}
 }
 
 // registerControlMetrics exposes the writer's control telemetry on the bare

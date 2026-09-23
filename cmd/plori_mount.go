@@ -559,15 +559,16 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(m, store, chunkConf)
 	return &ploriVolume{
-		paths:    f.paths,
-		cli:      c,
-		m:        m,
-		blob:     blob,
-		store:    store,
-		vfsConf:  vfsConf,
-		registry: registry,
-		reg:      registerer,
-		metrics:  metrics,
+		paths:      f.paths,
+		cli:        c,
+		m:          m,
+		blob:       blob,
+		store:      store,
+		vfsConf:    vfsConf,
+		registry:   registry,
+		reg:        registerer,
+		metrics:    metrics,
+		quotaBasis: f.opts.QuotaBasis,
 		identity: pmount.FormatIdentity{
 			Name:      format.Name,
 			UUID:      format.UUID,
@@ -590,8 +591,10 @@ type ploriVolume struct {
 	reg            prometheus.Registerer
 	metrics        *privateMetricsServer
 	identity       pmount.FormatIdentity
-	v              *vfs.VFS
-	sessioned      bool
+	// quotaBasis is the mount option `quota_basis` (meta.PloriWithQuotaBasis).
+	quotaBasis string
+	v          *vfs.VFS
+	sessioned  bool
 	// stopped is the supervisor's stop, as the volume sees it. Close is the one
 	// call the supervisor makes on every shape of stop and never otherwise, so
 	// it is where that state arrives; Usage is the only thing that touches the
@@ -683,9 +686,16 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	if st := p.m.Chroot(meta.Background(), p.vfsConf.Meta.Subdir); st != 0 {
 		return st
 	}
-	// Configure single-writer accounting before NewSession starts refresh and
-	// cleanup goroutines, not only before the FUSE handlers start.
-	admittedMeta := meta.PloriWithQuotaAdmission(p.m)
+	// Configure single-writer accounting, and the slice_data recount, before
+	// NewSession starts refresh and cleanup goroutines, not only before the
+	// FUSE handlers start.
+	admittedMeta, err := meta.PloriWithQuotaBasis(p.m, p.quotaBasis)
+	if err != nil {
+		return fmt.Errorf("quota basis: %w", err)
+	}
+	if meta.PloriQuotaBasis(p.m) == meta.QuotaBasisSliceData {
+		registerDataSpaceDrift(p.registry)
+	}
 	meta.PloriSetQuotaAdmission(admittedMeta, p.quotaAdmission)
 	if err := p.m.NewSession(true); err != nil {
 		return fmt.Errorf("new session: %w", err)
