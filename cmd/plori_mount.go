@@ -683,6 +683,10 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	if st := p.m.Chroot(meta.Background(), p.vfsConf.Meta.Subdir); st != 0 {
 		return st
 	}
+	// Configure single-writer accounting before NewSession starts refresh and
+	// cleanup goroutines, not only before the FUSE handlers start.
+	admittedMeta := meta.PloriWithQuotaAdmission(p.m)
+	meta.PloriSetQuotaAdmission(admittedMeta, p.quotaAdmission)
 	if err := p.m.NewSession(true); err != nil {
 		return fmt.Errorf("new session: %w", err)
 	}
@@ -690,8 +694,6 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	p.m.OnReload(func(fmtp *meta.Format) {
 		p.store.UpdateLimit(fmtp.UploadLimit, fmtp.DownloadLimit)
 	})
-	admittedMeta := meta.PloriWithQuotaAdmission(p.m)
-	meta.PloriSetQuotaAdmission(admittedMeta, p.quotaAdmission)
 	p.v = vfs.NewVFS(p.vfsConf, admittedMeta, p.store, p.reg, p.registry)
 	p.v.UpdateFormat = updateFormat(p.cli)
 	// plori-mount serves FUSE in this process instead of going through the

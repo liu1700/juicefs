@@ -395,3 +395,14 @@ drives a real AWS SDK client against an in-process shim that honours
 mounts it, writes a file, stops with SIGTERM and requires exit 0, then restores
 the replica into a fresh state directory under a new writer epoch and reads the
 same bytes back.
+
+The gateway writer also exposes fixed control-call observations on its private
+metrics socket. `juicefs_plori_control_calls_total` and
+`juicefs_plori_control_duration_seconds_total` cover that writer's Litestream
+`sync` calls through response-body completion. Workspace `barrier` and `clone`
+execution use `juicefs_plori_workspace_operations_total` and
+`juicefs_plori_workspace_operation_duration_seconds_total`; queue time is
+excluded. Outcomes are `ok`, `deadline`, `canceled`, `refused`, and `other`.
+`juicefs_plori_control_metrics_ready` is 1 only after all finite series are
+registered. An absent series or sentinel is unavailable, not zero. These
+observations do not establish a durability receipt or authorize readiness.
