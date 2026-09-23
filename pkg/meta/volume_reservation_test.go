@@ -181,6 +181,58 @@ func volresArms(t *testing.T, run func(t *testing.T, e volresEngine, reserved bo
 
 const volresCapacity = 1 << 20
 
+// The ceiling is inclusive for both growth and clone admission. Correcting an
+// overshoot fixture must not turn an exactly full volume into a refusal.
+func TestVolumeReservationAllowsExactCapacity(t *testing.T) {
+	volresArms(t, func(t *testing.T, e volresEngine, reserved bool) {
+		for _, clone := range []bool{false, true} {
+			t.Run(fmt.Sprintf("clone=%t", clone), func(t *testing.T) {
+				m, b := volresOpen(t, e, volresCapacity, 0)
+				var src Ino
+				var summary uint64
+				if clone {
+					src = volresNode(t, m, RootInode, "src", TypeDirectory)
+					volresGrow(t, m, volresNode(t, m, src, "f", TypeFile), 4*4096)
+					var sum Summary
+					if st := m.GetSummary(Background(), src, &sum, true, true); st != 0 {
+						t.Fatal(st)
+					}
+					summary = sum.Size
+				}
+				file := volresNode(t, m, RootInode, "fill", TypeFile)
+				free := uint64(volresCapacity - volresClaimed(b))
+				if summary >= free {
+					t.Fatalf("setup: clone summary %d must leave write growth within %d free", summary, free)
+				}
+				size := free - summary + uint64(align4K(0))
+				ctxWrite, ctxClone := volresCtx(reserved), volresCtx(reserved)
+				defer volresRelease(b, ctxWrite, ctxClone)
+				if st := m.Fallocate(ctxWrite, file, 0, 0, size, nil); st != 0 {
+					t.Fatalf("write to exact boundary: %s", st)
+				}
+				volresRelease(b, ctxWrite)
+				if clone {
+					if st := volresClone(m, ctxClone, src, "dst"); st != 0 {
+						t.Fatalf("clone to exact boundary: %s", st)
+					}
+					volresRelease(b, ctxClone)
+				}
+				if used := volresClaimed(b); used != volresCapacity {
+					t.Fatalf("used=%d, want exact capacity=%d", used, volresCapacity)
+				}
+				ctxMore := volresCtx(reserved)
+				defer volresRelease(b, ctxMore)
+				if st := m.Fallocate(ctxMore, file, 0, 0, size+4096, nil); st != syscall.ENOSPC {
+					t.Fatalf("one block beyond capacity: %s, want ENOSPC", st)
+				}
+				if used := volresClaimed(b); used != volresCapacity {
+					t.Fatalf("refused growth changed usage to %d", used)
+				}
+			})
+		}
+	})
+}
+
 // A write that committed but is not yet counted must stay visible to the next
 // check. Upstream counts it only after the transaction returns.
 func TestVolumeReservationCoversCommittedUncountedWrite(t *testing.T) {
@@ -189,7 +241,13 @@ func TestVolumeReservationCoversCommittedUncountedWrite(t *testing.T) {
 		a := volresNode(t, m, RootInode, "a", TypeFile)
 		other := volresNode(t, m, RootInode, "b", TypeFile)
 		free := uint64(volresCapacity - volresClaimed(b))
-		half := (free/2 + 4096) &^ 4095 // each fits alone, both do not
+		growth := (free/2 + 4096) &^ 4095
+		// An empty file already accounts for one block. Fallocate takes a
+		// final length, while admission charges only the additional space.
+		size := growth + uint64(align4K(0))
+		if growth > free || 2*growth <= free {
+			t.Fatalf("setup: growth %d with %d free must fit once and not twice", growth, free)
+		}
 
 		committed, resume := make(chan struct{}), make(chan struct{})
 		volresInstall(t, b, &volresHook{afterFallocate: func(ino Ino) {
@@ -200,9 +258,9 @@ func TestVolumeReservationCoversCommittedUncountedWrite(t *testing.T) {
 		}})
 		ctxA, ctxB := volresCtx(reserved), volresCtx(reserved)
 		done := make(chan syscall.Errno, 1)
-		go func() { done <- m.Fallocate(ctxA, a, 0, 0, half, nil) }()
+		go func() { done <- m.Fallocate(ctxA, a, 0, 0, size, nil) }()
 		<-committed
-		stB := m.Fallocate(ctxB, other, 0, 0, half, nil)
+		stB := m.Fallocate(ctxB, other, 0, 0, size, nil)
 		close(resume)
 		if st := <-done; st != 0 {
 			t.Fatalf("first fallocate: %s", st)
@@ -238,7 +296,11 @@ func TestVolumeReservationHoldsClonePreflight(t *testing.T) {
 		other := volresNode(t, m, RootInode, "other", TypeFile)
 		summary := uint64(4096 + 4*4096)
 		free := uint64(volresCapacity - volresClaimed(b))
-		write := free - summary + 4096 // fits alone, not together with the clone
+		growth := free - summary + 4096
+		write := growth + uint64(align4K(0))
+		if summary > free || growth > free || summary+growth <= free {
+			t.Fatalf("setup: clone %d and write growth %d must each fit %d free, but not together", summary, growth, free)
+		}
 
 		preflighted, resume := make(chan struct{}), make(chan struct{})
 		var paused atomic.Bool
@@ -332,7 +394,11 @@ func TestVolumeReservationClonePreflightSeesUncountedWrite(t *testing.T) {
 		other := volresNode(t, m, RootInode, "other", TypeFile)
 		summary := uint64(4096 + 4*4096)
 		free := uint64(volresCapacity - volresClaimed(b))
-		write := free - summary + 4096
+		growth := free - summary + 4096
+		write := growth + uint64(align4K(0))
+		if summary > free || growth > free || summary+growth <= free {
+			t.Fatalf("setup: clone %d and write growth %d must each fit %d free, but not together", summary, growth, free)
+		}
 
 		committed, resume := make(chan struct{}), make(chan struct{})
 		volresInstall(t, b, &volresHook{afterFallocate: func(ino Ino) {
