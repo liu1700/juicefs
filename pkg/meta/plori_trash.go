@@ -79,6 +79,10 @@ const PloriDefaultTrashWalkCap = 200_000
 // `align4K(length)` per file, one 4 KiB block per directory, hard links counted once —
 // so the number is always a SUBSET of `used_bytes` and never something to add to it.
 // See PloriMeasureTrash for why that is true rather than hoped for.
+//
+// PloriMeasureTrashSliceData reports Bytes as the slice data that emptying the trash
+// would release (ploriTrashReclaimable), which is a subset of the slice_data figure. Inodes is counted the same way in both bases, because
+// the inode ceiling stays per copy.
 type PloriTrashUsage struct {
 	Bytes  int64
 	Inodes int64
@@ -134,16 +138,46 @@ type PloriTrashUsage struct {
 // has neither directory. Any other failure is returned, and the caller reports
 // `used_bytes` with no breakdown rather than a guess.
 func PloriMeasureTrash(m Meta, ctx Context, entryCap int) (PloriTrashUsage, error) {
+	return ploriMeasureTrash(m, ctx, entryCap, false)
+}
+
+// PloriMeasureTrashSliceData is PloriMeasureTrash for a volume whose used bytes are
+// counted on the slice_data basis (meta.PloriQuotaBasis). Inodes and Partial are
+// counted as PloriMeasureTrash counts them; Bytes is not.
+//
+// On that basis `used_bytes` is the sum of the sizes of the slices that still have a
+// reference, and a trash file's length says nothing about what purging it releases: a
+// clone shares its slices with the source, so a 1 GB revision in the trash can release
+// a few MB. Bytes is the sum of the sizes of the slices whose every reference comes
+// from a trash file (ploriTrashReclaimable). Each such slice is inside `used_bytes`
+// once, so the result is a subset of it by the same construction. A partial walk sees
+// fewer trash references, so fewer slices qualify and the number stays a floor.
+//
+// The caller names the basis rather than this function reading it, because the basis
+// is set by the plori-mount build only and this file is also linked on the plain build.
+// Only the SQL engine keeps the slice references this needs; any other engine is an
+// error, and the caller reports `used_bytes` with no breakdown.
+func PloriMeasureTrashSliceData(m Meta, ctx Context, entryCap int) (PloriTrashUsage, error) {
+	return ploriMeasureTrash(m, ctx, entryCap, true)
+}
+
+func ploriMeasureTrash(m Meta, ctx Context, entryCap int, sliceData bool) (PloriTrashUsage, error) {
 	if entryCap <= 0 {
 		entryCap = PloriDefaultTrashWalkCap
 	}
-	var u PloriTrashUsage
-	budget := entryCap
-	seen := make(map[Ino]bool)
+	w := ploriTrashWalk{budget: entryCap, links: make(map[Ino]uint32)}
+	var reader ploriTrashSliceReader
+	if sliceData {
+		var ok bool
+		if reader, ok = m.getBase().en.(ploriTrashSliceReader); !ok {
+			return PloriTrashUsage{}, fmt.Errorf("the %s metadata engine keeps no slice references to measure the trash with", m.Name())
+		}
+		w.files = make(map[Ino]uint32)
+	}
 
 	// JuiceFS's own trash. The root is excluded from the volume counter, so it is
 	// excluded here; its hour buckets and their contents are not.
-	if st := ploriWalkTrash(m, ctx, TrashInode, &budget, seen, &u); st != 0 && st != syscall.ENOENT {
+	if st := w.walk(m, ctx, TrashInode); st != 0 && st != syscall.ENOENT {
 		return PloriTrashUsage{}, fmt.Errorf("walk %s: %w", TrashName, st)
 	}
 
@@ -152,21 +186,63 @@ func PloriMeasureTrash(m Meta, ctx Context, entryCap int) (PloriTrashUsage, erro
 	var attr Attr
 	switch st := m.Lookup(ctx, RootInode, PloriTrashDirName, &ino, &attr, false); st {
 	case 0:
-		u.Bytes += align4K(0)
-		u.Inodes++
-		if st := ploriWalkTrash(m, ctx, ino, &budget, seen, &u); st != 0 && st != syscall.ENOENT {
+		w.u.Bytes += align4K(0)
+		w.u.Inodes++
+		if st := w.walk(m, ctx, ino); st != 0 && st != syscall.ENOENT {
 			return PloriTrashUsage{}, fmt.Errorf("walk /%s: %w", PloriTrashDirName, st)
 		}
 	case syscall.ENOENT:
 	default:
 		return PloriTrashUsage{}, fmt.Errorf("lookup /%s: %w", PloriTrashDirName, st)
 	}
-	return u, nil
+	if reader == nil {
+		return w.u, nil
+	}
+	bytes, err := reader.ploriTrashReclaimable(ctx, w.releasedByPurge())
+	if err != nil {
+		return PloriTrashUsage{}, fmt.Errorf("read the slice references of the trash: %w", err)
+	}
+	w.u.Bytes = bytes
+	return w.u, nil
 }
 
-// ploriWalkTrash accumulates every entry BELOW `root`, iteratively so a deleted
-// directory tree cannot recurse the stack away, and stops when the budget runs out.
-func ploriWalkTrash(m Meta, ctx Context, root Ino, budget *int, seen map[Ino]bool, u *PloriTrashUsage) syscall.Errno {
+// ploriTrashSliceReader is implemented by the SQL engine (plori_trash_sql.go), the
+// only engine that keeps the slice data counter.
+type ploriTrashSliceReader interface {
+	// ploriTrashReclaimable reads the chunk lists of `files` and the chunk_ref rows of
+	// every slice they name in one read-only transaction, and returns the summed size
+	// of the slices whose refs all come from those chunk lists.
+	ploriTrashReclaimable(ctx Context, files []Ino) (int64, error)
+}
+
+// ploriTrashWalk is the state shared by the walks of both trash namespaces.
+type ploriTrashWalk struct {
+	budget int
+	// links counts the trash names seen for each inode with Nlink > 1.
+	links map[Ino]uint32
+	// files maps every regular file seen in the trash to its Nlink. It is nil unless
+	// the volume counts on the slice_data basis.
+	files map[Ino]uint32
+	u     PloriTrashUsage
+}
+
+// releasedByPurge returns the trash files whose data a purge of the trash releases:
+// those with every hard link inside the trash. A file with a name outside the trash
+// keeps its chunk lists after the purge, so its slices are not released.
+func (w *ploriTrashWalk) releasedByPurge() []Ino {
+	files := make([]Ino, 0, len(w.files))
+	for ino, nlink := range w.files {
+		if nlink <= 1 || w.links[ino] >= nlink {
+			files = append(files, ino)
+		}
+	}
+	return files
+}
+
+// walk accumulates every entry BELOW `root`, iteratively so a deleted directory tree
+// cannot recurse the stack away, and stops when the budget runs out.
+func (w *ploriTrashWalk) walk(m Meta, ctx Context, root Ino) syscall.Errno {
+	u := &w.u
 	stack := []Ino{root}
 	for len(stack) > 0 {
 		dir := stack[len(stack)-1]
@@ -187,11 +263,11 @@ func ploriWalkTrash(m Meta, ctx Context, root Ino, budget *int, seen map[Ino]boo
 			if len(e.Name) == 2 && e.Name[0] == '.' && e.Name[1] == '.' {
 				continue
 			}
-			if *budget <= 0 {
+			if w.budget <= 0 {
 				u.Partial = true
 				return 0
 			}
-			*budget--
+			w.budget--
 			if e.Attr == nil {
 				continue
 			}
@@ -205,13 +281,16 @@ func ploriWalkTrash(m Meta, ctx Context, root Ino, budget *int, seen map[Ino]boo
 			// way, and a trash full of links to one file would otherwise report space
 			// that emptying it would not free.
 			if e.Attr.Nlink > 1 {
-				if seen[e.Inode] {
+				w.links[e.Inode]++
+				if w.links[e.Inode] > 1 {
 					continue
 				}
-				seen[e.Inode] = true
 			}
 			u.Bytes += align4K(e.Attr.Length)
 			u.Inodes++
+			if w.files != nil && e.Attr.Typ == TypeFile {
+				w.files[e.Inode] = e.Attr.Nlink
+			}
 		}
 	}
 	return 0

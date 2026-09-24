@@ -234,3 +234,57 @@ func TestAFailedFinalUsageReadLeavesHealthAlone(t *testing.T) {
 		t.Errorf("health.json = %d bytes / %d inodes, want the unchanged 0 / 0", h.UsedBytes, h.UsedInodes)
 	}
 }
+
+// The stop's final report and the health.json rewritten from it carry the basis
+// the final reading was taken on, and the logical figure with it.
+func TestTheFinalReportAndHealthJSONCarryTheUsageBasis(t *testing.T) {
+	serving := Usage{Bytes: 4096, Inodes: 3, Basis: UsageBasisSliceData, LogicalBytes: 4096}
+	final := Usage{Bytes: 3 << 20, Inodes: 1572, Basis: UsageBasisSliceData, LogicalBytes: 300 << 20}
+	vol := newUnmountingVolume()
+	vol.setUsage(serving, nil)
+	vol.after = final
+	cp := &fakeCP{}
+	sup := newCloseoutSup(t, testSpec(), vol, cp, &fakeReplicator{}, newSharedFencer())
+
+	f := sup.Run(context.Background(), stopAfter(120*time.Millisecond))
+	if f.Exit != CodeOK {
+		t.Fatalf("exit = %d (%v), want a clean stop", f.Exit, f.Err)
+	}
+	reported := cp.reportedUsages()
+	if len(reported) == 0 {
+		t.Fatal("a clean stop posted no final usage report")
+	}
+	if last := reported[len(reported)-1]; last != final {
+		t.Fatalf("final report = %+v, want %+v", last, final)
+	}
+	h := readHealth(t, sup)
+	if h.UsedBytes != final.Bytes || h.UsageBasis != UsageBasisSliceData || h.LogicalBytes == nil || *h.LogicalBytes != final.LogicalBytes {
+		t.Errorf("health.json used_bytes=%d usage_basis=%q logical_bytes=%v, want %d / %q / %d",
+			h.UsedBytes, h.UsageBasis, h.LogicalBytes, final.Bytes, UsageBasisSliceData, final.LogicalBytes)
+	}
+}
+
+// A volume that names no basis leaves both fields out of the final health.json:
+// absent means the logical figure, and nothing is published as a basis that was
+// not reported.
+func TestTheFinalHealthJSONOmitsTheBasisAVolumeDoesNotName(t *testing.T) {
+	vol := newUnmountingVolume()
+	vol.setUsage(Usage{Bytes: 4096, Inodes: 3}, nil)
+	vol.after = Usage{Bytes: 81465344, Inodes: 1572}
+	cp := &fakeCP{}
+	sup := newCloseoutSup(t, testSpec(), vol, cp, &fakeReplicator{}, newSharedFencer())
+
+	f := sup.Run(context.Background(), stopAfter(120*time.Millisecond))
+	if f.Exit != CodeOK {
+		t.Fatalf("exit = %d (%v), want a clean stop", f.Exit, f.Err)
+	}
+	fields := healthFields(t, sup)
+	if _, ok := fields["used_bytes"]; !ok {
+		t.Fatal("health.json has no used_bytes")
+	}
+	for _, field := range []string{"usage_basis", "logical_bytes"} {
+		if _, ok := fields[field]; ok {
+			t.Errorf("health.json carries %s for a volume that names no basis", field)
+		}
+	}
+}

@@ -55,9 +55,14 @@ type Health struct {
 	ReplicaLagMs         int64     `json:"replica_lag_ms"`
 	PendingBlocks        uint64    `json:"pending_blocks"`
 	LastBarrierAt        time.Time `json:"last_barrier_at"`
-	UsedBytes            int64     `json:"used_bytes"`
-	UsedInodes           int64     `json:"used_inodes"`
-	GrantEpochApplied    int64     `json:"grant_epoch_applied"`
+	// UsedBytes is counted on UsageBasis ("logical_4k" or "slice_data").
+	// UsageBasis and LogicalBytes are absent when the volume names no basis, and
+	// UsedBytes is then the logical figure.
+	UsedBytes         int64  `json:"used_bytes"`
+	UsageBasis        string `json:"usage_basis,omitempty"`
+	LogicalBytes      *int64 `json:"logical_bytes,omitempty"`
+	UsedInodes        int64  `json:"used_inodes"`
+	GrantEpochApplied int64  `json:"grant_epoch_applied"`
 	// ProjectedDrainSeconds is how long PendingBlocks would take to become
 	// durable at the drain rate this worker has measured. It is what makes the
 	// third stop instant possible: the plugin waits write_stop_margin + this

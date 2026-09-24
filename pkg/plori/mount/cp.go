@@ -355,6 +355,10 @@ func (c *Client) ReleaseLease(ctx context.Context, volumeID string, epoch int64,
 // look" would make the dashboard promise that emptying the trash frees nothing when the
 // truth is that nobody knows. `trash_partial` travels with them so a floor is never
 // stored as an amount.
+//
+// `usage_basis` names how `used_bytes` (and `trash_bytes`) are counted, and
+// `logical_bytes` travels with it. Both are absent when the volume names no basis;
+// `used_bytes` is then the logical figure.
 func (c *Client) ReportUsage(ctx context.Context, volumeID string, epoch int64, u Usage, at time.Time) error {
 	body := map[string]any{
 		"volume_id":   volumeID,
@@ -362,6 +366,10 @@ func (c *Client) ReportUsage(ctx context.Context, volumeID string, epoch int64, 
 		"used_bytes":  u.Bytes,
 		"used_inodes": u.Inodes,
 		"observed_at": at,
+	}
+	if u.Basis != "" {
+		body["usage_basis"] = u.Basis
+		body["logical_bytes"] = u.LogicalBytes
 	}
 	if u.TrashKnown {
 		body["trash_bytes"] = u.TrashBytes

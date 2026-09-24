@@ -118,3 +118,29 @@ func TestAPartialWalkReportsItsFloorWithTheFlagSet(t *testing.T) {
 		t.Error("a capped walk was reported as a complete one")
 	}
 }
+
+// The report carries the basis used_bytes is counted on and the logical figure,
+// and leaves both out when the volume names no basis.
+func TestTheUsageReportCarriesTheUsageBasis(t *testing.T) {
+	got := usageCapture(t, Usage{
+		Bytes: 3 << 20, Inodes: 41, Basis: UsageBasisSliceData, LogicalBytes: 300 << 20,
+		TrashKnown: true, TrashBytes: 1 << 20, TrashInodes: 5,
+	})
+	if got["usage_basis"] != UsageBasisSliceData {
+		t.Errorf("usage_basis = %v, want %q", got["usage_basis"], UsageBasisSliceData)
+	}
+	for field, want := range map[string]float64{
+		"used_bytes": 3 << 20, "logical_bytes": 300 << 20, "trash_bytes": 1 << 20,
+	} {
+		if got[field] != want {
+			t.Errorf("%s = %v, want %v", field, got[field], want)
+		}
+	}
+
+	got = usageCapture(t, Usage{Bytes: 100 << 20, Inodes: 900})
+	for _, field := range []string{"usage_basis", "logical_bytes"} {
+		if _, present := got[field]; present {
+			t.Errorf("%s was sent for a volume that names no basis", field)
+		}
+	}
+}
