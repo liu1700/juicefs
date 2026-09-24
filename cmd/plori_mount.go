@@ -831,7 +831,7 @@ func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, 
 	// it is also the logical figure; on slice_data the logical figure comes from
 	// the engine's logical counters, for display only.
 	u := pmount.Usage{Bytes: int64(total - avail), Inodes: int64(iused)}
-	sliceData := meta.PloriQuotaBasis(p.m) == meta.QuotaBasisSliceData
+	sliceData := p.quotaBasis == meta.QuotaBasisSliceData
 	if sliceData {
 		u.Basis, u.LogicalBytes = pmount.UsageBasisSliceData, meta.PloriLogicalBytes(p.m)
 	} else {
