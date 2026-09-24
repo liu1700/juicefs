@@ -329,6 +329,16 @@ type baseMeta struct {
 	// and never reread from the engine while the mount runs, because this
 	// process is the only writer.
 	dataSpace atomic.Int64
+	// ploriReleaseAgain marks a chunk whose shadowed-slice release was
+	// requested while another job held it in compacting; the holder runs the
+	// release when it finishes (plori_release.go). Guarded like compacting and
+	// created on first use, as is ploriCompactRefused.
+	ploriReleaseAgain map[uint64]bool
+	// ploriCompactRefused holds the chunks whose compaction was refused by
+	// the data growth claim and already logged. Guarded like compacting.
+	ploriCompactRefused map[uint64]bool
+	// ploriReleasing counts the shadowed-slice release jobs that are running.
+	ploriReleasing atomic.Int64
 
 	parentMu        sync.Mutex        // protect dirParents
 	quotaMu         sync.RWMutex      // protect dirQuotas
@@ -2308,6 +2318,12 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		if m.sliceData.Load() {
 			// The write inserted one chunk_ref row with refs 1 (doWrite).
 			m.commitVolumeData(ctx, int64(slice.Size))
+			// A write below the old length may cover earlier slices of the
+			// chunk completely (plori_release.go).
+			oldLength := attr.Length - uint64(delta.length)
+			if numSlices > 1 && uint64(indx)*ChunkSize+uint64(off) < oldLength {
+				m.ploriScheduleRelease(inode, indx, indx)
+			}
 		}
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
@@ -2341,6 +2357,12 @@ func (m *baseMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, 
 	if st == 0 {
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
+		if delta.length < 0 {
+			// A shrink covers the removed range with zero slices, which may
+			// hide earlier slices completely (plori_release.go).
+			oldLength := length + uint64(-delta.length)
+			m.ploriScheduleRelease(inode, uint32(length/ChunkSize), uint32((oldLength-1)/ChunkSize))
+		}
 	}
 	return st
 }
@@ -2966,7 +2988,13 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	defer func() {
 		m.Lock()
 		delete(m.compacting, k)
+		release := m.ploriReleaseRequested(k)
 		m.Unlock()
+		if release {
+			// A shadowed-slice release was requested while this compaction
+			// held the chunk (plori_release.go).
+			m.ploriScheduleRelease(inode, indx, indx)
+		}
 	}()
 
 	ss, st := m.en.doRead(Background(), inode, indx)
@@ -2998,6 +3026,20 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 			panic(fmt.Sprintf("invalid compaction skipped %d, pos %d, size %d; slices: %s", skipped, pos, size, sstring))
 		}
 	}
+
+	// In slice_data mode the new slice is data the volume keeps next to the
+	// replaced slices until they are released, so it is claimed against the
+	// byte ceiling before its object is written. A refused chunk stays
+	// uncompacted, which costs read performance only.
+	claim, ok := m.claimDataGrowth(int64(size))
+	if !ok {
+		m.ploriCompactRefusedLog(inode, indx, size)
+		return
+	}
+	if claim > 0 {
+		m.ploriCompactClaimed(inode, indx)
+	}
+	defer func() { m.settleDataGrowth(claim) }()
 
 	var id uint64
 	if st = m.NewSlice(Background(), &id); st != 0 {
@@ -3034,6 +3076,8 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		origin = append(origin, marshalSlice(s.pos, s.id, s.size, s.off, s.len)...)
 	}
 	st = m.en.doCompactChunk(inode, indx, origin, compacted, skipped, pos, id, size, dsbuf)
+	m.settleDataGrowth(claim)
+	claim = 0
 	if st == syscall.EINVAL {
 		logger.Infof("compaction for %d:%d is wasted, delete slice %d (%d bytes)", inode, indx, id, size)
 		m.deleteSlice(id, size)

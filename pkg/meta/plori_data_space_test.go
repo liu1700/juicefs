@@ -126,13 +126,20 @@ func dsClone(m Meta, ctx Context, srcParent, src Ino, name string) syscall.Errno
 	return m.Clone(ctx, srcParent, src, RootInode, name, CLONE_MODE_PRESERVE_ATTR, 0, 1, &count, &total)
 }
 
-// dsDrain waits until no file data deletion is running, then deletes the
-// data of files whose deletion was deferred. Unlink and trash purge delete
-// file data in a goroutine holding a maxDeleting token, and defer it to the
-// hourly job when all tokens are taken.
+// dsDrain waits until no shadowed-slice release and no file data deletion is
+// running, then deletes the data of files whose deletion was deferred. Write
+// and Truncate schedule releases in a goroutine (plori_release.go). Unlink and
+// trash purge delete file data in a goroutine holding a maxDeleting token, and
+// defer it to the hourly job when all tokens are taken.
 func dsDrain(t *testing.T, m *dbMeta) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
+	for m.ploriReleasing.Load() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d shadowed-slice releases still running", m.ploriReleasing.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
 	for len(m.maxDeleting) > 0 {
 		if time.Now().After(deadline) {
 			t.Fatalf("%d file deletions still running", len(m.maxDeleting))
@@ -286,8 +293,8 @@ func TestDataSpaceDeleteSourceThenCopies(t *testing.T) {
 
 // dsHarness drives a random sequence of reference changes over files in the
 // root directory. Each op returns a description, or "" when it did nothing.
-// Other units add ops (compaction, shadowed release, delayed-slice cleanup)
-// to dsOps.
+// plori_release_test.go adds compaction, shadowed release and delayed-slice
+// cleanup to dsOps.
 type dsHarness struct {
 	t      *testing.T
 	m      *dbMeta
@@ -403,11 +410,18 @@ var dsOps = []dsOp{
 }
 
 // Design test (5): after every step of a random sequence the maintained row,
-// the in-memory value and the recount are equal.
+// the in-memory value and the recount are equal. With trash on, released and
+// compacted slices are held in delslices; with trash off their references are
+// removed at once.
 func TestDataSpaceRandomSequenceMatchesRecount(t *testing.T) {
+	t.Run("trash on", func(t *testing.T) { dsRunRandom(t, 1) })
+	t.Run("trash off", func(t *testing.T) { dsRunRandom(t, 0) })
+}
+
+func dsRunRandom(t *testing.T, trashDays int) {
 	seed := time.Now().UnixNano()
 	t.Logf("seed %d", seed)
-	m, _ := dsOpen(t, 0, 0, 1)
+	m, _ := dsOpen(t, 0, 0, trashDays)
 	h := &dsHarness{t: t, m: m, rnd: rand.New(rand.NewSource(seed)), slices: map[string]int{}}
 	for step := 0; step < 300; step++ {
 		op := dsOps[h.rnd.Intn(len(dsOps))]
@@ -421,6 +435,7 @@ func TestDataSpaceRandomSequenceMatchesRecount(t *testing.T) {
 		}
 	}
 	dsPurge(t, m)
+	dsCleanupDelayed(t, m)
 	dsCheck(t, m, 0, "everything deleted and purged")
 }
 

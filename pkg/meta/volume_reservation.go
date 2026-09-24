@@ -322,6 +322,40 @@ func (m *baseMeta) settleVolumeGrowth(space, inodes int64, committed bool) {
 	m.pendingInodes -= inodes
 }
 
+// claimDataGrowth claims slice data that a background job adds without a
+// Write, such as the slice a compaction inserts, before the job writes it.
+// It returns the amount claimed, which settleDataGrowth must release once the
+// job's metadata transaction committed or failed, and false when data does not
+// fit under the byte ceiling after every outstanding claim. The committed
+// amount itself reaches dataSpace through applyDataSpace in the engine. In
+// logical mode it claims nothing and always succeeds.
+func (m *baseMeta) claimDataGrowth(data int64) (int64, bool) {
+	if !m.sliceData.Load() {
+		return 0, true
+	}
+	data = positivePart(data)
+	m.volMu.Lock()
+	defer m.volMu.Unlock()
+	if !m.volumeFitsLocked(data, 0) {
+		return 0, false
+	}
+	m.pendingSpace += data
+	return data, true
+}
+
+// settleDataGrowth releases a claim of claimDataGrowth. The engine counts the
+// committed amount in dataSpace before the job settles, so between the two the
+// amount is counted twice; the ceiling check can only refuse early, never
+// admit past the ceiling.
+func (m *baseMeta) settleDataGrowth(claim int64) {
+	if claim == 0 {
+		return
+	}
+	m.volMu.Lock()
+	m.pendingSpace -= claim
+	m.volMu.Unlock()
+}
+
 // volumeClaimed is committed usage, unflushed deltas and outstanding claims,
 // read as one consistent value. In slice_data mode the committed usage is
 // dataSpace.
