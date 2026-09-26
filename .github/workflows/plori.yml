@@ -41,11 +41,16 @@ permissions:
 env:
   GO_VERSION: 1.25.13
   GOVULNCHECK_VERSION: v1.6.0
-  MINIO_IMAGE: quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
+  # MinIO RELEASE.2025-04-22T22-12-26Z built from source (the same release as the former
+  # quay.io/minio/minio@sha256:a1ea29fa... pin, whose upstream image is no longer pullable).
+  MINIO_IMAGE: ghcr.io/liu1700/minio-mirror@sha256:2230f47e9581f3449fea8737174d4057542c42a47da3acc8086c5c1de4c788eb
 
 jobs:
   verify:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
     services:
       redis:
         image: redis@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
@@ -101,6 +106,13 @@ jobs:
             ./juicefs.plori.scan > govulncheck-plori.json
           python3 hack/check-govulncheck.py govulncheck-plori.json \
             .github/security/plori-vuln-waivers.json juicefs.plori
+
+      - name: Log in to GHCR for the MinIO image
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Start pinned MinIO
         run: |
