@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -92,6 +93,8 @@ type Supervisor struct {
 	// did not already pay: before PLO-913 the stop could not even be noticed
 	// until the periodic barrier returned.
 	barrierMu sync.Mutex
+
+	admissionOutcomes [3]atomic.Uint64
 
 	mu              sync.Mutex
 	lastBarrier     BarrierResult
@@ -1991,9 +1994,22 @@ func (s *Supervisor) admissionBound() time.Duration {
 // full account is the user buying disk, and only a renew carrying Grow will
 // notice that they did (TestAGrowTheAccountCannotFundIsAskedAgain), so refusing
 // must not also stop asking.
-func (s *Supervisor) Admit(ctx context.Context) syscall.Errno {
-	if ctx.Err() != nil {
+func (s *Supervisor) Admit(ctx context.Context) (result syscall.Errno) {
+	defer func() {
+		switch result {
+		case 0:
+			s.admissionOutcomes[0].Add(1)
+		case syscall.ENOSPC:
+			s.admissionOutcomes[1].Add(1)
+		case syscall.EINTR:
+			s.admissionOutcomes[2].Add(1)
+		}
+	}()
+	// FUSE Err is always EINTR; only the request cancel signal proves interruption.
+	select {
+	case <-ctx.Done():
 		return syscall.EINTR
+	default:
 	}
 	s.mu.Lock()
 	s.noteCeilingRefusedLocked()
