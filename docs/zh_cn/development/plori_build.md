@@ -88,7 +88,7 @@ hack/verify-plori-csi-image.sh juicefs-plori:dev
 - Linux AMD64 和 ARM64 静态压缩包及校验和；
 - SPDX JSON SBOM 和原始 `govulncheck` 证据；
 - 带 provenance 和 SBOM 的多架构
-  `ghcr.io/liu1700/juicefs-plori` 镜像；
+  `ghcr.io/plori-ai/juicefs-plori` 镜像；
 - 记录源码版本、Go 版本、构建标签、镜像名、不可变镜像摘要和机器可读支持策略的
   `build-info.json`。
 

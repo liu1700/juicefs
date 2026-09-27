@@ -47,7 +47,7 @@ RUN apk add --no-cache \
 
 ARG VERSION=dev
 ARG REVISION=unknown
-LABEL org.opencontainers.image.source="https://github.com/liu1700/juicefs" \
+LABEL org.opencontainers.image.source="https://github.com/plori-ai/juicefs" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.title="JuiceFS Plori runtime" \
