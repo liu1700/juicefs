@@ -353,7 +353,9 @@ same bytes back.
 A volume-ceiling refusal waits for a larger grant for at most three lease-renew
 intervals. Once growth is denied, subsequent refusals return `ENOSPC` immediately
 while still requesting growth. A closed FUSE request cancel channel returns
-`EINTR`; `fuseContext.Err()` alone does not indicate an interrupt.
+`EINTR`; `fuseContext.Err()` alone does not indicate an interrupt. Quota admission
+reads this channel through `PloriInterrupt()`; upstream `Done()` behavior is
+unchanged. Other contexts use `Done()` for admission cancellation.
 
 The per-mount registry exports `juicefs_plori_quota_trips_total{outcome}`.
 Each completed `Supervisor.Admit` call increments `admitted` for a grant received

@@ -62,10 +62,43 @@ func quotaFileSystem(t *testing.T) (*fileSystem, *prometheus.Registry) {
 	return newFileSystem(conf, vfs.NewVFS(conf, admitted, nil, nil, nil)), registry
 }
 
+func TestPloriFuseContextDoneIgnoresInterrupt(t *testing.T) {
+	fs := &fileSystem{conf: &vfs.Config{}}
+	cancel := make(chan struct{})
+	ctx := fs.newContext(cancel, &gofuse.InHeader{})
+	defer releaseContext(ctx)
+	close(cancel)
+	for _, request := range []meta.Context{ctx, ctx.WithValue(struct{}{}, true)} {
+		interrupt, ok := request.(interface{ PloriInterrupt() <-chan struct{} })
+		if !ok || interrupt.PloriInterrupt() != cancel {
+			t.Fatal("request does not expose the kernel interrupt channel")
+		}
+		select {
+		case <-request.Done():
+			t.Fatal("kernel interrupt changed upstream Done behavior")
+		default:
+		}
+		if request.Done() != nil {
+			t.Fatal("Done should remain the background context's nil channel")
+		}
+	}
+}
+
 func TestPloriQuotaRealFuseContext(t *testing.T) {
 	fs, _ := quotaFileSystem(t)
-	for _, when := range []string{"not interrupted", "before admission", "during admission"} {
-		t.Run(when, func(t *testing.T) {
+	for _, tc := range []struct {
+		when      string
+		withValue bool
+	}{
+		{"not interrupted", false}, {"before admission", false}, {"during admission", false},
+		{"not interrupted", true}, {"before admission", true}, {"during admission", true},
+	} {
+		when := tc.when
+		name := when
+		if tc.withValue {
+			name += "/with_value"
+		}
+		t.Run(name, func(t *testing.T) {
 			cancel := make(chan struct{})
 			ctx := fs.newContext(cancel, &gofuse.InHeader{NodeId: 1})
 			defer releaseContext(ctx)
@@ -84,7 +117,11 @@ func TestPloriQuotaRealFuseContext(t *testing.T) {
 			}
 			start := time.Now()
 			var ino meta.Ino
-			got := fs.v.Meta.Create(ctx, 1, "refused", 0600, 0, 0, &ino, &meta.Attr{})
+			var request meta.Context = ctx
+			if tc.withValue {
+				request = ctx.WithValue(struct{}{}, true)
+			}
+			got := fs.v.Meta.Create(request, 1, "refused", 0600, 0, 0, &ino, &meta.Attr{})
 			if got != want {
 				t.Fatalf("Create = %s, want %s", got, want)
 			}

@@ -1969,6 +1969,13 @@ func (s *Supervisor) admissionBound() time.Duration {
 	return AdmissionRenewRounds * s.Spec.LeaseRenewInterval.D()
 }
 
+func admissionInterrupt(ctx context.Context) <-chan struct{} {
+	if request, ok := ctx.(interface{ PloriInterrupt() <-chan struct{} }); ok {
+		return request.PloriInterrupt()
+	}
+	return ctx.Done()
+}
+
 // Admit runs after the refused metadata transaction has returned. Cancellation
 // releases only this waiter; the shared allocation remains useful to others.
 //
@@ -2007,7 +2014,7 @@ func (s *Supervisor) Admit(ctx context.Context) (result syscall.Errno) {
 	}()
 	// FUSE Err is always EINTR; only the request cancel signal proves interruption.
 	select {
-	case <-ctx.Done():
+	case <-admissionInterrupt(ctx):
 		return syscall.EINTR
 	default:
 	}
@@ -2026,7 +2033,7 @@ func (s *Supervisor) Admit(ctx context.Context) (result syscall.Errno) {
 	timer := time.NewTimer(bound)
 	defer timer.Stop()
 	select {
-	case <-ctx.Done():
+	case <-admissionInterrupt(ctx):
 		return syscall.EINTR
 	case <-f.done:
 		return f.result

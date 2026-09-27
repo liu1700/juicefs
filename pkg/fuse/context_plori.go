@@ -19,5 +19,5 @@
 
 package fuse
 
-// Done exposes the kernel request's interrupt signal to quota admission.
-func (c *fuseContext) Done() <-chan struct{} { return c.cancel }
+// PloriInterrupt exposes the kernel request's interrupt signal to quota admission.
+func (c *fuseContext) PloriInterrupt() <-chan struct{} { return c.cancel }
