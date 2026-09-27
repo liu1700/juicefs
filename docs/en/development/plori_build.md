@@ -101,7 +101,7 @@ release publishes:
 
 - Linux AMD64 and ARM64 static archives and checksums;
 - SPDX JSON SBOMs and raw `govulncheck` evidence;
-- a multi-architecture `ghcr.io/liu1700/juicefs-plori` image with provenance
+- a multi-architecture `ghcr.io/plori-ai/juicefs-plori` image with provenance
   and an SBOM;
 - `build-info.json`, which records the source revision, Go version, build tags,
   image name, immutable image digest, and the machine-readable support policy.
