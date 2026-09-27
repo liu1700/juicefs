@@ -25,9 +25,54 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/juicedata/juicefs/pkg/meta"
+	pmount "github.com/juicedata/juicefs/pkg/plori/mount"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// registerLitestreamMetricsChild exposes pmount.LitestreamMetricsChildGauge on
+// the bare registry, so the name is exact and carries no labels. It is an
+// observation for the Runtime collector only; nothing in the writer's health or
+// authority reads it.
+func registerLitestreamMetricsChild(registry *prometheus.Registry, child func() uint64) {
+	registry.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: pmount.LitestreamMetricsChildGauge,
+		Help: "Start sequence of the supervised Litestream child while it alone holds the loopback metrics listener, else 0.",
+	}, func() float64 { return float64(child()) }))
+}
+
+// DataSpaceDriftGauge is the slice_data recount drift of this mount's last
+// open: the recount of the slice data minus the persisted counter row, in
+// bytes (meta.PloriDataSpaceDrift). It is non-zero only when a reference path
+// changed slice references without the counter, or after a restore.
+const DataSpaceDriftGauge = "juicefs_plori_data_space_recount_drift_bytes"
+
+// registerDataSpaceDrift exposes DataSpaceDriftGauge on the bare registry. It
+// is registered only on slice_data mounts.
+func registerDataSpaceDrift(registry *prometheus.Registry) {
+	if registry == nil {
+		return
+	}
+	err := registry.Register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: DataSpaceDriftGauge,
+		Help: "Slice data recount minus the persisted ploriDataSpace counter at the last slice_data open, in bytes.",
+	}, func() float64 { return float64(meta.PloriDataSpaceDrift()) }))
+	var already prometheus.AlreadyRegisteredError
+	if err != nil && !errors.As(err, &already) {
+		ploriLog("data_space_drift_unregistered", "error", err.Error())
+	}
+}
+
+// registerControlMetrics exposes the writer's control telemetry on the bare
+// registry before the private socket serves it. A failure leaves the ready
+// sentinel absent, which the Runtime collector reads as no telemetry rather
+// than zeros, and does not stop the mount.
+func registerControlMetrics(registry *prometheus.Registry, m *pmount.ControlMetrics) {
+	if err := m.Register(registry); err != nil {
+		ploriLog("control_metrics_unregistered", "error", err.Error())
+	}
+}
 
 // privateMetricsServer exposes this mount's registry through a state-dir
 // socket. The root supervisor owns the 0700 state directory; mode 0600 keeps

@@ -354,6 +354,8 @@ func (m *dbMeta) initStatement() {
 		fmt.Sprintf("update %schunk_ref set refs=refs+1 where chunkid = ? AND size = ?", m.tablePrefix)
 	m.statement["update chunk_ref set refs=refs-1 where chunkid=? AND size=?"] =
 		fmt.Sprintf("update %schunk_ref set refs=refs-1 where chunkid=? AND size=?", m.tablePrefix)
+	m.statement[stmtDataAdd] =
+		fmt.Sprintf("update %scounter set value=value + ? where name='ploriDataSpace'", m.tablePrefix)
 	m.statement["update dir_quota set used_space=used_space+?, used_inodes=used_inodes+? where inode=?"] =
 		fmt.Sprintf("update %sdir_quota set used_space=used_space+?, used_inodes=used_inodes+? where inode=?", m.tablePrefix)
 	m.statement["update user_group_quota set used_space=used_space+?, used_inodes=used_inodes+? where qtype=? and qkey=?"] =
@@ -610,13 +612,19 @@ func (m *dbMeta) Name() string {
 }
 
 func (m *dbMeta) doDeleteSlice(id uint64, size uint32) error {
-	return m.txn(func(s *xorm.Session) error {
-		_, err := s.Delete(&sliceRef{Id: id})
+	var data int64
+	err := m.txn(func(s *xorm.Session) error {
+		var err error
+		data, err = m.ploriDeleteRef(s, id)
 		if err == nil {
 			m.genLog(Background(), s, time.Now().UnixNano(), "DELETESLICE(%d,%d)", id, size)
 		}
 		return err
 	})
+	if err == nil {
+		m.applyDataSpace(data)
+	}
+	return err
 }
 
 func (m *dbMeta) syncTable(beans ...interface{}) error {
@@ -1085,9 +1093,11 @@ func mustInsert(s *xorm.Session, beans ...interface{}) error {
 	return nil
 }
 
-func (m *dbMeta) batchUpdateChunkRefs(s *xorm.Session, chunkRefDeltas map[uint64]int) error {
+// batchUpdateChunkRefs applies chunkRefDeltas and returns the ploriDataSpace
+// change (plori_data_space.go), which is 0 in logical mode.
+func (m *dbMeta) batchUpdateChunkRefs(s *xorm.Session, chunkRefDeltas map[uint64]int) (int64, error) {
 	if len(chunkRefDeltas) == 0 {
-		return nil
+		return 0, nil
 	}
 	chunkIds := make([]uint64, 0, len(chunkRefDeltas))
 	for id, delta := range chunkRefDeltas {
@@ -1096,14 +1106,22 @@ func (m *dbMeta) batchUpdateChunkRefs(s *xorm.Session, chunkRefDeltas map[uint64
 		}
 	}
 	if len(chunkIds) == 0 {
-		return nil
+		return 0, nil
 	}
 	slices.Sort(chunkIds)
+	var data int64
 
 	batchSize := m.getTxnBatchNum()
 	for start := 0; start < len(chunkIds); start += batchSize {
 		end := min(start+batchSize, len(chunkIds))
 		batch := chunkIds[start:end]
+		if m.sliceData.Load() {
+			d, err := m.ploriBatchRefsCrossing(s, batch, chunkRefDeltas)
+			if err != nil {
+				return 0, err
+			}
+			data += d
+		}
 		var sb strings.Builder
 		args := make([]interface{}, 0, len(batch)*3)
 		fmt.Fprintf(&sb, "UPDATE %schunk_ref SET refs = refs + CASE ", m.tablePrefix)
@@ -1121,10 +1139,10 @@ func (m *dbMeta) batchUpdateChunkRefs(s *xorm.Session, chunkRefDeltas map[uint64
 		}
 		sb.WriteString(")")
 		if _, err := s.Exec(append([]interface{}{sb.String()}, args...)...); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return data, m.ploriAddDataSpace(s, data)
 }
 
 func (m *dbMeta) genLog(ctx Context, s *xorm.Session, ns int64, op string, args ...any) {
@@ -1318,6 +1336,26 @@ func (m *dbMeta) txn(f func(s *xorm.Session) error, inodes ...Ino) error {
 	return lastErr
 }
 
+// cloneTxn reuses txn's engine-specific locking and retry behavior while
+// checking clone authority inside every transaction attempt. A refusal from
+// either check reaches xorm before Commit and rolls that attempt back. It also
+// gates directory repair, a clone-tail mutation that is exposed to fsck.
+func (m *dbMeta) cloneTxn(ctx Context, f func(s *xorm.Session) error, inodes ...Ino) error {
+	return m.txn(func(s *xorm.Session) error {
+		s.Context(ctx)
+		if st := m.cloneAllowed(ctx); st != 0 {
+			return st
+		}
+		if err := f(s); err != nil {
+			return err
+		}
+		if st := m.cloneAllowed(ctx); st != 0 {
+			return st
+		}
+		return nil
+	}, inodes...)
+}
+
 func (m *dbMeta) roTxn(ctx context.Context, f func(s *xorm.Session) error) error {
 	start := time.Now()
 	defer func() { m.txDist.Observe(time.Since(start).Seconds()) }()
@@ -1502,10 +1540,15 @@ func (m *dbMeta) doFlushStats() {
 			logger.Warnf("update stats: %s", err)
 		}
 		if err == nil {
+			// A reservation check reads used+new under volMu; it must never see
+			// the flushed delta in neither counter.
+			m.volMu.Lock()
 			atomic.AddInt64(&m.newSpace, -newSpace)
+			runVolumeTestHook(&m.volumeTransferTestHook)
 			atomic.AddInt64(&m.usedSpace, newSpace)
 			atomic.AddInt64(&m.newInodes, -newInodes)
 			atomic.AddInt64(&m.usedInodes, newInodes)
+			m.volMu.Unlock()
 		}
 	}
 }
@@ -2002,7 +2045,7 @@ func (m *dbMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 func (m *dbMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash Ino
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -2188,7 +2231,7 @@ func (m *dbMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 func (m *dbMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, attr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash Ino
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -2343,7 +2386,7 @@ func (m *dbMeta) getNodes(s *xorm.Session, nodes ...*node) error {
 
 func (m *dbMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode, tInode *Ino, attr, tAttr *Attr) syscall.Errno {
 	var trash Ino
-	if st := m.checkTrash(parentDst, &trash); st != 0 {
+	if st := m.checkTrash(ctx, parentDst, &trash); st != 0 {
 		return st
 	}
 	exchange := flags == RenameExchange
@@ -2862,7 +2905,7 @@ func (m *dbMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, delta 
 		entries = entries[batchSize:]
 		var trash Ino
 		if len(skipCheckTrash) == 0 || !skipCheckTrash[0] {
-			if st := m.checkTrash(parent, &trash); st != 0 {
+			if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 				return st
 			}
 		}
@@ -3435,7 +3478,9 @@ func (m *dbMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 			delta.space = align4K(newleng) - align4K(nodeAttr.Length)
 			nodeAttr.Length = newleng
 		}
-		if err := m.checkQuota(ctx, delta.space, 0, nodeAttr.Uid, nodeAttr.Gid, m.getParents(s, inode, nodeAttr.Parent)...); err != 0 {
+		// The volume ceiling in slice_data mode counts the slice this write
+		// inserts, including a write inside the current length.
+		if err := m.checkQuotaData(ctx, delta.space, int64(slice.Size), 0, nodeAttr.Uid, nodeAttr.Gid, m.getParents(s, inode, nodeAttr.Parent)...); err != 0 {
 			return err
 		}
 		now := time.Now().UnixNano()
@@ -3448,7 +3493,9 @@ func (m *dbMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		if err = m.upsertSlice(s, inode, indx, buf, &insert); err != nil {
 			return err
 		}
-		if err = mustInsert(s, sliceRef{slice.Id, slice.Size, 1}); err != nil {
+		// It adds slice.Size to ploriDataSpace; baseMeta.Write counts the same
+		// amount in memory after the commit.
+		if _, err = m.ploriInsertRef(s, sliceRef{slice.Id, slice.Size, 1}); err != nil {
 			return err
 		}
 		_, err = s.Cols("length", "mtime", "ctime", "mtimensec", "ctimensec").Update(&nodeAttr, &node{Inode: inode})
@@ -3471,11 +3518,11 @@ func (m *dbMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, off
 		f.Lock()
 		defer f.Unlock()
 	}
-	var newLength, newSpace int64
+	var newLength, newSpace, data int64
 	var nin, nout node
 	defer func() { m.of.InvalidateChunk(fout, invalidateAllChunks) }()
 	err := m.txn(func(s *xorm.Session) error {
-		newLength, newSpace = 0, 0
+		newLength, newSpace, data = 0, 0, 0
 		nin = node{Inode: fin}
 		nout = node{Inode: fout}
 		err := m.getNodesForUpdate(s, &nin, &nout)
@@ -3537,9 +3584,11 @@ func (m *dbMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, off
 				return err
 			}
 			if id > 0 {
-				if _, err := ses.Exec(m.sqlConv("update chunk_ref set refs=refs+1 where chunkid = ? AND size = ?"), id, size); err != nil {
+				d, err := m.ploriRefDelta(ses, id, size, 1)
+				if err != nil {
 					return err
 				}
+				data += d
 			}
 			return nil
 		}
@@ -3594,6 +3643,7 @@ func (m *dbMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, off
 		return nil
 	}, fout)
 	if err == nil {
+		m.applyDataSpace(data)
 		m.updateParentStat(ctx, fout, nout.Parent, newLength, newSpace)
 		m.updateUserGroupStat(ctx, nout.Uid, nout.Gid, newSpace, 0)
 	}
@@ -3788,8 +3838,10 @@ func (m *dbMeta) doCleanupSlices(ctx Context, count *uint64) error {
 
 func (m *dbMeta) deleteChunk(inode Ino, indx uint32) error {
 	var ss []*slice
+	var data int64
 	err := m.txn(func(s *xorm.Session) error {
 		ss = ss[:0]
+		data = 0
 		var c = chunk{Inode: inode, Indx: indx}
 		ok, err := s.ForUpdate().MustCols("indx").Get(&c)
 		if err != nil {
@@ -3808,7 +3860,7 @@ func (m *dbMeta) deleteChunk(inode Ino, indx uint32) error {
 				deltas[sl.id] += -1
 			}
 		}
-		if err = m.batchUpdateChunkRefs(s, deltas); err != nil {
+		if data, err = m.batchUpdateChunkRefs(s, deltas); err != nil {
 			return err
 		}
 		c.Slices = nil
@@ -3822,6 +3874,7 @@ func (m *dbMeta) deleteChunk(inode Ino, indx uint32) error {
 	if err != nil {
 		return fmt.Errorf("delete slice from chunk %s fail: %s, retry later", inode, err)
 	}
+	m.applyDataSpace(data)
 	for _, s := range ss {
 		if s.id == 0 {
 			continue
@@ -3875,8 +3928,10 @@ func (m *dbMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 		})
 
 		for _, ds := range result {
+			var data int64
 			if err := m.txn(func(ses *xorm.Session) error {
 				ss = ss[:0]
+				data = 0
 				ds := delslices{Id: ds.Id}
 				if ok, e := ses.ForUpdate().Get(&ds); e != nil {
 					return e
@@ -3888,9 +3943,11 @@ func (m *dbMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 					return fmt.Errorf("invalid value for delayed slices %d: %v", ds.Id, ds.Slices)
 				}
 				for _, s := range ss {
-					if _, e := ses.Exec(m.sqlConv("update chunk_ref set refs=refs-1 where chunkid=? AND size=?"), s.Id, s.Size); e != nil {
+					d, e := m.ploriRefDelta(ses, s.Id, s.Size, -1)
+					if e != nil {
 						return e
 					}
+					data += d
 				}
 				_, e := ses.Delete(&delslices{Id: ds.Id})
 				m.genLog(ctx, ses, time.Now().UnixNano(), "CLEANUP_DELAYED_SLICES(%d,%d)", ds.Id, ds.Deleted)
@@ -3899,6 +3956,7 @@ func (m *dbMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 				logger.Warnf("Cleanup delayed slices %d: %s", ds.Id, err)
 				continue
 			}
+			m.applyDataSpace(data)
 			for _, s := range ss {
 				var ref = sliceRef{Id: s.Id}
 				err := m.simpleTxn(ctx, func(s *xorm.Session) error {
@@ -3925,7 +3983,9 @@ func (m *dbMeta) doCleanupDelayedSlices(ctx Context, edge int64) (int, error) {
 }
 
 func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*slice, skipped int, pos uint32, id uint64, size uint32, delayed []byte) syscall.Errno {
+	var data int64
 	st := errno(m.txn(func(s *xorm.Session) error {
+		data = 0
 		var c2 = chunk{Inode: inode, Indx: indx}
 		_, err := s.ForUpdate().MustCols("indx").Get(&c2)
 		if err != nil {
@@ -3941,9 +4001,11 @@ func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*sli
 			return err
 		}
 		// create the key to tracking it
-		if err = mustInsert(s, sliceRef{id, size, 1}); err != nil {
+		d, err := m.ploriInsertRef(s, sliceRef{id, size, 1})
+		if err != nil {
 			return err
 		}
+		data += d
 		if delayed != nil {
 			if len(delayed) > 0 {
 				if err = mustInsert(s, &delslices{id, time.Now().Unix(), delayed}); err != nil {
@@ -3955,9 +4017,11 @@ func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*sli
 				if s_.id == 0 {
 					continue
 				}
-				if _, err := s.Exec(m.sqlConv("update chunk_ref set refs=refs-1 where chunkid=? AND size=?"), s_.id, s_.size); err != nil {
+				d, err := m.ploriRefDelta(s, s_.id, s_.size, -1)
+				if err != nil {
 					return err
 				}
+				data += d
 			}
 		}
 		m.genLog(Background(), s, time.Now().UnixNano(), "COMPACTCHUNK(%d,%d,%d,%d,%d,%d,%d)", inode, indx, skipped, len(ss), pos, id, size)
@@ -3980,9 +4044,15 @@ func (m *dbMeta) doCompactChunk(inode Ino, indx uint32, origin []byte, ss []*sli
 		}
 	}
 
+	if st == 0 {
+		// Also when the double-check above found the commit that reported an
+		// error: data is from the attempt that committed.
+		m.applyDataSpace(data)
+	}
 	if st == syscall.EINVAL {
 		_ = m.txn(func(s *xorm.Session) error {
-			return mustInsert(s, &sliceRef{id, size, 0})
+			_, err := m.ploriInsertRef(s, sliceRef{id, size, 0})
+			return err
 		})
 	} else if st == 0 && delayed == nil {
 		for _, s := range ss {
@@ -4107,9 +4177,11 @@ func (m *dbMeta) scanTrashSlices(ctx Context, scan trashSliceScan) error {
 	var ss []Slice
 	for _, ds := range dss {
 		var claimed bool
+		var data int64
 		err = m.txn(func(tx *xorm.Session) error {
 			claimed = false
 			ss = ss[:0]
+			data = 0
 			del := delslices{Id: ds.Id}
 			found, err := tx.Get(&del)
 			if err != nil {
@@ -4139,9 +4211,11 @@ func (m *dbMeta) scanTrashSlices(ctx Context, scan trashSliceScan) error {
 				return fmt.Errorf("delete delayed slice %d affected %d rows", del.Id, affected)
 			}
 			for _, s := range ss {
-				if _, e := tx.Exec(m.sqlConv("update chunk_ref set refs=refs-1 where chunkid=? AND size=?"), s.Id, s.Size); e != nil {
+				d, e := m.ploriRefDelta(tx, s.Id, s.Size, -1)
+				if e != nil {
 					return e
 				}
+				data += d
 			}
 			m.genLog(ctx, tx, time.Now().UnixNano(), "CLEANUP_TRASH_SLICES(%d,%d)", del.Id, del.Deleted)
 			claimed = true
@@ -4150,6 +4224,7 @@ func (m *dbMeta) scanTrashSlices(ctx Context, scan trashSliceScan) error {
 		if err != nil {
 			return err
 		}
+		m.applyDataSpace(data)
 		if claimed {
 			for _, s := range ss {
 				var ref = sliceRef{Id: s.Id}
@@ -4239,7 +4314,7 @@ func (m *dbMeta) doRepair(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 	n.setAtime(attr.Atime*1e9 + int64(attr.Atimensec))
 	n.setMtime(attr.Mtime*1e9 + int64(attr.Mtimensec))
 	n.setCtime(attr.Ctime*1e9 + int64(attr.Ctimensec))
-	return errno(m.txn(func(s *xorm.Session) error {
+	return errno(m.cloneTxn(ctx, func(s *xorm.Session) error {
 		n.Nlink = 2
 		var rows []edge
 		if err := s.Find(&rows, &edge{Parent: inode}); err != nil {
@@ -5430,7 +5505,11 @@ func (m *dbMeta) validateCloneTarget(ctx Context, s xorm.Interface, ino Ino) (no
 }
 
 func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, ino Ino, attr *Attr, cmode uint8, cumask uint16, top bool) syscall.Errno {
-	return errno(m.txn(func(s *xorm.Session) error {
+	// A clone adds a reference to slices the source already holds, so data
+	// stays 0 unless a source row was already at refs zero or below.
+	var data int64
+	st := errno(m.cloneTxn(ctx, func(s *xorm.Session) error {
+		data = 0
 		n := node{Inode: srcIno}
 		ok, err := s.ForUpdate().Get(&n)
 		if err != nil {
@@ -5445,6 +5524,9 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 
 		m.parseAttr(&n, attr)
 		if eno := m.Access(ctx, srcIno, MODE_MASK_R, attr); eno != 0 {
+			return eno
+		}
+		if eno := m.chargeVolume(ctx, ino, align4K(n.Length), 1); eno != 0 {
 			return eno
 		}
 
@@ -5531,9 +5613,11 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 				for _, c := range cs {
 					for _, sli := range readSliceBuf(c.Slices) {
 						if sli.id > 0 {
-							if _, err := s.Exec(m.sqlConv("update chunk_ref set refs=refs+1 where chunkid = ? AND size = ?"), sli.id, sli.size); err != nil {
+							d, err := m.ploriRefDelta(s, sli.id, sli.size, 1)
+							if err != nil {
 								return err
 							}
+							data += d
 						}
 					}
 				}
@@ -5555,6 +5639,10 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		m.genLog(ctx, s, now.UnixNano(), "CLONE(%d,%d,%s,%d,%d,%d,%t):%d", srcIno, parent, logEncode2(name), ino, cmode, cumask, top, ino)
 		return nil
 	}, srcIno))
+	if st == 0 {
+		m.applyDataSpace(data)
+	}
+	return st
 }
 
 func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, result *batchCloneResult) syscall.Errno {
@@ -5587,9 +5675,11 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 		}
 	}
 
-	err := m.txn(func(s *xorm.Session) error {
+	var data int64
+	err := m.cloneTxn(ctx, func(s *xorm.Session) error {
 		nowNano := time.Now().UnixNano()
 		*result = batchCloneResult{deltas: make(ugQuotaDeltas)}
+		data = 0
 
 		if _, err := m.validateCloneTarget(ctx, s, dstParent); err != nil {
 			return err
@@ -5668,6 +5758,9 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 				Space:  entrySpace,
 				Inodes: 1,
 			})
+		}
+		if eno := m.chargeVolume(ctx, cloneInfos[0].dstIno, result.space, result.inodes); eno != 0 {
+			return eno
 		}
 
 		if err := mustInsert(s, nodesIns...); err != nil {
@@ -5750,15 +5843,19 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 			}
 		}
 
-		if err := m.batchUpdateChunkRefs(s, chunkRefCounts); err != nil {
+		d, err := m.batchUpdateChunkRefs(s, chunkRefCounts)
+		if err != nil {
 			return err
 		}
+		data = d
 
 		return nil
 	})
 	if err != nil {
 		return errno(err)
 	}
+	m.applyDataSpace(data)
+	result.chargeKeys = []Ino{cloneInfos[0].dstIno}
 	return 0
 }
 
@@ -5807,7 +5904,7 @@ func (m *dbMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 }
 
 func (m *dbMeta) doAttachDirNode(ctx Context, parent Ino, inode Ino, name string) syscall.Errno {
-	return errno(m.txn(func(s *xorm.Session) error {
+	return errno(m.cloneTxn(ctx, func(s *xorm.Session) error {
 		// must lock parent node first to avoid deadlock
 		var n = node{Inode: parent}
 		ok, err := s.ForUpdate().Get(&n)

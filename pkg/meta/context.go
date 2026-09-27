@@ -18,6 +18,7 @@ package meta
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 )
 
@@ -104,6 +105,40 @@ func WrapWithTimeout(ctx Context, timeout time.Duration) Context {
 func WrapWithoutCancel(ctx context.Context, pid, uid uint32, gids []uint32) Context {
 	return &wrapContext{ctx, nil, pid, uid, gids}
 }
+
+// attemptContext scopes Cancel to one attempt of a call its caller may retry.
+// Identity, permission checks, values, the deadline, Done and the caller's own
+// cancellation all remain the caller's, so a canceled caller still stops the
+// attempt. Cancel only marks the attempt: an operation that cancels its own
+// sibling work (emptyDir does) no longer cancels the caller, which may still
+// wait for a larger grant and retry.
+type attemptContext struct {
+	Context
+	canceled *atomic.Bool // shared by every context derived from this attempt
+}
+
+func newAttemptContext(parent Context) *attemptContext {
+	return &attemptContext{Context: parent, canceled: new(atomic.Bool)}
+}
+
+func (a *attemptContext) Cancel() { a.canceled.Store(true) }
+
+func (a *attemptContext) Canceled() bool { return a.canceled.Load() || a.Context.Canceled() }
+
+func (a *attemptContext) Err() error {
+	if a.canceled.Load() {
+		return context.Canceled
+	}
+	return a.Context.Err()
+}
+
+func (a *attemptContext) WithValue(k, v interface{}) Context {
+	return &attemptContext{Context: a.Context.WithValue(k, v), canceled: a.canceled}
+}
+
+// canceledByAttempt reports whether the attempt canceled itself, independent of
+// its caller.
+func (a *attemptContext) canceledByAttempt() bool { return a.canceled.Load() }
 
 func containsGid(ctx Context, gid uint32) bool {
 	for _, g := range ctx.Gids() {

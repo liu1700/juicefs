@@ -10,9 +10,8 @@ proves the mount opens the filesystem it was told to open, holds the
 control-plane lease, and runs the ordered durability shutdown when it is asked
 to stop.
 
-It is not a replacement for `juicefs mount`. Every generic command still works
-exactly as it does upstream; this one adds the Plori-specific lifecycle around
-them and is compiled only into builds carrying the `plori` build tag.
+This command adds the Plori-specific lifecycle. It is compiled only into builds
+with the `plori` build tag.
 
 ## Invocation
 
@@ -33,18 +32,13 @@ juicefs plori-mount \
 With it, the metadata replica is driven by the **node-level** `litestream
 replicate` the CSI plugin runs and supervises: this worker registers its own
 database over that control socket, with its own per-epoch replica prefix, and
-execs no continuous Litestream of its own. One process per node costs
-`35.5 + 0.48·N` MiB against 36 MiB per mount, which is the difference between
-six of eight slots being able to peak at once and all eight.
+does not start a continuous Litestream process of its own.
 
-Without it, the worker execs a `litestream replicate` child of its own — the
-original topology, kept working so a plugin and a worker image can roll
-independently.
+Without it, the worker starts its own `litestream replicate` child.
 
 `litestream restore` is a one-shot process on both paths. It runs before the
 database exists, reads from a different prefix than the one this generation
-writes to, and is over in seconds, so its footprint is a cold-start cost rather
-than a steady-state one.
+writes to. It does not remain running after restore.
 
 One thing the shared daemon cannot do: stop replicating a database **without** a
 final sync. `POST /unregister` and `POST /stop` both reach `db.Close`, which
@@ -52,8 +46,9 @@ syncs. The out-of-band fence path therefore unregisters on the shortest budget
 the API accepts rather than killing a process. What still holds is the rest of
 the protocol: no `clean` marker is written, so the next generation takes the
 unconditional `fsck` and the restore-time repair, and a successor with a
-recorded durable point restores **to** it and never sees anything pushed after
-the fence.
+recorded durable point requests that restore anchor. If compaction prevents an
+exact TXID restore, recovery can include later transactions. Restore-time
+repair checks their block references. See [Recovery](#recovery).
 
 The object credential comes from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
 in the worker's own environment. The MountSpec carries none, and a spec whose
@@ -66,20 +61,14 @@ credentials are exit 68.
 
 ## The MountSpec
 
-The spec file is the control-plane's `storagespec.MountSpec`, decoded verbatim
-with `DisallowUnknownFields`. The types live in `pkg/plori/mountspec`, which is
-the one package under `pkg/plori/` with **no** `plori` build tag: a wire
-contract is plain data, and the other end of it has to be able to decode it
-without inheriting the release profile. `pkg/plori/mount` re-exports the names
-(`MountSpec`, `LoadSpec`, …) as aliases, so the supervisor reads the same as
-before. The control-plane is the authority on that wire;
-`mountspec.MountSpec` is a copy of it, and the copy is checked by decoding
-the control-plane's own generated golden
-(`services/control-plane/internal/storagespec/testdata/*.golden.json`) in
-plori-runtime's `services/storage-worker`. Two ends built from prose drifted
-once already: the worker decoded `format_spec` with four fields while the server
-sent `format` with nine, so every real spec was refused with exit 64 and no test
-on either side could see it (PLO-395).
+The worker decodes the control-plane's `storagespec.MountSpec` with
+`DisallowUnknownFields`. Its wire types live in `pkg/plori/mountspec`, which
+does not require the `plori` build tag. `pkg/plori/mount` re-exports aliases
+such as `MountSpec` and `LoadSpec`.
+
+The control-plane owns this wire contract. The plori-runtime storage-worker
+checks compatibility against generated fixtures in
+`services/control-plane/internal/storagespec/testdata/*.golden.json`.
 
 Two fields drive the first boot:
 
@@ -88,15 +77,11 @@ Two fields drive the first boot:
 | `format` | everything `juicefs format` needs for this volume: `volume_id`, `bucket` (`<endpoint>/<bucket>`, no deeper), `data_prefix`, `meta_prefix` (the metadata ROOT, not this writer's epoch inside it), `trash_days`, `capacity_bytes`, `inodes`, `grant_epoch`, `expected_uuid` |
 | `may_format` | the authorisation to run `juicefs format`, true exactly when the volume has never been formatted |
 
-`may_format` is a field rather than an inference from an empty `expected_uuid`
-because an authorisation both sides infer from the absence of a value is one a
-future rename silently grants. Every other value in `format` is also spelled
-elsewhere in the spec, so the worker refuses (exit 64) a spec whose two
-spellings disagree — a `format.bucket` that is not the spec's own object store
-would format one bucket and replicate to another. Block size, compression and
-the storage driver are constants of the Plori profile (`FormatBlockSizeKB`,
-`FormatStorage`), not wire fields: a field the server never sends is one the two
-sides can disagree about for free.
+`may_format` grants explicit formatting authority. An empty `expected_uuid`
+does not grant that authority. The worker refuses inconsistent values repeated
+in `format` and the enclosing spec with exit 64. For example, both bucket
+values must agree. Block size, compression, and the storage driver are profile
+constants, not wire fields.
 
 ## Mount options
 
@@ -112,17 +97,14 @@ a command line.
 | `heartbeat=` | `300` | seconds or a Go duration |
 | `barrier_interval=` | `60` | seconds or a Go duration |
 | `litestream_sync=` | `1s` | replica sync interval |
-| `gomemlimit=` | — | consumed by the plugin, which exports `GOMEMLIMIT`; the Go runtime reads it directly |
+| `gomemlimit=` | unset | consumed by the plugin, which exports `GOMEMLIMIT`; the Go runtime reads it directly |
 
-An unrecognised key is logged and ignored. That is the opposite of the rule for
-an unknown top-level spec field, and the difference is which side owns the
-meaning: an unknown field means the control-plane is describing authority this
-worker cannot honour, while an unknown option means it is tuning something this
-worker does not have.
+The worker logs and ignores an unrecognised mount-option key. It refuses an
+unknown top-level spec field because that field can describe authority the
+worker does not support.
 
-`PLORI_MOUNT_OPTIONS` replaces the whole list rather than merging with it,
-because a merged list would make the resulting mount a function of two
-authorities and neither would be auditable.
+`PLORI_MOUNT_OPTIONS` replaces the whole option list. It does not merge with
+the spec's options.
 
 ## Exit codes
 
@@ -131,13 +113,13 @@ code never gets reused for a different meaning.
 
 | code | meaning | plugin action |
 |---|---|---|
-| 0 | clean stop after SIGTERM: fenced, barrier, unmount, final sync, lease released. Also the startup a SIGTERM abandoned before the mount was up (`E_STOPPED_BEFORE_MOUNT`) — nothing was published and no `ready` file exists, so a publish waiting on one still fails | normal |
+| 0 | clean stop after SIGTERM: fenced, barrier, unmount, final sync, lease released. Also an abandoned startup (`E_STOPPED_BEFORE_MOUNT`). Nothing was published and no `ready` file exists, so a publish waiting for it still fails | normal |
 | 64 | spec invalid, unsupported `credential_source`, or an unknown field the worker must not ignore | fail publish, no retry |
 | 65 | identity mismatch (Format Name/UUID against the spec or the `juicefs_uuid` object, or the control-plane refused the format acknowledgement) | fail publish, no retry; the control-plane is told via `/lease/release reason=identity_mismatch` |
-| 66 | lease lost — renew returned `stale_epoch`/`lease_held`, the deadline passed, the fence marker was already held, or the FUSE session ended on its own. `E_FENCED_OUT_OF_BAND` is the same code with a distinct meaning: the epoch was taken away rather than allowed to run out, so this worker stopped **without** a barrier and without a final sync | unpublish; the abnormal-exit guard cancels the run |
+| 66 | lease lost: renew returned `stale_epoch`/`lease_held`, the deadline passed, the fence marker was already held, or the FUSE session ended unexpectedly. `E_FENCED_OUT_OF_BAND` means the epoch was revoked. The worker stopped without a barrier or final sync | unpublish; the abnormal-exit guard cancels the run |
 | 67 | restore failed: replica missing, corrupt, or failed its integrity check | fail publish; retryable only if the error JSON says so |
 | 68 | object store unreachable or credential rejected at startup | fail publish, retryable |
-| 69 | the stop did not finish inside the write-stop window — reported data loss, lease still released. `E_BARRIER_INCOMPLETE` is the local half (the barrier or the writeback drain), `E_REPLICATION_FAILED` the remote half (the final replica sync, or replication that stopped and did not recover within a barrier period) | unpublish; surface as a typed event |
+| 69 | durability incomplete, lease still released. `E_BARRIER_INCOMPLETE` identifies a barrier or writeback-drain failure. `E_REPLICATION_FAILED` identifies a final-sync failure or replication that did not recover within a barrier period | unpublish; surface as a typed event |
 | 70 | `.control` would be Agent-writable, the cache dir holds another tenant's staging, or trash-days is 0 | fail publish, no retry |
 
 The last line on stderr is a single JSON object with a typed `error` field
@@ -199,30 +181,21 @@ number for each would change the plugin's table every time a condition is split.
     the root inode answers. Everything above has to be true before this file
     exists, because the plugin publishes the volume the moment it appears.
 
-A SIGTERM that arrives before step 10 **abandons** the startup rather than
-queueing behind it. Every step above runs under a context the signal cancels,
-and the worker gives up at the next of four checkpoints — in front of the fence
-claim, after the restore, before replication starts, and after the seed — tears
-down whatever exists by then (replicator aborted, database closed), releases the
-lease with reason `stopped_before_mount` and exits 0 with
-`E_STOPPED_BEFORE_MOUNT`. The alternative, which is what this used to do, is to
-finish a restore nobody is waiting for any more: on a large replica the
-kubelet's grace period expires inside it, the SIGKILL that follows leaves no
-`clean` marker, and the next generation pays for an unconditional repair. An
-abandoned startup writes no `clean` marker either, so a restore it interrupted
-is set aside by its successor rather than adopted.
+A SIGTERM before step 10 cancels startup. The worker checks cancellation before
+the fence claim, after restore, before replication, and after the seed.
+It aborts replication, closes the database, and releases the lease with reason
+`stopped_before_mount`. It exits 0 with `E_STOPPED_BEFORE_MOUNT`.
+An abandoned startup writes no `clean` marker. Its successor sets aside the
+interrupted restore instead of adopting it.
 
-If the wait for the mount itself fails, the FUSE session is ended and joined
-before anything unmounts or closes the volume, and whatever it returned is
-reported on the exit line — it is usually the only thing that knows why the
-mount never appeared.
+If the mount wait fails, the worker ends and joins the FUSE session before
+unmounting or closing the volume. The exit line reports the session result.
 
 ## The writer lease
 
 `lease_expires_at` is converted to this process's monotonic clock once, at
-receipt, and never recomputed from the wall clock afterwards — a writer that
-was frozen and thawed would otherwise resume believing it still holds the
-lease. New writes stop at `expiry - write_stop_margin`. A wall-clock step
+receipt. Later wall-clock readings do not recompute that deadline.
+New writes stop at `expiry - write_stop_margin`. A wall-clock step
 larger than one second relative to the monotonic clock is itself treated as a
 fence trip.
 
@@ -242,9 +215,9 @@ barrier, unmount and close SQLite, force a final replica sync, stop the
 replicator, report the durable point and the final usage, release the lease.
 The whole sequence is bounded by what is left of the lease, because a barrier
 that outlives its authority is the fault the fencing design exists to prevent.
-If the bound is exhausted the worker exits 69 — reported data loss — and still
-releases the lease, since holding it costs the Agent a full TTL and the data is
-lost either way.
+If the bound is exhausted, the worker exits 69 and reports incomplete durability.
+It still releases the lease. Unreplicated metadata or pending writeback data
+can be lost.
 
 The durable point recorded before each barrier is `T_before`, the wall clock
 captured *before* the barrier ran. The barrier's own completion timestamp is
@@ -260,7 +233,7 @@ generation died mid-flight.
 
 | file | written | contents |
 |---|---|---|
-| `meta.db` | restore or format | the SQLite metadata — this is the filesystem |
+| `meta.db` | restore or format | the SQLite filesystem metadata |
 | `litestream.yml` | startup, 0600 | replication config; never contains a credential |
 | `litestream.sock` | replication start | Litestream's control socket |
 | `ready` | after the mount serves | `{"epoch", "mounted_at", "volume"}` |
@@ -276,12 +249,11 @@ The directory is 0700 and lives outside the Agent's bind mount.
 |---|---|---|
 | `--backup-meta` | `0` | Litestream is the metadata backup, and the hourly dump was one of the two idle object writers |
 | `--no-usage-report` | on | the mount is not a telemetry client |
-| `--metrics` | empty | one Prometheus listener per mount does not fit a node running many; `health.json` is the surface |
-| Litestream compaction | L1 10 m, L2 1 h, L3 6 h | with snapshot 24 h and L0 retention 30 m, an idle mount costs 0.018 object ops/s |
+| `--metrics` | empty | no public TCP metrics listener. In-Pod writers expose private `metrics.sock` |
+| Litestream compaction | L1 10 m, L2 1 h, L3 6 h | snapshot interval 24 h and L0 retention 30 m |
 
-These four are not configurable, and should not be. Everything that is tunable
-is in the mount-options vocabulary above, so a measurement can change a value
-without a worker rollout.
+These defaults are fixed in the profile. The mount-options table lists the
+supported tuning options.
 
 ## Why Litestream runs as a child process
 
@@ -294,44 +266,104 @@ the process holds, and each instance keeps its own inode and WAL-index registry
 and cannot see the other's state. Two SQLite builds in two processes is what
 the locking protocol is designed for.
 
-Nothing is lost. `DB.SyncAndWait` is reachable as `litestream sync -wait` over
+`DB.SyncAndWait` is available as `litestream sync -wait` over
 the control socket, a single SIGTERM makes `replicate` run its own shutdown
 sync, and restore takes a TXID or a timestamp on the command line. Separate
 processes also keep the crash domains apart.
 
-The cost is about 36 MiB per mount. The way to recover it without the hazard is
-one node-level Litestream watching many databases, which v0.5.17 supports
-natively; whether a per-volume replica prefix can be expressed under a single
-directory-watch config is the open question there.
+A node-level Litestream process can serve multiple databases through explicit
+registration. Select this topology with `--replicator`.
 
-## Not implemented
+## Volume ceiling admission
 
-* ~~**Restore-time missing-block repair.**~~ Implemented by PLO-320 in
-  `pkg/plori/restore`; see [`plori_restore.md`](plori_restore.md). The
-  supervisor calls `Volume.RepairAfterRestore` after an unclean generation,
-  between the session purge and the start of replication.
+The admission wrapper attaches an in-memory volume reservation to each metadata
+call (`pkg/meta/volume_reservation.go`). The ceiling check reserves space and
+inodes before admission. Counter updates replace the reservation with committed
+usage. The call releases unused reservations before it returns or waits for a
+larger grant. Concurrent calls cannot reuse reserved capacity. Reservations are
+not persisted or reported as usage.
+
+Clone reserves its source usage during preflight. Each clone transaction charges
+that reservation before commit. A refused charge returns `ENOSPC` without
+retrying the clone, because part of the clone can already exist.
+
+The first unlink, rmdir, or rename in an hour can require a trash bucket.
+Creating that bucket reserves 4 KiB and one inode. At a full grant, the call
+waits for admission. It does not bypass trash. A recursive remove that is
+refused partway waits for admission, then removes the remaining entries.
+Internal cancellation stops sibling work for that attempt. Caller cancellation
+ends the call.
+
+Admission waits use the metadata context's `Canceled()` predicate when available.
+The FUSE context has a nil `Done` channel and always returns `EINTR` from `Err`,
+including before cancellation. The wait polls `Canceled()` every 100 ms.
+Ordinary contexts retain their `Done` and `Err` cancellation behavior.
+
+SQL and KV serialize heartbeat counter refresh with the pending-delta flush.
+The single-writer Redis admission client uses the startup counter baseline plus
+its own committed deltas. Heartbeat refresh does not overwrite them.
+This prevents double counting a remote commit and its local update, including
+deletions. Other writers and online counter repair are outside this contract.
+Restart the sole client after offline counter repair.
+
+The ceiling applies per metadata client on each engine. This profile requires
+one writer for the volume. The ceiling uses logical 4 KiB accounting.
+It does not limit physical object bytes.
+
+The wrapper enables single-writer accounting before `NewSession` starts
+background work. Grant updates use `PloriApplyGrant` to update the metadata
+ceiling and the running client.
+
+## Workspace gateway Litestream metrics
+
+With `--workspace-gateway` only, the replicate config sets `addr:
+"127.0.0.1:9909"`. Restore configs and other workers keep `addr: ""`.
+An M1 worker runs in the node's network namespace. The listener binds only to
+loopback. Pinned Litestream also serves `/debug/pprof` there. Processes in the
+gateway's network namespace can reach it.
+
+Litestream continues running if its background listener fails to bind.
+The port alone does not identify the child.
+
+The private `metrics.sock` exports `juicefs_plori_litestream_metrics_child`.
+This gauge reports the supervised child's start sequence only while that child
+uniquely owns the TCP listener. Otherwise, it reports `0`. This includes child
+startup, shutdown, restart, unreadable `/proc`, and a listener owned by another
+process.
+
+The writer resolves the child in `/proc` once per start, before the child can
+be reaped. It uses the parent PID and innermost `NSpid`. Each scrape rechecks
+the child's kernel start time and socket ownership.
+
+Read the identity gauge before and after a Litestream scrape. Accept the sample
+only when both identity values are equal and nonzero.
+
+## Recovery
+
+The supervisor calls `Volume.RepairAfterRestore` after an unclean generation,
+between session purge and replication startup. See
+[`plori_restore.md`](plori_restore.md) for missing-block repair.
+
+The MountSpec carries `durable_point` and `restore_from_prefix` when the
+control-plane has a recorded durable point. Restore prefers its replica TXID,
+then its timestamp. Without either anchor, it restores the latest transaction.
+Without an explicit prefix, `PriorMetaPrefix` selects the prior generation.
+
+Compaction can make an exact TXID unreachable. In that case, restore tries the
+nearest available transaction boundary at or after the TXID. If no boundary can
+be selected, or that boundary is also unreachable, it tries the latest
+transaction. Other restore failures stop recovery. Subsequent repair checks for
+missing blocks and quarantines affected files. A forward restore can include
+transactions after the recorded durable point.
+
+## Lifecycle limits
+
 * **Litestream retention policy.** Snapshot interval, L0 retention and the
   compaction levels are set, but nothing prunes an abandoned epoch's metadata
   prefix after its volume is retired. Owner: PLO-320.
-* **A metrics endpoint.** `health.json` is written for the plugin to read;
-  the worker exposes no Prometheus surface of its own, and the JuiceFS metrics
-  listener is disabled because one listener per mount does not fit a node
-  running many. Owner: PLO-325.
-* ~~**Recovery to `T_before` across nodes.**~~ Implemented by PLO-391. The
-  MountSpec carries `durable_point` (the anchor, with the fencing epoch that
-  produced it) and `restore_from_prefix` (that epoch's metadata prefix), so a
-  worker starting on a node with no local `durable-point.json` restores the last
-  proven durable point rather than the latest transaction. Both are omitted when
-  the control-plane has no durable point on record, and the `PriorMetaPrefix`
-  listing stays as the fallback for that case. One gap remains: the anchor is a
-  wall-clock instant, so `replica_txid` is carried but not yet used — restoring
-  BY TXID needs a `Replicator.Restore` that takes one.
-* **A live quota hook.** A grant change is applied by rewriting the Format's
-  capacity and inode ceiling, which the running client picks up on its next
-  reload rather than immediately. Owner: PLO-324.
-* **Restart supervision.** JuiceFS's own child supervisor is deliberately not
-  in the picture, so a FUSE session that ends is reported as a non-zero exit
-  and the plugin decides what happens next. Owner: PLO-366.
+* **Restart supervision.** The Plori worker does not use JuiceFS's child
+  supervisor. An unexpected FUSE session exit produces a nonzero worker exit.
+  The plugin controls the next action. Owner: PLO-366.
 
 ## Tests
 
@@ -342,8 +374,28 @@ ordered shutdown, and the rendered Litestream config. The fence-marker test
 drives a real AWS SDK client against an in-process shim that honours
 `If-None-Match: *`.
 
-`hack/plori-mount-e2e/run.sh` is the end-to-end proof and runs in the fork's
+`hack/plori-mount-e2e/run.sh` defines an end-to-end check in the fork's
 `plori` workflow, which has fuse3 and a pinned MinIO. It formats a volume,
 mounts it, writes a file, stops with SIGTERM and requires exit 0, then restores
 the replica into a fresh state directory under a new writer epoch and reads the
-same bytes back.
+same bytes back. This describes the check, not a result for a particular build.
+
+## Workspace control metrics
+
+The gateway writer also exposes fixed control-call observations on its private
+metrics socket. `juicefs_plori_control_calls_total` and
+`juicefs_plori_control_duration_seconds_total` cover that writer's Litestream
+`sync` calls through response-body completion. Workspace `barrier` and `clone`
+execution use `juicefs_plori_workspace_operations_total` and
+`juicefs_plori_workspace_operation_duration_seconds_total`; queue time is
+excluded. Outcomes are `ok`, `deadline`, `canceled`, `refused`, and `other`.
+`juicefs_plori_control_metrics_ready` is 1 only after all finite series are
+registered. An absent series or sentinel is unavailable, not zero. These
+observations do not establish a durability receipt or authorize readiness.
+
+The producer is optional and enabled for gateway writers. A writer without it
+does not provide these observations. The fork counts each actual execution.
+A runtime receipt-cache replay that does not call the fork adds no execution.
+For `sync`, `ok` follows the caller's existing response checks. A nonwaiting
+probe checks HTTP status only. It does not validate the response body as a
+durability receipt.

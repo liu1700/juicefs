@@ -72,6 +72,7 @@ machine.`,
 			&cli.StringFlag{Name: "state-dir", Required: true, Usage: "private directory for the metadata database, WAL and replication state"},
 			&cli.StringFlag{Name: "cache-dir", Required: true, Usage: "JuiceFS writeback cache directory, one per volume"},
 			&cli.StringFlag{Name: "control-plane-url", Required: true, Usage: "base URL of the control-plane"},
+			&cli.BoolFlag{Name: "workspace-gateway", Usage: "use the separately authenticated Workspace writer API"},
 			&cli.StringFlag{Name: "token-file", Required: true, Usage: "projected ServiceAccount token, re-read on every call"},
 			&cli.StringFlag{Name: "lease-release-capability-file", Usage: "private one-generation lease-release capability file, used only during shutdown"},
 			&cli.StringFlag{Name: "credential-file", EnvVars: []string{"PLORI_OBJECT_CREDENTIAL_FILE"}, Usage: "JSON object credential, re-read while the worker runs; without it the AWS_* environment is used and the key cannot rotate"},
@@ -97,6 +98,10 @@ func ploriMount(c *cli.Context) error {
 	}
 	mode, err := parseMountMode(c.String("mount-mode"))
 	if err != nil {
+		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
+	}
+	workspaceGateway := c.Bool("workspace-gateway")
+	if err := validateWorkspaceGatewayMode(workspaceGateway, mode); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
 	}
 	if err := validateMountRuntime(mode, spec.ObjectStore.CredentialSource, c.String("credential-file"), c.String("replicator")); err != nil {
@@ -149,10 +154,25 @@ func ploriMount(c *cli.Context) error {
 		Env: func() []string { return source.Env(os.Environ()) },
 		Log: ploriLog,
 	}
+	fs := &ploriFS{paths: paths, credentials: credentials, inPod: mode == mountModeInPod}
+	var controlMetrics *pmount.ControlMetrics
+	if workspaceGateway {
+		// Loopback of the gateway's one trusted container only. Every other
+		// worker keeps Litestream's metrics listener off (litestream.go).
+		ls.MetricsAddr = pmount.WorkspaceLitestreamMetricsAddr
+		fs.litestreamMetricsChild = ls.MetricsChild
+		// This writer's own control telemetry, created before anything calls
+		// the child so no call goes uncounted. The gateway never runs under
+		// --replicator, so no node-level call is attributed to it.
+		controlMetrics = pmount.NewControlMetrics()
+		ls.ControlMetrics = controlMetrics
+		fs.controlMetrics = controlMetrics
+	}
 	if err := os.MkdirAll(paths.StateDir, 0o700); err != nil {
 		exitTerminal(spec.StorageVolumeID, spec.FenceEpoch, pmount.Classify(err))
 	}
 	opts := spec.Options(os.Getenv)
+	fs.opts = opts
 	if len(opts.Ignored) > 0 {
 		// An option this worker does not know is the control-plane tuning
 		// something it does not have, not authority it cannot honour, so it
@@ -192,18 +212,21 @@ func ploriMount(c *cli.Context) error {
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 
 	cp := pmount.NewClient(c.String("control-plane-url"), paths.TokenFile, 10*time.Second)
+	cp.WorkspaceGateway = workspaceGateway
 	cp.ReleaseCapabilityFile = c.String("lease-release-capability-file")
 	sup := &pmount.Supervisor{
-		Spec:    spec,
-		Paths:   paths,
-		Options: opts,
+		Spec:             spec,
+		Paths:            paths,
+		Options:          opts,
+		WorkspaceGateway: workspaceGateway,
 		Deps: pmount.Deps{
-			FS:                   &ploriFS{paths: paths, opts: opts, credentials: credentials, inPod: mode == mountModeInPod},
+			FS:                   fs,
 			CP:                   cp,
 			Replicator:           replicator,
 			Fencer:               fencer,
 			Credentials:          credentials,
 			ControlGateInstalled: vfs.InternalMsgGateInstalled,
+			ControlMetrics:       controlMetrics,
 			Log:                  ploriLog,
 		},
 	}
@@ -241,6 +264,13 @@ func validateMountRuntime(mode mountMode, source, credentialFile, replicator str
 	}
 	if mode == mountModeInPod && replicator != "" {
 		return fmt.Errorf("%w: mount_mode %q does not support --replicator", pmount.ErrSpec, mode)
+	}
+	return nil
+}
+
+func validateWorkspaceGatewayMode(enabled bool, mode mountMode) error {
+	if enabled && mode != mountModeInPod {
+		return fmt.Errorf("%w: --workspace-gateway requires mount_mode %q", pmount.ErrSpec, mountModeInPod)
 	}
 	return nil
 }
@@ -300,11 +330,26 @@ func objectCredential(path string) (*creds.Source, error) {
 	return source, nil
 }
 
+// ploriVFSConfig is the only VFS configuration constructor used by both
+// plori-mount delivery modes. Generic juicefs mount keeps getVfsConf unchanged.
+func ploriVFSConfig(c *cli.Context, metaConf *meta.Config, format *meta.Format, chunkConf *chunk.Config) *vfs.Config {
+	conf := getVfsConf(c, metaConf, format, chunkConf)
+	conf.DisableInternalCommands = true
+	conf.EnablePloriNativeInodeXattr = true
+	return conf
+}
+
 type ploriFS struct {
 	paths       pmount.Paths
 	opts        pmount.MountOptions
 	credentials *pmount.CredentialWatcher
 	inPod       bool
+	// litestreamMetricsChild is set only for the Workspace gateway writer. It
+	// backs pmount.LitestreamMetricsChildGauge on the private metrics socket.
+	litestreamMetricsChild func() uint64
+	// controlMetrics is set only for the Workspace gateway writer, and is
+	// registered on the same private registry.
+	controlMetrics *pmount.ControlMetrics
 }
 
 // metaURI is the local SQLite metadata engine. It is deliberately a plain
@@ -484,7 +529,7 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 	// which is what PLO-346 measured; the Plori profile bounds it and the
 	// supervisor tightens it from the drain rate it measures (PLO-383).
 	chunkConf.MaxStagingBacklog = pmount.DefaultMaxStagingBacklog
-	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
+	vfsConf := ploriVFSConfig(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
 	blob, err := NewReloadableStorage(format, m, f.credentialPatch())
 	if err != nil {
@@ -496,6 +541,12 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 	// 68, whereas this path has to survive a rotation without stopping.
 	blob = &watchCredential{ObjectStorage: blob, w: f.credentials}
 	registerer, registry := wrapRegister(c, f.paths.MountPoint, format.Name)
+	if f.inPod && f.litestreamMetricsChild != nil {
+		registerLitestreamMetricsChild(registry, f.litestreamMetricsChild)
+	}
+	if f.inPod && f.controlMetrics != nil {
+		registerControlMetrics(registry, f.controlMetrics)
+	}
 	var metrics *privateMetricsServer
 	if f.inPod {
 		metrics, err = startPrivateMetrics(f.paths.MetricsPath(), registry)
@@ -508,15 +559,16 @@ func (f *ploriFS) Open(ctx context.Context, spec *pmount.MountSpec) (pmount.Volu
 	store := chunk.NewCachedStore(blob, *chunkConf, registerer)
 	registerMetaMsg(m, store, chunkConf)
 	return &ploriVolume{
-		paths:    f.paths,
-		cli:      c,
-		m:        m,
-		blob:     blob,
-		store:    store,
-		vfsConf:  vfsConf,
-		registry: registry,
-		reg:      registerer,
-		metrics:  metrics,
+		paths:      f.paths,
+		cli:        c,
+		m:          m,
+		blob:       blob,
+		store:      store,
+		vfsConf:    vfsConf,
+		registry:   registry,
+		reg:        registerer,
+		metrics:    metrics,
+		quotaBasis: f.opts.QuotaBasis,
 		identity: pmount.FormatIdentity{
 			Name:      format.Name,
 			UUID:      format.UUID,
@@ -539,8 +591,10 @@ type ploriVolume struct {
 	reg            prometheus.Registerer
 	metrics        *privateMetricsServer
 	identity       pmount.FormatIdentity
-	v              *vfs.VFS
-	sessioned      bool
+	// quotaBasis is the mount option `quota_basis` (meta.PloriWithQuotaBasis).
+	quotaBasis string
+	v          *vfs.VFS
+	sessioned  bool
 	// stopped is the supervisor's stop, as the volume sees it. Close is the one
 	// call the supervisor makes on every shape of stop and never otherwise, so
 	// it is where that state arrives; Usage is the only thing that touches the
@@ -632,6 +686,17 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	if st := p.m.Chroot(meta.Background(), p.vfsConf.Meta.Subdir); st != 0 {
 		return st
 	}
+	// Configure single-writer accounting, and the slice_data recount, before
+	// NewSession starts refresh and cleanup goroutines, not only before the
+	// FUSE handlers start.
+	admittedMeta, err := meta.PloriWithQuotaBasis(p.m, p.quotaBasis)
+	if err != nil {
+		return fmt.Errorf("quota basis: %w", err)
+	}
+	if meta.PloriQuotaBasis(p.m) == meta.QuotaBasisSliceData {
+		registerDataSpaceDrift(p.registry)
+	}
+	meta.PloriSetQuotaAdmission(admittedMeta, p.quotaAdmission)
 	if err := p.m.NewSession(true); err != nil {
 		return fmt.Errorf("new session: %w", err)
 	}
@@ -639,8 +704,6 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	p.m.OnReload(func(fmtp *meta.Format) {
 		p.store.UpdateLimit(fmtp.UploadLimit, fmtp.DownloadLimit)
 	})
-	admittedMeta := meta.PloriWithQuotaAdmission(p.m)
-	meta.PloriSetQuotaAdmission(admittedMeta, p.quotaAdmission)
 	p.v = vfs.NewVFS(p.vfsConf, admittedMeta, p.store, p.reg, p.registry)
 	p.v.UpdateFormat = updateFormat(p.cli)
 	// plori-mount serves FUSE in this process instead of going through the
@@ -714,7 +777,13 @@ func (p *ploriVolume) Barrier(ctx context.Context) (pmount.BarrierResult, error)
 		}
 	}
 	status, err := store.RemoteDurability(ctx)
-	res := pmount.BarrierResult{BarrierAt: time.Now().UTC(), PendingBlocks: status.PendingBlocks}
+	res := pmount.BarrierResult{
+		BarrierAt:                   time.Now().UTC(),
+		PendingBlocks:               status.PendingBlocks,
+		Fence:                       status.Fence,
+		LastSuccessfulFence:         status.LastSuccessfulFence,
+		LastSuccessfulBarrierUnixMs: status.LastSuccessfulBarrierUnixMs,
+	}
 	return res, err
 }
 
@@ -757,7 +826,17 @@ func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, 
 	if st := p.m.StatFS(metaCtx, meta.RootInode, &total, &avail, &iused, &iavail); st != 0 {
 		return pmount.Usage{}, st
 	}
+	// StatFS reports used space on the quota basis in force (meta.PloriQuotaBasis),
+	// so Bytes is the figure the ceiling is enforced against. On the logical basis
+	// it is also the logical figure; on slice_data the logical figure comes from
+	// the engine's logical counters, for display only.
 	u := pmount.Usage{Bytes: int64(total - avail), Inodes: int64(iused)}
+	sliceData := p.quotaBasis == meta.QuotaBasisSliceData
+	if sliceData {
+		u.Basis, u.LogicalBytes = pmount.UsageBasisSliceData, meta.PloriLogicalBytes(p.m)
+	} else {
+		u.Basis, u.LogicalBytes = pmount.UsageBasisLogical4K, u.Bytes
+	}
 	// Not once the stop has begun. The ordered stop detaches the mount and
 	// closes the metadata session (shutdown step 4), and a trash walk after
 	// that is a real Readdir against a session that is gone. It returns EIO,
@@ -787,7 +866,12 @@ func (p *ploriVolume) Usage(ctx context.Context, withTrash bool) (pmount.Usage, 
 	if !withTrash {
 		return u, nil
 	}
-	t, err := meta.PloriMeasureTrash(p.m, metaCtx, 0)
+	// The breakdown is counted on the same basis as Bytes, so it stays a subset.
+	measure := meta.PloriMeasureTrash
+	if sliceData {
+		measure = meta.PloriMeasureTrashSliceData
+	}
+	t, err := measure(p.m, metaCtx, 0)
 	if err != nil {
 		logger.Warnf("plori: measuring the trash of %s failed, reporting usage without the breakdown: %s", p.identity.Name, err)
 		return u, nil

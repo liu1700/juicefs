@@ -1483,15 +1483,15 @@ func (f *File) Close(ctx meta.Context) (err syscall.Errno) {
 	defer func() { f.fs.log(l, "Close (%s): %s", f.path, errstr(err)) }()
 	f.Lock()
 	defer f.Unlock()
+	if f.rdata != nil {
+		rdata := f.rdata
+		f.rdata = nil
+		time.AfterFunc(time.Second, func() {
+			rdata.Close(meta.Background())
+		})
+	}
 	if f.flags != 0 && !f.info.IsDir() {
 		f.offset = 0
-		if f.rdata != nil {
-			rdata := f.rdata
-			f.rdata = nil
-			time.AfterFunc(time.Second, func() {
-				rdata.Close(meta.Background())
-			})
-		}
 		if f.wdata != nil {
 			err = f.wdata.Close(meta.Background())
 			f.fs.InvalidateAttr(f.inode)

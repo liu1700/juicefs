@@ -119,11 +119,11 @@ func (r *repairGateReplicator) restored() (string, RestoreOptions) {
 }
 
 // TestAFenceDuringABarrierKeepsThePriorRecordedPointForTheSuccessor models
-// the reachable ordering: authority changes while Barrier is blocked, then the
-// old worker's late durable-point report is rejected and its next serial renew
-// observes stale_epoch. The supervisor has one loop, so it cannot observe that
-// fence until the barrier returns; this test does not call fenceAndStop
-// concurrently.
+// authority changing while Barrier is blocked. Renewals no longer wait behind
+// the barrier, so the old worker can observe stale_epoch before the barrier
+// returns or after it: before, the stop suppresses that barrier's report;
+// after, the late report reaches the control plane and is rejected. Either
+// way nothing the old worker reports is accepted.
 func TestAFenceDuringABarrierKeepsThePriorRecordedPointForTheSuccessor(t *testing.T) {
 	auth := &recordedPointAuthority{leaseAuthority: newLeaseAuthority(11, 2*time.Minute)}
 	prior := &DurablePointSpec{
@@ -158,8 +158,8 @@ func TestAFenceDuringABarrierKeepsThePriorRecordedPointForTheSuccessor(t *testin
 	case <-time.After(time.Second):
 		t.Fatal("barrier did not begin")
 	}
-	// The authority is external to this process. The worker remains blocked in
-	// Barrier until it returns, then receives stale_epoch on its next renew.
+	// The authority is external to this process. The barrier stays blocked
+	// until released, and a renewal around it receives stale_epoch.
 	auth.promote(12)
 	releaseBarrier()
 	f := waitFatal(t, done, 3*time.Second, "old writer did not observe stale_epoch")
@@ -172,8 +172,8 @@ func TestAFenceDuringABarrierKeepsThePriorRecordedPointForTheSuccessor(t *testin
 	if got := auth.durablePoint(); got == nil || got.FenceEpoch != prior.FenceEpoch || got.ReplicaTxID != prior.ReplicaTxID || !got.DurableAt.Equal(prior.DurableAt) {
 		t.Fatalf("accepted durable point = %#v, want unchanged prior %#v", got, prior)
 	}
-	if attempts, rejected := auth.reports(); attempts != 1 || rejected != 1 {
-		t.Fatalf("late durable-point reports = %d attempted / %d rejected, want 1 / 1", attempts, rejected)
+	if attempts, rejected := auth.reports(); attempts > 1 || rejected != attempts {
+		t.Fatalf("late durable-point reports = %d attempted / %d rejected, want at most one, and rejected", attempts, rejected)
 	}
 
 	// A different node has no old state-dir durable-point.json. It must use the

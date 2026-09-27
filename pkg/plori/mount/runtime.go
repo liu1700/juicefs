@@ -23,6 +23,8 @@ import (
 	"context"
 	"syscall"
 	"time"
+
+	"github.com/juicedata/juicefs/pkg/plori/gatewaycontrol"
 )
 
 // Paths are the four directories and files the plugin hands the worker.
@@ -53,6 +55,10 @@ func (p Paths) HealthPath() string { return p.StateDir + "/health.json" }
 // MetricsPath is the private in-pod Prometheus socket. It is not a TCP
 // listener because the Agent shares the Pod network namespace.
 func (p Paths) MetricsPath() string { return p.StateDir + "/metrics.sock" }
+
+// WorkspaceControlPath is the private Workspace writer control socket. It is
+// created only for an in-pod workspace gateway.
+func (p Paths) WorkspaceControlPath() string { return p.StateDir + "/workspace-control.sock" }
 
 // CleanStopPath records that the previous generation completed its ordered
 // stop. It is written as the last act of a clean shutdown and removed at the
@@ -87,6 +93,19 @@ type BarrierResult struct {
 	// PendingBlocks is what the writeback cache still owed when the barrier
 	// finished; zero on success.
 	PendingBlocks uint64
+	// Fence and LastSuccessfulFence identify the completed native durability
+	// barrier. They are not restore anchors.
+	Fence               uint64
+	LastSuccessfulFence uint64
+	// LastSuccessfulBarrierUnixMs is the native barrier completion timestamp.
+	LastSuccessfulBarrierUnixMs int64
+}
+
+// WorkspaceCloner is implemented only by the in-pod Workspace writer. It is
+// deliberately separate from Volume so ordinary mounts and their fakes retain
+// their existing surface.
+type WorkspaceCloner interface {
+	CloneTree(context.Context, gatewaycontrol.CloneRequest) error
 }
 
 // RepairReport is one restore-time repair pass over the data plane
@@ -108,6 +127,16 @@ type RepairReport struct {
 	Elapsed time.Duration `json:"elapsed"`
 }
 
+// The wire values of `usage_basis` in health.json and the usage report.
+const (
+	// UsageBasisLogical4K is the upstream rule: align4K(length) per file and 4 KiB
+	// per directory, symlink and empty file (meta.QuotaBasisLogical).
+	UsageBasisLogical4K = "logical_4k"
+	// UsageBasisSliceData is the stored slice data, shared slices counted once
+	// (meta.QuotaBasisSliceData).
+	UsageBasisSliceData = "slice_data"
+)
+
 // Usage is the volume's consumption as the metadata engine sees it.
 //
 // TrashBytes/TrashInodes are the part of Bytes/Inodes that a deleted file is still
@@ -121,8 +150,16 @@ type RepairReport struct {
 // no trash number at all, and the product then says nothing about the trash rather than
 // guessing at it.
 type Usage struct {
+	// Bytes is the figure the volume ceiling is enforced against, counted on Basis.
 	Bytes  int64
 	Inodes int64
+	// Basis names how Bytes and TrashBytes are counted: UsageBasisLogical4K or
+	// UsageBasisSliceData. It is empty when the volume does not name a basis; Bytes is
+	// then the logical figure, and Basis and LogicalBytes are not published.
+	Basis string
+	// LogicalBytes is the 4 KiB-aligned length total (the engine's usedSpace counter),
+	// reported for display next to Bytes. Meaningful only when Basis is set.
+	LogicalBytes int64
 	// TrashKnown is false when the trash walk failed. The two numbers below are then
 	// meaningless and are not reported.
 	TrashKnown  bool

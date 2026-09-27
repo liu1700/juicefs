@@ -38,20 +38,31 @@ type Ready struct {
 	ReadyMS   int64     `json:"ready_ms"`
 }
 
-// Health is rewritten on every renew tick. Field names are the CLI contract's
-// ("Health" section); the plugin exposes them through its metrics endpoint,
-// which PLO-325 will consume.
+// Health is rewritten on every renew answer and every health tick. Field names
+// are the CLI contract's ("Health" section); the plugin exposes them through its
+// metrics endpoint, which PLO-325 will consume.
 type Health struct {
-	Epoch                int64     `json:"epoch"`
+	Epoch int64 `json:"epoch"`
+	// ObservedAt is when the run loop took this snapshot. The loop no longer
+	// waits on replication or a barrier, so a document whose observed_at stops
+	// moving means the loop itself is stuck or the write is failing
+	// (health_write_failed), not that a slow call is in progress. The file's
+	// mtime said the same only as long as nothing else touched the file.
+	ObservedAt           time.Time `json:"observed_at"`
 	LeaseExpiresAt       time.Time `json:"lease_expires_at"`
 	LastRenewOK          bool      `json:"last_renew_ok"`
 	LeaseRenewalFailures uint64    `json:"lease_renewal_failures"`
 	ReplicaLagMs         int64     `json:"replica_lag_ms"`
 	PendingBlocks        uint64    `json:"pending_blocks"`
 	LastBarrierAt        time.Time `json:"last_barrier_at"`
-	UsedBytes            int64     `json:"used_bytes"`
-	UsedInodes           int64     `json:"used_inodes"`
-	GrantEpochApplied    int64     `json:"grant_epoch_applied"`
+	// UsedBytes is counted on UsageBasis ("logical_4k" or "slice_data").
+	// UsageBasis and LogicalBytes are absent when the volume names no basis, and
+	// UsedBytes is then the logical figure.
+	UsedBytes         int64  `json:"used_bytes"`
+	UsageBasis        string `json:"usage_basis,omitempty"`
+	LogicalBytes      *int64 `json:"logical_bytes,omitempty"`
+	UsedInodes        int64  `json:"used_inodes"`
+	GrantEpochApplied int64  `json:"grant_epoch_applied"`
 	// ProjectedDrainSeconds is how long PendingBlocks would take to become
 	// durable at the drain rate this worker has measured. It is what makes the
 	// third stop instant possible: the plugin waits write_stop_margin + this
@@ -118,6 +129,12 @@ type Health struct {
 	// ReplicaLagMs keeps reporting the last good value forever. Nothing else
 	// in this document distinguishes "replicating" from "not replicating".
 	ReplicationFailed bool `json:"replication_failed"`
+	// ReplicationCheckedAt is when the last replication probe returned, pass or
+	// fail; zero until the first one does, and for a replicator that cannot be
+	// probed. ReplicationFailed is only as current as this: a probe or repair
+	// that has not returned leaves the previous verdict standing, and the gap
+	// between this and ObservedAt is how old that verdict is.
+	ReplicationCheckedAt time.Time `json:"replication_checked_at"`
 	// CredentialGeneration counts the object keys this worker has run on,
 	// starting at 1. It is how a rotation drill answers "has the fleet picked
 	// the new key up yet" without anything having to name the key. A worker

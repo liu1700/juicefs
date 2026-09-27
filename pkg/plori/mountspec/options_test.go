@@ -85,3 +85,22 @@ func TestCacheSizeIsPositiveAndBoundedInMiB(t *testing.T) {
 		}
 	}
 }
+
+// quota_basis defaults to logical; an unknown value is reported and leaves the
+// default, so a worker never runs on a basis it was not asked for.
+func TestQuotaBasisOption(t *testing.T) {
+	if got := ParseMountOptions(nil).QuotaBasis; got != QuotaBasisLogical {
+		t.Errorf("default quota basis = %q, want %q", got, QuotaBasisLogical)
+	}
+	for _, v := range []string{QuotaBasisLogical, QuotaBasisSliceData} {
+		if got := ParseMountOptions([]string{"quota_basis=" + v}); got.QuotaBasis != v || len(got.Ignored) != 0 {
+			t.Errorf("quota_basis=%s parsed as %q, ignored %v", v, got.QuotaBasis, got.Ignored)
+		}
+	}
+	for _, raw := range []string{"quota_basis=bogus", "quota_basis", "quota_basis="} {
+		got := ParseMountOptions([]string{raw})
+		if got.QuotaBasis != QuotaBasisLogical || len(got.Ignored) != 1 || got.Ignored[0] != "quota_basis" {
+			t.Errorf("%s parsed as %q, ignored %v; want the default and one ignored key", raw, got.QuotaBasis, got.Ignored)
+		}
+	}
+}

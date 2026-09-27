@@ -41,7 +41,11 @@ permissions:
 env:
   GO_VERSION: 1.25.13
   GOVULNCHECK_VERSION: v1.6.0
-  MINIO_IMAGE: quay.io/minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
+  # MinIO is built from source at this release and commit: the upstream quay.io and
+  # Docker Hub images that CI used to pin (quay.io/minio/minio@sha256:a1ea29fa...) are
+  # no longer pullable.
+  MINIO_RELEASE: RELEASE.2025-04-22T22-12-26Z
+  MINIO_COMMIT: 0d7408fc9969caf07de6a8c3a84f9fbb10a6739e
 
 jobs:
   verify:
@@ -69,7 +73,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Install build and FUSE dependencies
-        run: sudo apt-get update && sudo apt-get install --yes fuse3 musl-tools
+        run: sudo apt-get update && sudo apt-get install --yes fuse3 musl-tools sqlite3
 
       - name: Build static Plori binary
         run: |
@@ -102,16 +106,33 @@ jobs:
           python3 hack/check-govulncheck.py govulncheck-plori.json \
             .github/security/plori-vuln-waivers.json juicefs.plori
 
+      - name: Cache the MinIO build
+        id: minio-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/minio-bin
+          key: minio-${{ env.MINIO_COMMIT }}-go${{ env.GO_VERSION }}
+
+      - name: Build MinIO from source
+        if: steps.minio-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$MINIO_RELEASE" https://github.com/minio/minio.git "$RUNNER_TEMP/minio-src"
+          test "$(git -C "$RUNNER_TEMP/minio-src" rev-parse HEAD)" = "$MINIO_COMMIT"
+          mkdir -p "$RUNNER_TEMP/minio-bin"
+          (cd "$RUNNER_TEMP/minio-src" && CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -o "$RUNNER_TEMP/minio-bin/minio" .)
+
       - name: Start pinned MinIO
         run: |
-          docker run --detach --rm --name plori-minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=plori-ci -e MINIO_ROOT_PASSWORD=plori-ci-secret \
-            "$MINIO_IMAGE" server /data
+          mkdir -p "$RUNNER_TEMP/minio-data"
+          MINIO_ROOT_USER=plori-ci MINIO_ROOT_PASSWORD=plori-ci-secret \
+            nohup "$RUNNER_TEMP/minio-bin/minio" server "$RUNNER_TEMP/minio-data" --address 127.0.0.1:9000 \
+            > "$RUNNER_TEMP/minio.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/minio.pid"
           for _ in $(seq 1 30); do
             curl --fail --silent http://127.0.0.1:9000/minio/health/live && exit 0
             sleep 1
           done
-          docker logs plori-minio
+          cat "$RUNNER_TEMP/minio.log"
           exit 1
 
       - name: Exercise Redis, S3, FUSE, and durability barrier
@@ -220,18 +241,18 @@ jobs:
           AWS_ACCESS_KEY_ID: plori-ci
           AWS_SECRET_ACCESS_KEY: plori-ci-secret
           AWS_REGION: us-east-1
-          LITESTREAM_VERSION: 0.5.17
-          LITESTREAM_SHA256: cfb371176d164437ae869f8351cfde49bd1804ae71c61923f75c9cba9c9c006d
+          LITESTREAM_VERSION: v0.5.17-plori.3
+          LITESTREAM_SHA256: ef8c459b1950e34a18a2a69bbc814bf40bbe6a77f0898a5e0126a3f11f301d77
           S3_ENDPOINT: http://127.0.0.1:9000
           S3_BUCKET: plori-ci-mount
         run: |
           set -euo pipefail
           curl --fail --location --silent --show-error \
-            "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-${LITESTREAM_VERSION}-linux-x86_64.tar.gz" \
+            "https://github.com/liu1700/litestream/releases/download/${LITESTREAM_VERSION}/litestream-${LITESTREAM_VERSION#v}-linux-x86_64.tar.gz" \
             -o "$RUNNER_TEMP/litestream.tar.gz"
           echo "${LITESTREAM_SHA256}  $RUNNER_TEMP/litestream.tar.gz" | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/litestream.tar.gz" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/litestream" version | grep -q "${LITESTREAM_VERSION}"
+          test "$("$RUNNER_TEMP/litestream" version)" = "${LITESTREAM_VERSION}"
           # The supervisor formats the volume itself, but the bucket has to
           # exist; MinIO creates one on a bare PUT of the bucket path.
           curl --fail --silent --show-error --request PUT \
@@ -239,13 +260,14 @@ jobs:
             "$S3_ENDPOINT/$S3_BUCKET" || true
           PLORI_BIN=./juicefs.plori LITESTREAM_BIN="$RUNNER_TEMP/litestream" \
             hack/plori-mount-e2e/run.sh
-          # Restore-anchor and fenced-residual invariants use the pinned
+          # Restore-anchor and fenced-residual invariants use the runtime-pinned
           # binary and real SQLite databases, so they run where both exist
-          # rather than in the unit gate, which has neither. It skips itself if
-          # the sqlite3 CLI is missing.
+          # rather than in the unit gate. sqlite3 is installed above and is a
+          # required fixture dependency here.
+          command -v sqlite3
           LITESTREAM_BIN="$RUNNER_TEMP/litestream" CGO_ENABLED=1 \
-            go test -count=1 -tags "$(make -s plori.tags)" \
-            -run '^(TestRestoreByTXIDMatchesTheDurablePointWhereATimestampDoesNot|TestRestoreTimestampFallsBehindAfterRealL0Retention|TestRealAbortResidualRestoresToTheRecordedPointOrRepairsTheLatest)$' \
+            go test -count=1 -v -tags "$(make -s plori.tags)" \
+            -run '^(TestRestoreByTXIDMatchesTheDurablePointWhereATimestampDoesNot|TestRestoreForwardAfterRealL0RetentionKeepsDurableRows|TestRealAbortResidualRestoresToTheRecordedPointOrRepairsTheLatest)$' \
             ./pkg/plori/mount/ ./pkg/plori/restore/
 
       - name: Clean up the plori-mount lifecycle test
@@ -303,7 +325,7 @@ jobs:
 
       - name: Stop MinIO
         if: always()
-        run: docker rm --force plori-minio 2>/dev/null || true
+        run: kill "$(cat "$RUNNER_TEMP/minio.pid")" 2>/dev/null || true
 
   release:
     if: github.repository == 'liu1700/juicefs' && github.ref_type == 'tag'

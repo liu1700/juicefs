@@ -49,8 +49,77 @@ type ploriAdmissionMeta struct {
 }
 
 // PloriWithQuotaAdmission decorates the metadata client used by one mount.
-// Nil admission preserves the ordinary JuiceFS ENOSPC behavior.
-func PloriWithQuotaAdmission(m Meta) Meta { return &ploriAdmissionMeta{Meta: m} }
+// Nil admission preserves the ordinary JuiceFS ENOSPC behavior. The volume
+// byte ceiling keeps the logical basis.
+func PloriWithQuotaAdmission(m Meta) Meta {
+	m.getBase().enableSingleWriterCounters(m.Name() == "redis")
+	return &ploriAdmissionMeta{Meta: m}
+}
+
+// ploriDataSpaceDrift is the recount minus the persisted ploriDataSpace row at
+// the last slice_data open of this process, 0 when the row did not exist yet.
+// A non-zero value after a clean stop means a reference path changed refs
+// without the counter (plori_data_space.go).
+var ploriDataSpaceDrift atomic.Int64
+
+// PloriDataSpaceDrift is the drift found by the last slice_data recount in
+// this process. The mount exports it as a gauge.
+func PloriDataSpaceDrift() int64 { return ploriDataSpaceDrift.Load() }
+
+// PloriWithQuotaBasis is PloriWithQuotaAdmission with the quota basis the
+// mount options name (QuotaBasisLogical or QuotaBasisSliceData; empty means
+// logical). slice_data needs the SQL engine; any other engine, and an unknown
+// basis, is an error, so a mount never runs on a basis it was not asked for.
+//
+// For slice_data it recounts the slice data, rewrites the ploriDataSpace row
+// and logs the drift. It must run before NewSession, which starts the
+// background jobs that change slice references.
+func PloriWithQuotaBasis(m Meta, basis string) (Meta, error) {
+	switch basis {
+	case "", QuotaBasisLogical:
+	case QuotaBasisSliceData:
+		en, ok := m.getBase().en.(interface {
+			ploriEnableSliceData() (recount, drift int64, existed bool, err error)
+		})
+		if !ok {
+			return nil, fmt.Errorf("quota basis %s needs the SQL metadata engine, not %s", basis, m.Name())
+		}
+		recount, drift, existed, err := en.ploriEnableSliceData()
+		if err != nil {
+			return nil, fmt.Errorf("recount slice data: %w", err)
+		}
+		ploriDataSpaceDrift.Store(drift)
+		switch {
+		case !existed:
+			logger.Infof("plori: quota basis %s, slice data %d bytes (counter created)", basis, recount)
+		case drift != 0:
+			logger.Warnf("plori: quota basis %s, slice data %d bytes, the persisted counter differed by %d bytes", basis, recount, drift)
+		default:
+			logger.Infof("plori: quota basis %s, slice data %d bytes, no drift", basis, recount)
+		}
+	default:
+		return nil, fmt.Errorf("unknown quota basis %q", basis)
+	}
+	return PloriWithQuotaAdmission(m), nil
+}
+
+// PloriQuotaBasis is the basis the volume byte ceiling of m is compared
+// against: QuotaBasisSliceData after PloriWithQuotaBasis enabled it, else
+// QuotaBasisLogical. StatFS reports used space on the same basis.
+func PloriQuotaBasis(m Meta) string {
+	if m.getBase().sliceData.Load() {
+		return QuotaBasisSliceData
+	}
+	return QuotaBasisLogical
+}
+
+// PloriLogicalBytes is the logical used space (usedSpace plus the unflushed
+// delta) from this process's counters, whatever the basis. In logical mode it
+// is the number StatFS reports once the counters are loaded.
+func PloriLogicalBytes(m Meta) int64 {
+	b := m.getBase()
+	return atomic.LoadInt64(&b.usedSpace) + atomic.LoadInt64(&b.newSpace)
+}
 
 func PloriSetQuotaAdmission(m Meta, a PloriQuotaAdmission) {
 	if wrapped, ok := m.(*ploriAdmissionMeta); ok {
@@ -58,16 +127,58 @@ func PloriSetQuotaAdmission(m Meta, a PloriQuotaAdmission) {
 	}
 }
 
+// retry runs one admitted metadata call per attempt. Each attempt carries a
+// fresh marker and a fresh volume reservation (volume_reservation.go): the
+// reservation claims the ceiling at the check and is converted when the commit
+// is counted, so concurrent calls cannot admit the same free space. Whatever
+// the attempt claimed and did not commit is released as soon as it returns,
+// before the admission wait.
 func (m *ploriAdmissionMeta) retry(ctx Context, call func(Context) syscall.Errno) syscall.Errno {
+	return m.retryAttempts(ctx, false, call)
+}
+
+// retryAttempts is retry with, when scoped, an attemptContext per attempt: a
+// Cancel issued by the operation itself then ends only that attempt. Only the
+// volume ceiling's own refusal, recorded by this attempt's marker, is waited
+// on and retried. A scoped attempt that canceled its own remaining work after
+// that refusal may surface as EINTR; it is retried only while the caller is
+// not canceled. Any other result, and any caller cancellation, is returned.
+func (m *ploriAdmissionMeta) retryAttempts(ctx Context, scoped bool, call func(Context) syscall.Errno) syscall.Errno {
+	ledger, _ := m.Meta.(interface {
+		releaseVolumeReservation(*volumeReservation)
+	})
 	for {
 		marker := &ploriQuotaMarker{}
-		marked := ctx.WithValue(ploriQuotaMarkerKey{}, marker)
+		attempt := ctx
+		var scope *attemptContext
+		if scoped {
+			scope = newAttemptContext(ctx)
+			attempt = scope
+		}
+		marked := attempt.WithValue(ploriQuotaMarkerKey{}, marker)
+		var reservation *volumeReservation
+		if ledger != nil {
+			reservation = newVolumeReservation()
+			marked = withVolumeReservation(marked, reservation)
+		}
 		st := call(marked)
+		if ledger != nil {
+			ledger.releaseVolumeReservation(reservation)
+		}
 		if st == 0 {
 			m.proactive()
 		}
-		if st != syscall.ENOSPC || !marker.tripped.Load() {
+		if !marker.tripped.Load() {
 			return st
+		}
+		switch {
+		case st == syscall.ENOSPC:
+		case st == syscall.EINTR && scope != nil && scope.canceledByAttempt() && !ctx.Canceled():
+		default:
+			return st
+		}
+		if ctx.Canceled() {
+			return syscall.EINTR
 		}
 		a := m.admission.Load()
 		if a == nil || *a == nil {
@@ -89,13 +200,12 @@ func (m *ploriAdmissionMeta) proactive() {
 	}
 }
 
-// Read the same local counters as checkQuota. StatFS can consult directory
-// quotas and synchronously refresh remote counters; neither belongs on every
-// committed write's volume-admission path.
+// Read the same local counters and outstanding claims as the reservation
+// check. StatFS can consult directory quotas and synchronously refresh remote
+// counters; neither belongs on every committed write's volume-admission path.
 func (m *baseMeta) ploriQuotaNearLimit() bool {
 	f := m.getFormat()
-	used := atomic.LoadInt64(&m.usedSpace) + atomic.LoadInt64(&m.newSpace)
-	inodes := atomic.LoadInt64(&m.usedInodes) + atomic.LoadInt64(&m.newInodes)
+	used, inodes := m.volumeClaimed()
 	near := func(used int64, limit uint64) bool {
 		// ceil(4*limit/5), without overflowing either side of the comparison.
 		return limit > 0 && used >= 0 && uint64(used) >= limit-limit/5
@@ -137,9 +247,35 @@ func (m *ploriAdmissionMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, f
 	})
 }
 
-// Clone's only volume check precedes all clone entries. The per-call marker
-// makes this retry apply only to that preflight refusal, never a backend error
-// after a partial clone. BatchClone does not perform a quota check.
+// Unlink, Rmdir, Rename and Remove grow the volume only when they create the
+// hour's trash bucket (checkTrash). That claim is refused before the call's
+// own transaction, through the same marker, so the retry repeats a call that
+// changed nothing. Remove is not one transaction: a retry resumes deleting what
+// is left, which is the same request. Remove's attempts are scoped because
+// emptyDir cancels its context to stop sibling work after a failure; that must
+// end the attempt, not the caller's request.
+func (m *ploriAdmissionMeta) Unlink(ctx Context, parent Ino, name string, skipCheckTrash ...bool) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno { return m.Meta.Unlink(c, parent, name, skipCheckTrash...) })
+}
+func (m *ploriAdmissionMeta) Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ...bool) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno { return m.Meta.Rmdir(c, parent, name, skipCheckTrash...) })
+}
+func (m *ploriAdmissionMeta) Rename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
+	return m.retry(ctx, func(c Context) syscall.Errno {
+		return m.Meta.Rename(c, parentSrc, nameSrc, parentDst, nameDst, flags, inode, attr)
+	})
+}
+func (m *ploriAdmissionMeta) Remove(ctx Context, parent Ino, name string, skipTrash bool, numThreads int, count *uint64) syscall.Errno {
+	return m.retryAttempts(ctx, true, func(c Context) syscall.Errno {
+		return m.Meta.Remove(c, parent, name, skipTrash, numThreads, count)
+	})
+}
+
+// Clone's only ceiling check is its preflight, before any clone entry. Each
+// clone transaction is then charged against that claim before it commits; a
+// charge the ceiling refuses fails the clone with ENOSPC WITHOUT the marker, so
+// this retry applies only to the preflight refusal and never repeats a partial
+// clone.
 func (m *ploriAdmissionMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name string, cmode uint8, cumask uint16, concurrency uint8, count, total *uint64) syscall.Errno {
 	return m.retry(ctx, func(c Context) syscall.Errno {
 		return m.Meta.Clone(c, srcParentIno, srcIno, parent, name, cmode, cumask, concurrency, count, total)

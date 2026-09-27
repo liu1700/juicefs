@@ -23,9 +23,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -538,6 +540,61 @@ func TestAGrantThatIsNotLargerIsNotAWayOut(t *testing.T) {
 		h, ok := healthWhenWritten(sup)
 		return ok && !h.QuotaExhausted
 	}, "quota_exhausted never cleared after a genuinely larger ceiling was applied")
+}
+
+// Mirrors the real FUSE context: Err is EINTR even while live, Done is nil,
+// and Canceled is the cancellation authority.
+type fuseAdmissionContext struct {
+	context.Context
+	stopped atomic.Bool
+}
+
+func (c *fuseAdmissionContext) Err() error     { return syscall.EINTR }
+func (c *fuseAdmissionContext) Canceled() bool { return c.stopped.Load() }
+
+func TestQuotaAdmissionUsesFUSECancellationContract(t *testing.T) {
+	for _, cancel := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel=%t", cancel), func(t *testing.T) {
+			// The admission bound (PLO-873) is AdmissionRenewRounds renew
+			// intervals. With testSpec's 50 ms interval it would end the wait at
+			// 150 ms, close to the 100 ms cancellation poll. A long interval
+			// keeps the bound out of this test, which is about cancellation.
+			spec := testSpec()
+			spec.LeaseRenewInterval = Duration(10 * time.Second)
+			sup := newSup(t, spec, &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
+			sup.admissionRenew = make(chan struct{}, 1)
+			ctx := &fuseAdmissionContext{Context: context.Background()}
+			done := make(chan syscall.Errno, 1)
+			go func() { done <- sup.Admit(ctx) }()
+			select {
+			case <-sup.admissionRenew:
+			case result := <-done:
+				t.Fatalf("live FUSE request did not await grant: %s", result)
+			case <-time.After(time.Second):
+				t.Fatal("admission did not request grant")
+			}
+			want := syscall.Errno(0)
+			if cancel {
+				ctx.stopped.Store(true)
+				want = syscall.EINTR
+			} else {
+				sup.mu.Lock()
+				sup.finishQuotaFlightLocked(0)
+				sup.mu.Unlock()
+			}
+			select {
+			case got := <-done:
+				if got != want {
+					t.Fatalf("result=%s want=%s", got, want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("admission did not settle")
+			}
+			sup.mu.Lock()
+			sup.finishQuotaFlightLocked(syscall.EINTR)
+			sup.mu.Unlock()
+		})
+	}
 }
 
 // ---------------------------------------------------- the admission bound ---

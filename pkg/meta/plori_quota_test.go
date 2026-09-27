@@ -62,6 +62,11 @@ func (a *quotaAdmissionTest) Proactive() { a.prefetches.Add(1) }
 // open session.
 func openQuotaVolume(t *testing.T, capacity, inodes uint64) (*dbMeta, string) {
 	t.Helper()
+	return openQuotaVolumeWithTrash(t, capacity, inodes, 0)
+}
+
+func openQuotaVolumeWithTrash(t *testing.T, capacity, inodes uint64, trashDays int) (*dbMeta, string) {
+	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "quota.db")
 	m, err := newSQLMeta("sqlite3", dbPath, testConfig())
 	if err != nil {
@@ -71,6 +76,7 @@ func openQuotaVolume(t *testing.T, capacity, inodes uint64) (*dbMeta, string) {
 	format := testFormat()
 	format.Capacity = capacity
 	format.Inodes = inodes
+	format.TrashDays = trashDays
 	if err := m.Init(format, true); err != nil {
 		t.Fatalf("init meta: %s", err)
 	}
@@ -412,4 +418,395 @@ func sessionCount(t *testing.T, m Meta) int {
 		t.Fatalf("list sessions: %s", err)
 	}
 	return len(sessions)
+}
+
+func ploriPending(m *dbMeta) (int64, int64) {
+	m.volMu.Lock()
+	defer m.volMu.Unlock()
+	return m.pendingSpace, m.pendingInodes
+}
+
+// ploriGrantExactly leaves the volume with no free space for the next growth.
+func ploriGrantExactly(t *testing.T, m *dbMeta, extra int64) {
+	t.Helper()
+	used, _ := m.volumeClaimed()
+	if err := PloriApplyGrant(m, used+extra, 65536); err != nil {
+		t.Fatalf("grant: %s", err)
+	}
+}
+
+// claimsReleasedAdmission proves each wait happens with no claim outstanding
+// and no metadata lock held: it applies the grant itself, which needs the
+// SQLite write lock.
+type claimsReleasedAdmission struct {
+	m       *dbMeta
+	calls   atomic.Int32
+	pending atomic.Int64
+}
+
+func (a *claimsReleasedAdmission) Admit(context.Context) syscall.Errno {
+	a.calls.Add(1)
+	s, i := ploriPending(a.m)
+	a.pending.Add(s + i)
+	if err := PloriApplyGrant(a.m, int64(a.m.GetFormat().Capacity)+(64<<20), 65536); err != nil {
+		return syscall.EIO
+	}
+	return 0
+}
+func (a *claimsReleasedAdmission) Proactive() {}
+
+func TestPloriAdmissionWaitsWithNoClaimOutstanding(t *testing.T) {
+	m, _ := openQuotaVolume(t, 8<<20, 1024)
+	ctx := Background()
+	var ino Ino
+	if st := m.Mknod(ctx, RootInode, "grow", TypeFile, 0644, 022, 0, "", &ino, &Attr{}); st != 0 {
+		t.Fatal(st)
+	}
+	ploriGrantExactly(t, m, 0)
+	w := PloriWithQuotaAdmission(m)
+	a := &claimsReleasedAdmission{m: m}
+	PloriSetQuotaAdmission(w, a)
+	if st := w.Fallocate(ctx, ino, 0, 0, 1<<20, nil); st != 0 {
+		t.Fatalf("fallocate after admission: %s", st)
+	}
+	if a.calls.Load() != 1 || a.pending.Load() != 0 {
+		t.Fatalf("admission calls=%d claims during the wait=%d, want 1 and 0", a.calls.Load(), a.pending.Load())
+	}
+	if s, i := ploriPending(m); s != 0 || i != 0 {
+		t.Fatalf("pending after the call = %d/%d", s, i)
+	}
+}
+
+// Only the clone preflight is retried after admission: nothing exists yet.
+func TestPloriAdmissionRetriesTheClonePreflight(t *testing.T) {
+	m, _ := openQuotaVolume(t, 8<<20, 65536)
+	ctx := Background()
+	src := cloneFenceMkdir(t, m, ctx, RootInode, "source")
+	file := cloneFenceFile(t, m, ctx, src, "file")
+	if st := m.Fallocate(ctx, file, 0, 0, 1<<20, nil); st != 0 {
+		t.Fatal(st)
+	}
+	ploriGrantExactly(t, m, 4096)
+	w := PloriWithQuotaAdmission(m)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	var count, total uint64
+	if st := w.Clone(ctx, RootInode, src, RootInode, "copy", CLONE_MODE_PRESERVE_ATTR, 0, 1, &count, &total); st != 0 {
+		t.Fatalf("clone after admission: %s", st)
+	}
+	if got := a.calls.Load(); got != 1 {
+		t.Fatalf("admission calls = %d, want 1", got)
+	}
+	cloneFencePresent(t, m, ctx, RootInode, "copy")
+	if s, i := ploriPending(m); s != 0 || i != 0 {
+		t.Fatalf("pending after clone = %d/%d", s, i)
+	}
+}
+
+// A clone transaction refused after the preflight must not reach admission:
+// retrying would repeat a partially executed clone.
+func TestPloriAdmissionNeverRetriesAPartialClone(t *testing.T) {
+	m, _ := openQuotaVolume(t, 8<<20, 65536)
+	setup := Background()
+	src := cloneFenceMkdir(t, m, setup, RootInode, "source")
+	f1 := cloneFenceFile(t, m, setup, src, "f1")
+	f2 := cloneFenceFile(t, m, setup, src, "f2")
+	for _, f := range []Ino{f1, f2} {
+		if st := m.Fallocate(setup, f, 0, 0, 2*4096, nil); st != 0 {
+			t.Fatal(st)
+		}
+	}
+	const summary, growth = 4096 + 4*4096, 64 * 4096
+	ploriGrantExactly(t, m, summary+growth)
+	var grown atomic.Bool
+	installCloneFenceEngine(t, m, &cloneFenceEngine{
+		engine: m.en,
+		afterCloneEntry: func(top bool) {
+			if top && grown.CompareAndSwap(false, true) {
+				if st := m.Fallocate(Background(), f2, 0, 0, 2*4096+growth, nil); st != 0 {
+					t.Errorf("grow the source: %s", st)
+				}
+			}
+		},
+	})
+	w := PloriWithQuotaAdmission(m)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	var count, total uint64
+	if st := w.Clone(setup, RootInode, src, RootInode, "copy", CLONE_MODE_PRESERVE_ATTR, 0, 1, &count, &total); st != syscall.ENOSPC {
+		t.Fatalf("clone of a source that grew = %s, want ENOSPC", st)
+	}
+	if got := a.calls.Load(); got != 0 {
+		t.Fatalf("admission calls = %d; a partial clone was retried", got)
+	}
+	cloneFenceAbsent(t, m, setup, RootInode, "copy")
+	if s, i := ploriPending(m); s != 0 || i != 0 {
+		t.Fatalf("pending after refused clone = %d/%d", s, i)
+	}
+}
+
+// The first deletion of the hour needs the trash bucket. At a full grant the
+// unlink waits for admission and then files the entry in the trash.
+func TestPloriAdmissionUnlinkWaitsForTheTrashBucket(t *testing.T) {
+	m, _ := openQuotaVolumeWithTrash(t, 8<<20, 65536, 1)
+	ctx := Background()
+	victim := cloneFenceFile(t, m, ctx, RootInode, "victim")
+	ploriGrantExactly(t, m, 0)
+	w := PloriWithQuotaAdmission(m)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	bucket := TrashBucketName(time.Now())
+	if st := w.Unlink(ctx, RootInode, "victim"); st != 0 {
+		t.Fatalf("unlink after admission: %s", st)
+	}
+	if got := a.calls.Load(); got != 1 {
+		t.Fatalf("admission calls = %d, want 1", got)
+	}
+	cloneFenceAbsent(t, m, ctx, RootInode, "victim")
+	if TrashBucketName(time.Now()) != bucket {
+		t.Skip("the hour changed during the test")
+	}
+	bucketIno := cloneFencePresent(t, m, ctx, TrashInode, bucket)
+	cloneFencePresent(t, m, ctx, bucketIno, TrashEntryName(RootInode, victim, "victim"))
+}
+
+// Remove is not one transaction. A refused bucket stops it before anything is
+// deleted here; after admission the retry deletes the tree into the trash.
+func TestPloriAdmissionRemoveResumesAfterTheBucketGrant(t *testing.T) {
+	m, _ := openQuotaVolumeWithTrash(t, 8<<20, 65536, 1)
+	ctx := Background()
+	tree := cloneFenceMkdir(t, m, ctx, RootInode, "tree")
+	cloneFenceFile(t, m, ctx, tree, "a")
+	cloneFenceFile(t, m, ctx, tree, "b")
+	ploriGrantExactly(t, m, 0)
+	w := PloriWithQuotaAdmission(m)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	var count uint64
+	if st := w.Remove(ctx, RootInode, "tree", false, 1, &count); st != 0 {
+		t.Fatalf("remove after admission: %s", st)
+	}
+	if got := a.calls.Load(); got != 1 {
+		t.Fatalf("admission calls = %d, want 1", got)
+	}
+	cloneFenceAbsent(t, m, ctx, RootInode, "tree")
+	if s, i := ploriPending(m); s != 0 || i != 0 {
+		t.Fatalf("pending after remove = %d/%d", s, i)
+	}
+}
+
+// ploriNestedTree builds tree/child/grandchild/leaf plus tree/child/sibling.
+// Removed with one thread, child runs in emptyDir's goroutine and grandchild
+// on its synchronous path, whose failure cancels the context it was given.
+func ploriNestedTree(t *testing.T, m *dbMeta, ctx Context) {
+	t.Helper()
+	tree := cloneFenceMkdir(t, m, ctx, RootInode, "tree")
+	child := cloneFenceMkdir(t, m, ctx, tree, "child")
+	grandchild := cloneFenceMkdir(t, m, ctx, child, "grandchild")
+	cloneFenceFile(t, m, ctx, grandchild, "leaf")
+	cloneFenceFile(t, m, ctx, child, "sibling")
+}
+
+// The bucket refusal happens deep in the tree and emptyDir cancels its context
+// to stop sibling work. That cancellation belongs to the attempt: the caller's
+// context survives, the call waits for the grant and the retry removes the
+// rest. Before attempts were scoped it canceled the caller and the retry ended
+// in EINTR.
+func TestPloriAdmissionNestedRemoveResumesAfterTheBucketGrant(t *testing.T) {
+	m, _ := openQuotaVolumeWithTrash(t, 8<<20, 65536, 1)
+	ctx := Background()
+	ploriNestedTree(t, m, ctx)
+	ploriGrantExactly(t, m, 0)
+	w := PloriWithQuotaAdmission(m)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	var count uint64
+	if st := w.Remove(ctx, RootInode, "tree", false, 1, &count); st != 0 {
+		t.Fatalf("nested remove after admission: %s", st)
+	}
+	if got := a.calls.Load(); got != 1 {
+		t.Fatalf("admission calls = %d, want 1", got)
+	}
+	if ctx.Canceled() {
+		t.Fatal("the operation canceled its caller's context")
+	}
+	cloneFenceAbsent(t, m, ctx, RootInode, "tree")
+	if s, i := ploriPending(m); s != 0 || i != 0 {
+		t.Fatalf("pending after remove = %d/%d", s, i)
+	}
+	if st := w.Remove(ctx, RootInode, "missing", false, 1, &count); st != syscall.ENOENT || a.calls.Load() != 1 {
+		t.Fatalf("remove of a missing name = %s after %d admissions, want ENOENT with no admission", st, a.calls.Load())
+	}
+}
+
+// A caller canceled while its Remove is refused is not waited on or retried,
+// even though the refusal is the ceiling's.
+func TestPloriAdmissionRemoveStopsForACanceledCaller(t *testing.T) {
+	m, _ := openQuotaVolumeWithTrash(t, 8<<20, 65536, 1)
+	setup := Background()
+	ploriNestedTree(t, m, setup)
+	ploriGrantExactly(t, m, 0)
+	w := PloriWithQuotaAdmission(m)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	ctx := Background()
+	hook := volumeQuotaHook
+	volumeQuotaHook = func(c Context) {
+		hook(c)
+		ctx.Cancel() // the caller goes away at the moment of the refusal
+	}
+	t.Cleanup(func() { volumeQuotaHook = hook })
+	var count uint64
+	if st := w.Remove(ctx, RootInode, "tree", false, 1, &count); st != syscall.EINTR {
+		t.Fatalf("remove for a canceled caller = %s, want EINTR", st)
+	}
+	if got := a.calls.Load(); got != 0 {
+		t.Fatalf("admission calls = %d for a canceled caller", got)
+	}
+	cloneFencePresent(t, m, setup, RootInode, "tree")
+	if s, i := ploriPending(m); s != 0 || i != 0 {
+		t.Fatalf("pending after canceled remove = %d/%d", s, i)
+	}
+}
+
+// openSliceDataVolume creates a SQLite volume and opens it the way
+// plori-mount's Serve does: PloriWithQuotaBasis before NewSession.
+func openSliceDataVolume(t *testing.T, capacity, inodes uint64) (*dbMeta, Meta) {
+	t.Helper()
+	m, err := newSQLMeta("sqlite3", filepath.Join(t.TempDir(), "slicedata.db"), testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	t.Cleanup(func() { _ = m.Shutdown() })
+	format := testFormat()
+	format.Capacity = capacity
+	format.Inodes = inodes
+	if err := m.Init(format, true); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+	w, err := PloriWithQuotaBasis(m, QuotaBasisSliceData)
+	if err != nil {
+		t.Fatalf("slice_data basis: %s", err)
+	}
+	if err := m.NewSession(true); err != nil {
+		t.Fatalf("open session: %s", err)
+	}
+	return m.(*dbMeta), w
+}
+
+// An overwrite inside the file length is refused at the ceiling in
+// slice_data mode, waits for a grant and is retried once.
+func TestPloriQuotaSliceDataAdmissionRetriesARefusedOverwrite(t *testing.T) {
+	m, w := openSliceDataVolume(t, 64<<20, 65536)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	f := dsFile(t, w, RootInode, "f")
+	if st := dsWrite(w, Background(), f, 0, 4<<20); st != 0 {
+		t.Fatal(st)
+	}
+	ploriGrantExactly(t, m, 0)
+	var attr Attr
+	if st := m.GetAttr(Background(), f, &attr); st != 0 || attr.Length != 4<<20 {
+		t.Fatalf("setup: getattr %s length %d", st, attr.Length)
+	}
+	if st := dsWrite(w, Background(), f, 0, 1<<20); st != 0 {
+		t.Fatalf("overwrite after admission = %s", st)
+	}
+	if got := a.calls.Load(); got != 1 {
+		t.Fatalf("admission calls = %d, want 1", got)
+	}
+	if got := m.dataSpace.Load(); got != 5<<20 {
+		t.Fatalf("slice data %d, want %d", got, 5<<20)
+	}
+	if s, i := ploriPending(m); s != 0 || i != 0 {
+		t.Fatalf("pending after the call = %d/%d", s, i)
+	}
+}
+
+// The 80 percent trigger reads the slice data. Clones push the logical
+// counter far past the ceiling without a prefetch; a write that takes the
+// slice data past 80 percent prefetches.
+func TestPloriQuotaSliceDataPrefetchUsesDataBytes(t *testing.T) {
+	const capacity = 10 << 20
+	m, w := openSliceDataVolume(t, capacity, 65536)
+	a := &quotaAdmissionTest{m: m}
+	PloriSetQuotaAdmission(w, a)
+	f := dsFile(t, w, RootInode, "f")
+	if st := dsWrite(w, Background(), f, 0, 4<<20); st != 0 {
+		t.Fatal(st)
+	}
+	for i := 0; i < 5; i++ {
+		if st := dsClone(w, Background(), RootInode, f, "copy"+string(rune('a'+i))); st != 0 {
+			t.Fatalf("clone %d: %s", i, st)
+		}
+	}
+	if logical := PloriLogicalBytes(w); logical <= capacity {
+		t.Fatalf("setup: logical %d, want above the ceiling %d", logical, capacity)
+	}
+	if got := a.prefetches.Load(); got != 0 {
+		t.Fatalf("prefetch below 80 percent of slice data: %d", got)
+	}
+	g := dsFile(t, w, RootInode, "g")
+	if st := dsWrite(w, Background(), g, 0, 4<<20+512<<10); st != 0 {
+		t.Fatal(st)
+	}
+	if got := a.prefetches.Load(); got != 1 {
+		t.Fatalf("prefetch at 80 percent of slice data: %d", got)
+	}
+	if got := a.calls.Load(); got != 0 {
+		t.Fatalf("a successful operation waited for admission: %d", got)
+	}
+}
+
+func TestPloriQuotaBasisSelection(t *testing.T) {
+	for _, basis := range []string{"", QuotaBasisLogical} {
+		m, _ := openQuotaVolume(t, 8<<20, 1024)
+		w, err := PloriWithQuotaBasis(m, basis)
+		if err != nil || PloriQuotaBasis(w) != QuotaBasisLogical {
+			t.Fatalf("basis %q: %v, reported %s", basis, err, PloriQuotaBasis(w))
+		}
+	}
+	m, _ := openQuotaVolume(t, 8<<20, 1024)
+	if _, err := PloriWithQuotaBasis(m, "bogus"); err == nil {
+		t.Fatal("an unknown basis was accepted")
+	}
+	if PloriQuotaBasis(m) != QuotaBasisLogical {
+		t.Fatal("a refused basis changed the mode")
+	}
+	_, w := openSliceDataVolume(t, 8<<20, 1024)
+	if PloriQuotaBasis(w) != QuotaBasisSliceData || PloriDataSpaceDrift() != 0 {
+		t.Fatalf("slice_data mount reports basis %s drift %d", PloriQuotaBasis(w), PloriDataSpaceDrift())
+	}
+	f := dsFile(t, w, RootInode, "f")
+	if st := dsWrite(w, Background(), f, 0, 1<<20); st != 0 {
+		t.Fatal(st)
+	}
+	if st := dsClone(w, Background(), RootInode, f, "g"); st != 0 {
+		t.Fatal(st)
+	}
+	var total, avail, iused, iavail uint64
+	if st := w.StatFS(Background(), RootInode, &total, &avail, &iused, &iavail); st != 0 {
+		t.Fatal(st)
+	}
+	if used := total - avail; used != 1<<20 {
+		t.Fatalf("StatFS used %d, want the slice data %d", used, 1<<20)
+	}
+	if logical := PloriLogicalBytes(w); logical < 2<<20 {
+		t.Fatalf("logical bytes %d, want both copies", logical)
+	}
+}
+
+// slice_data is kept by the SQL engine only; any other engine fails the mount.
+func TestPloriQuotaBasisRefusesRedis(t *testing.T) {
+	m, err := newRedisMeta("redis", "127.0.0.1:6379/8", testConfig())
+	if err != nil {
+		t.Fatalf("create redis meta: %s", err)
+	}
+	t.Cleanup(func() { _ = m.Shutdown() })
+	if _, err := PloriWithQuotaBasis(m, QuotaBasisSliceData); err == nil {
+		t.Fatal("slice_data was accepted on redis")
+	}
+	if PloriQuotaBasis(m) != QuotaBasisLogical {
+		t.Fatal("a refused basis changed the mode")
+	}
 }

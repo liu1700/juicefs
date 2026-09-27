@@ -1752,7 +1752,7 @@ func (m *redisMeta) doCleanupChangelog(ctx Context, maxAge time.Duration, maxLin
 func (m *redisMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash, inode Ino
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -1945,7 +1945,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 		entries = entries[batchSize:]
 		var trash Ino
 		if len(skipCheckTrash) == 0 || !skipCheckTrash[0] {
-			if st := m.checkTrash(parent, &trash); st != 0 {
+			if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 				return st
 			}
 		}
@@ -2300,7 +2300,7 @@ func (m *redisMeta) doBatchUnlink(ctx Context, parent Ino, entries []*Entry, del
 func (m *redisMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, oldAttr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	var trash Ino
 	if !(len(skipCheckTrash) == 1 && skipCheckTrash[0]) {
-		if st := m.checkTrash(parent, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parent, &trash); st != 0 {
 			return st
 		}
 	}
@@ -2432,7 +2432,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 		keys[0], keys[2] = keys[2], keys[0]
 	}
 	if !exchange {
-		if st := m.checkTrash(parentDst, &trash); st != 0 {
+		if st := m.checkTrash(ctx, parentDst, &trash); st != 0 {
 			return st
 		}
 	}
@@ -2484,7 +2484,7 @@ func (m *redisMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentD
 				keys = append(keys, m.entryKey(dino))
 			}
 			if !exchange {
-				if st := m.checkTrash(parentDst, &trash); st != 0 {
+				if st := m.checkTrash(ctx, parentDst, &trash); st != 0 {
 					return st
 				}
 			}
@@ -5339,6 +5339,9 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 		if eno := m.Access(ctx, srcIno, MODE_MASK_R, &attr); eno != 0 {
 			return eno
 		}
+		if eno := m.chargeVolume(ctx, ino, align4K(attr.Length), 1); eno != 0 {
+			return eno
+		}
 		attr.Parent = parent
 		now := time.Now()
 		if cmode&CLONE_MODE_PRESERVE_ATTR == 0 {
@@ -5722,6 +5725,11 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 				}
 				validInfos = append(validInfos, info)
 			}
+			if len(infos) > 0 {
+				if eno := m.chargeVolume(ctx, infos[0].dstIno, batchResult.space, batchResult.inodes); eno != 0 {
+					return eno
+				}
+			}
 
 			_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
 				for _, info := range validInfos {
@@ -5769,6 +5777,9 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 			for _, q := range batchResult.deltas {
 				result.deltas.add(q)
 			}
+			if len(infos) > 0 {
+				result.chargeKeys = append(result.chargeKeys, infos[0].dstIno)
+			}
 		}
 	}
 	return 0
@@ -5783,9 +5794,14 @@ func (m *redisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 	if eno := m.emptyDir(ctx, ino, true, nil, rmConcurrent); eno != 0 {
 		return eno
 	}
-	m.updateStats(-align4K(0), -1)
-	return errno(m.txn(ctx, func(tx *redis.Tx) error {
-		_, err := tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+	removed := false
+	err = m.txn(ctx, func(tx *redis.Tx) error {
+		removed = false
+		exists, err := tx.Exists(ctx, m.inodeKey(ino)).Result()
+		if err != nil || exists == 0 {
+			return err
+		}
+		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
 			p.Del(ctx, m.inodeKey(ino))
 			p.Del(ctx, m.xattrKey(ino))
 			p.DecrBy(ctx, m.usedSpaceKey(), align4K(0))
@@ -5798,8 +5814,13 @@ func (m *redisMeta) doCleanupDetachedNode(ctx Context, ino Ino) syscall.Errno {
 			m.genLog(ctx, p, time.Now(), "CLEANUP(%d)", ino)
 			return nil
 		})
+		removed = err == nil
 		return err
-	}, m.inodeKey(ino), m.xattrKey(ino)))
+	}, m.inodeKey(ino), m.xattrKey(ino))
+	if err == nil && removed {
+		m.updateStats(-align4K(0), -1)
+	}
+	return errno(err)
 }
 
 func (m *redisMeta) doFindDetachedNodes(t time.Time) []Ino {

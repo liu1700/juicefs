@@ -25,7 +25,7 @@ import (
 // MountOptions is the resolved form of the MountSpec's `mount_options`.
 //
 // The vocabulary is closed and small (CLI contract rev 2): `writeback`,
-// `allow_other`, `buffer_size=`, `cache_size=`, `heartbeat=`, `barrier_interval=`,
+// `allow_other`, `buffer_size=`, `cache_size=`, `heartbeat=`, `barrier_interval=`, `quota_basis=`,
 // `litestream_sync=`. It is deliberately NOT "a list of juicefs flags" — the
 // list is server-built and the two sides version independently, so the worker
 // understands a vocabulary rather than a command line.
@@ -55,6 +55,12 @@ type MountOptions struct {
 	// the value bounds THIS heap, and PLORI_MOUNT_OPTIONS — the operator
 	// escape hatch — has to be able to move it after the environment is set.
 	GoMemLimitBytes int64
+	// QuotaBasis is what the volume byte ceiling is compared against:
+	// QuotaBasisLogical (the default) or QuotaBasisSliceData, where slice data
+	// shared by several files, such as the copies of a native clone, counts
+	// once. The control plane sets slice_data for Workspace volumes. An
+	// unknown value is ignored and leaves the default.
+	QuotaBasis string
 	// Ignored holds the keys this worker did not recognise, for one log line.
 	Ignored []string
 }
@@ -109,6 +115,13 @@ const (
 	DefaultTrashDays = 1
 )
 
+// Quota bases, the values of `quota_basis=`. They are the strings pkg/meta
+// accepts (meta.QuotaBasisLogical, meta.QuotaBasisSliceData).
+const (
+	QuotaBasisLogical   = "logical"
+	QuotaBasisSliceData = "slice_data"
+)
+
 // Writeback backlog bounds (PLO-383). The writeback backlog -- blocks staged on
 // local disk and not yet uploaded -- is both the loss window if the node dies
 // and the work the ordered stop's barrier has to finish inside the writer's
@@ -155,6 +168,7 @@ func ParseMountOptions(entries []string) MountOptions {
 		BarrierInterval: DefaultBarrierInterval,
 		LitestreamSync:  DefaultLitestreamSync,
 		GoMemLimitBytes: DefaultGoMemLimit,
+		QuotaBasis:      QuotaBasisLogical,
 	}
 	for _, raw := range entries {
 		key, value, hasValue := strings.Cut(strings.TrimSpace(raw), "=")
@@ -195,6 +209,13 @@ func ParseMountOptions(entries []string) MountOptions {
 			// leaves the default rather than removing the bound.
 			if n, ok := ParseGoSize(value); ok {
 				opts.GoMemLimitBytes = n
+			}
+		case "quota_basis":
+			switch value {
+			case QuotaBasisLogical, QuotaBasisSliceData:
+				opts.QuotaBasis = value
+			default:
+				opts.Ignored = append(opts.Ignored, key)
 			}
 		default:
 			opts.Ignored = append(opts.Ignored, key)

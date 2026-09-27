@@ -221,6 +221,9 @@ type batchCloneResult struct {
 	space  int64
 	inodes int64
 	deltas ugQuotaDeltas
+	// chargeKeys name the volume charges of the transactions that committed
+	// (volume_reservation.go). In memory only.
+	chargeKeys []Ino
 }
 
 func ugKey(uid, gid uint32) uint64 {
@@ -306,6 +309,41 @@ type baseMeta struct {
 
 	fsStatsLock sync.Mutex
 	*fsStat
+
+	// Test seams are client-local so background work on other clients cannot
+	// enter a test's critical-section callbacks. Nil outside tests.
+	volumeTransferTestHook atomic.Pointer[func()]
+	refreshUsageTestHook   atomic.Pointer[func()] // after the remote read
+
+	// volMu guards the volume reservations (volume_reservation.go) and makes
+	// every move between usedSpace, newSpace and the pending claims atomic for
+	// a reservation check. It is a leaf: nothing blocks while holding it.
+	volMu            sync.Mutex
+	pendingSpace     int64
+	pendingInodes    int64
+	unreservedSpace  int64
+	unreservedInodes int64
+	// singleWriterRedis keeps the startup baseline plus local committed deltas.
+	// Guarded by fsStatsLock; enabled before the admission wrapper serves calls.
+	singleWriterRedis bool
+	// sliceData selects QuotaBasisSliceData (volume_reservation.go). It is set
+	// once, before the mount serves, and never cleared.
+	sliceData atomic.Bool
+	// dataSpace is the committed slice data in slice_data mode: the recount at
+	// open plus every committed change since. It is changed only under volMu
+	// and never reread from the engine while the mount runs, because this
+	// process is the only writer.
+	dataSpace atomic.Int64
+	// ploriReleaseAgain marks a chunk whose shadowed-slice release was
+	// requested while another job held it in compacting; the holder runs the
+	// release when it finishes (plori_release.go). Guarded like compacting and
+	// created on first use, as is ploriCompactRefused.
+	ploriReleaseAgain map[uint64]bool
+	// ploriCompactRefused holds the chunks whose compaction was refused by
+	// the data growth claim and already logged. Guarded like compacting.
+	ploriCompactRefused map[uint64]bool
+	// ploriReleasing counts the shadowed-slice release jobs that are running.
+	ploriReleasing atomic.Int64
 
 	parentMu        sync.Mutex        // protect dirParents
 	quotaMu         sync.RWMutex      // protect dirQuotas
@@ -971,16 +1009,7 @@ func (m *baseMeta) refresh(ctx Context) {
 			}
 		}
 
-		if v, err := m.en.getCounter(usedSpace); err == nil {
-			atomic.StoreInt64(&m.usedSpace, v)
-		} else {
-			logger.Warnf("Get counter %s: %s", usedSpace, err)
-		}
-		if v, err := m.en.getCounter(totalInodes); err == nil {
-			atomic.StoreInt64(&m.usedInodes, v)
-		} else {
-			logger.Warnf("Get counter %s: %s", totalInodes, err)
-		}
+		m.refreshUsage()
 		m.loadQuotas()
 
 		if m.conf.ReadOnly || m.conf.NoBGJob || m.conf.Heartbeat == 0 {
@@ -992,6 +1021,45 @@ func (m *baseMeta) refresh(ctx Context) {
 			go m.CleanStaleSessions(ctx)
 		}
 	}
+}
+
+// refreshUsage serializes SQL/KV counter refresh with their pending-delta
+// flush. A single-writer Redis admission client instead retains its startup
+// baseline and committed local deltas. Redis commits remotely before updating
+// memory: rereading in that interval can count either growth or deletion twice.
+// A generation checked only around updateStats cannot close that interval.
+func (m *baseMeta) refreshUsage() {
+	m.fsStatsLock.Lock()
+	defer m.fsStatsLock.Unlock()
+	if m.singleWriterRedis {
+		return
+	}
+	used, usedErr := m.en.getCounter(usedSpace)
+	inodes, inodesErr := m.en.getCounter(totalInodes)
+	runVolumeTestHook(&m.refreshUsageTestHook)
+	m.volMu.Lock()
+	if usedErr == nil {
+		atomic.StoreInt64(&m.usedSpace, used)
+	}
+	if inodesErr == nil {
+		atomic.StoreInt64(&m.usedInodes, inodes)
+	}
+	m.volMu.Unlock()
+	if usedErr != nil {
+		logger.Warnf("Get counter %s: %s", usedSpace, usedErr)
+	}
+	if inodesErr != nil {
+		logger.Warnf("Get counter %s: %s", totalInodes, inodesErr)
+	}
+}
+
+// enableSingleWriterCounters must precede serving admission-wrapped mutations.
+// Startup NewSession still loads the durable counters. Other metadata clients
+// and online counter repair are outside this single-writer contract.
+func (m *baseMeta) enableSingleWriterCounters(redis bool) {
+	m.fsStatsLock.Lock()
+	m.singleWriterRedis = redis
+	m.fsStatsLock.Unlock()
 }
 
 func (m *baseMeta) CleanStaleSessions(ctx Context) {
@@ -1237,6 +1305,11 @@ func (m *baseMeta) statRootFs(ctx Context, totalspace, availspace, iused, iavail
 
 	used += atomic.LoadInt64(&m.newSpace)
 	inodes += atomic.LoadInt64(&m.newInodes)
+	if m.sliceData.Load() {
+		// df reports the number the byte ceiling is compared against, so avail
+		// is what a write can still be admitted for.
+		used = m.dataSpace.Load()
+	}
 	if used < 0 {
 		used = 0
 	}
@@ -1700,7 +1773,7 @@ func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode
 	attr.Full = true
 	st := m.en.doMknod(ctx, parent, name, _type, mode, cumask, path, inode, attr)
 	if st == 0 {
-		m.en.updateStats(space, inodes)
+		m.commitVolume(ctx, nil, space, inodes)
 		m.updateDirStat(ctx, parent, 0, space, inodes)
 		m.updateDirQuota(ctx, parent, space, inodes)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, space, inodes)
@@ -1915,19 +1988,31 @@ func (m *baseMeta) BatchUnlink(ctx Context, parent Ino, entries []*Entry, count 
 }
 
 func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries []*Entry, cmode uint8, cumask uint16, count *uint64) syscall.Errno {
+	if st := m.cloneAllowed(ctx); st != 0 {
+		return st
+	}
 	if len(entries) == 0 {
 		return 0
 	}
 	var r batchCloneResult
 	st := m.en.doBatchClone(ctx, srcParent, dstParent, entries, cmode, cumask, &r)
+	if st != 0 && len(r.chargeKeys) > 0 && volumeReservationFrom(ctx) != nil {
+		// Redis commits a large batch in several transactions. Count the ones
+		// that committed before the failure so their charges are not released
+		// as if nothing had been written.
+		m.commitVolume(ctx, r.chargeKeys, r.space, r.inodes)
+	}
 	if st == 0 {
-		m.en.updateStats(r.space, r.inodes)
-		m.updateDirQuota(ctx, dstParent, r.space, r.inodes)
+		m.commitVolume(ctx, r.chargeKeys, r.space, r.inodes)
+		m.updateDirQuota(cloneAccountingContext(ctx), dstParent, r.space, r.inodes)
 		for _, q := range r.deltas {
 			m.updateUserGroupStat(ctx, q.Uid, q.Gid, q.Space, q.Inodes)
 		}
 		if count != nil {
 			atomic.AddUint64(count, uint64(r.inodes))
+		}
+		if st = m.cloneAllowed(ctx); st != 0 {
+			return st
 		}
 	}
 	return st
@@ -2235,6 +2320,16 @@ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice 
 	var attr Attr
 	st := m.en.doWrite(ctx, inode, indx, off, slice, mtime, &numSlices, &delta, &attr)
 	if st == 0 {
+		if m.sliceData.Load() {
+			// The write inserted one chunk_ref row with refs 1 (doWrite).
+			m.commitVolumeData(ctx, int64(slice.Size))
+			// A write below the old length may cover earlier slices of the
+			// chunk completely (plori_release.go).
+			oldLength := attr.Length - uint64(delta.length)
+			if numSlices > 1 && uint64(indx)*ChunkSize+uint64(off) < oldLength {
+				m.ploriScheduleRelease(inode, indx, indx)
+			}
+		}
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
 		if numSlices%100 == 99 || numSlices > 350 {
@@ -2267,6 +2362,12 @@ func (m *baseMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, 
 	if st == 0 {
 		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
 		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
+		if delta.length < 0 {
+			// A shrink covers the removed range with zero slices, which may
+			// hide earlier slices completely (plori_release.go).
+			oldLength := length + uint64(-delta.length)
+			m.ploriScheduleRelease(inode, uint32(length/ChunkSize), uint32((oldLength-1)/ChunkSize))
+		}
 	}
 	return st
 }
@@ -2892,7 +2993,13 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 	defer func() {
 		m.Lock()
 		delete(m.compacting, k)
+		release := m.ploriReleaseRequested(k)
 		m.Unlock()
+		if release {
+			// A shadowed-slice release was requested while this compaction
+			// held the chunk (plori_release.go).
+			m.ploriScheduleRelease(inode, indx, indx)
+		}
 	}()
 
 	ss, st := m.en.doRead(Background(), inode, indx)
@@ -2924,6 +3031,20 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 			panic(fmt.Sprintf("invalid compaction skipped %d, pos %d, size %d; slices: %s", skipped, pos, size, sstring))
 		}
 	}
+
+	// In slice_data mode the new slice is data the volume keeps next to the
+	// replaced slices until they are released, so it is claimed against the
+	// byte ceiling before its object is written. A refused chunk stays
+	// uncompacted, which costs read performance only.
+	claim, ok := m.claimDataGrowth(int64(size))
+	if !ok {
+		m.ploriCompactRefusedLog(inode, indx, size)
+		return
+	}
+	if claim > 0 {
+		m.ploriCompactClaimed(inode, indx)
+	}
+	defer func() { m.settleDataGrowth(claim) }()
 
 	var id uint64
 	if st = m.NewSlice(Background(), &id); st != 0 {
@@ -2960,6 +3081,8 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 		origin = append(origin, marshalSlice(s.pos, s.id, s.size, s.off, s.len)...)
 	}
 	st = m.en.doCompactChunk(inode, indx, origin, compacted, skipped, pos, id, size, dsbuf)
+	m.settleDataGrowth(claim)
+	claim = 0
 	if st == syscall.EINVAL {
 		logger.Infof("compaction for %d:%d is wasted, delete slice %d (%d bytes)", inode, indx, id, size)
 		m.deleteSlice(id, size)
@@ -3088,7 +3211,13 @@ func (m *baseMeta) toTrash(parent Ino) bool {
 	return m.getFormat().TrashDays > 0
 }
 
-func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
+// checkTrash resolves the hourly trash bucket for a deletion from parent,
+// creating it when this is the first deletion of the hour. The new bucket is
+// volume growth (4 KiB and one inode). With a volume reservation in ctx it is
+// claimed against the ceiling first; a refusal is ENOSPC through the volume
+// quota hook, before the caller's own transaction starts, so the caller can
+// wait for a larger grant and retry. The trash is never bypassed.
+func (m *baseMeta) checkTrash(ctx Context, parent Ino, trash *Ino) syscall.Errno {
 	if !m.toTrash(parent) {
 		return 0
 	}
@@ -3103,16 +3232,26 @@ func (m *baseMeta) checkTrash(parent Ino, trash *Ino) syscall.Errno {
 
 	st := m.en.doLookup(Background(), TrashInode, name, trash, nil)
 	if st == syscall.ENOENT {
-		attr := Attr{Typ: TypeDirectory, Nlink: 2, Length: 4 << 10, Parent: TrashInode, Full: true}
-		st = m.en.doMknod(Background(), TrashInode, name, TypeDirectory, 0555, 0, "", trash, &attr)
-		if st == 0 {
-			m.en.updateStats(align4K(0), 1)
+		claimed := volumeReservationFrom(ctx) != nil
+		if claimed && !m.claimVolumeGrowth(align4K(0), 1) {
+			volumeQuotaTripped(ctx)
+			st = syscall.ENOSPC
+		} else {
+			attr := Attr{Typ: TypeDirectory, Nlink: 2, Length: 4 << 10, Parent: TrashInode, Full: true}
+			st = m.en.doMknod(Background(), TrashInode, name, TypeDirectory, 0555, 0, "", trash, &attr)
+			if claimed {
+				m.settleVolumeGrowth(align4K(0), 1, st == 0)
+			} else if st == 0 {
+				m.en.updateStats(align4K(0), 1)
+			}
 		}
 	}
 
 	m.Lock()
 	if st != 0 && st != syscall.EEXIST {
-		logger.Warnf("create subTrash %s: %s", name, st)
+		if st != syscall.ENOSPC { // a ceiling refusal created nothing
+			logger.Warnf("create subTrash %s: %s", name, st)
+		}
 	} else if *trash <= TrashInode {
 		logger.Warnf("invalid trash inode: %d", *trash)
 		st = syscall.EBADF
@@ -3407,8 +3546,8 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 		return syscall.EPERM
 	}
 
-	if m.readOnly() {
-		return syscall.EROFS
+	if st := m.cloneAllowed(ctx); st != 0 {
+		return st
 	}
 	if name == "" {
 		return syscall.ENOENT
@@ -3436,7 +3575,13 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 		return eno
 	}
 	var sum Summary
-	eno = m.GetSummary(ctx, srcIno, &sum, true, false)
+	// With a volume reservation every clone transaction is charged before it
+	// commits, so the preflight claim only decides whether the clone can be
+	// refused up front instead of midway. A strict walk sizes it from the same
+	// attributes the clone transactions copy, rather than from directory
+	// statistics that can drift.
+	strict := volumeReservationFrom(ctx) != nil
+	eno = m.GetSummary(ctx, srcIno, &sum, true, strict)
 	if eno != 0 {
 		return eno
 	}
@@ -3451,9 +3596,11 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 	if attr.Typ == TypeDirectory {
 		eno = m.cloneEntry(ctx, srcIno, parent, name, &dstIno, cmode, cumask, count, true, concurrent)
 		if eno == 0 {
-			eno = m.en.doAttachDirNode(ctx, parent, dstIno, name)
+			if eno = m.cloneAllowed(ctx); eno == 0 {
+				eno = m.en.doAttachDirNode(ctx, parent, dstIno, name)
+			}
 		}
-		if eno != 0 && dstIno != 0 {
+		if eno != 0 && dstIno != 0 && m.cloneAllowed(ctx) == 0 {
 			if eno := m.en.doCleanupDetachedNode(ctx, dstIno); eno != 0 {
 				logger.Errorf("remove detached tree (%d): %s", dstIno, eno)
 			}
@@ -3462,13 +3609,39 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 		eno = m.cloneEntry(ctx, srcIno, parent, name, nil, cmode, cumask, count, true, concurrent)
 	}
 	if eno == 0 {
-		m.updateDirStat(ctx, parent, int64(attr.Length), align4K(attr.Length), 1)
-		m.updateDirQuota(ctx, parent, int64(sum.Size), int64(sum.Dirs)+int64(sum.Files))
+		accountingCtx := cloneAccountingContext(ctx)
+		m.updateDirStat(accountingCtx, parent, int64(attr.Length), align4K(attr.Length), 1)
+		m.updateDirQuota(accountingCtx, parent, int64(sum.Size), int64(sum.Dirs)+int64(sum.Files))
+		eno = m.cloneAllowed(ctx)
 	}
 	return eno
 }
 
+// cloneAccountingContext preserves accounting for a committed clone even if
+// its caller cancels. It is used only for counters and read-only ancestor
+// lookup, never to start another clone transaction. The writer supervisor
+// still bounds shutdown if a metadata read does not finish.
+func cloneAccountingContext(ctx Context) Context {
+	return WrapWithoutCancel(context.WithoutCancel(ctx), ctx.Pid(), ctx.Uid(), ctx.Gids())
+}
+
+// cloneAllowed rejects clone work once its request is canceled or this client
+// has lost dynamic write authority. Callers use it before each new clone step
+// and before publishing a directory clone.
+func (m *baseMeta) cloneAllowed(ctx Context) syscall.Errno {
+	if ctx.Canceled() {
+		return errno(ctx.Err())
+	}
+	if m.readOnly() {
+		return syscall.EROFS
+	}
+	return 0
+}
+
 func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, dstIno *Ino, cmode uint8, cumask uint16, count *uint64, top bool, concurrent chan struct{}) syscall.Errno {
+	if st := m.cloneAllowed(ctx); st != 0 {
+		return st
+	}
 	ino, err := m.nextInode()
 	if err != nil {
 		return errno(err)
@@ -3481,11 +3654,16 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	if eno != 0 {
 		return eno
 	}
-	m.en.updateStats(align4K(attr.Length), 1)
+	m.commitVolume(ctx, []Ino{ino}, align4K(attr.Length), 1)
 	atomic.AddUint64(count, 1)
 	m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, align4K(attr.Length), 1)
 	if attr.Typ != TypeDirectory {
+		// The top-level caller accounts the published entry before reporting
+		// cancellation or authority loss. No further clone work starts here.
 		return 0
+	}
+	if eno = m.cloneAllowed(ctx); eno != 0 {
+		return eno
 	}
 	if eno = m.Access(ctx, srcIno, MODE_MASK_R|MODE_MASK_X, &attr); eno != 0 {
 		return eno
@@ -3591,9 +3769,11 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	}
 
 	if eno == 0 && skipped > 0 {
-		attr.Nlink -= skipped
-		if eno := m.en.doRepair(ctx, ino, &attr); eno != 0 {
-			logger.Warnf("fix nlink of %d: %s", ino, eno)
+		if eno = m.cloneAllowed(ctx); eno == 0 {
+			attr.Nlink -= skipped
+			if eno := m.en.doRepair(ctx, ino, &attr); eno != 0 {
+				logger.Warnf("fix nlink of %d: %s", ino, eno)
+			}
 		}
 	}
 	return eno
