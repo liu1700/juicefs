@@ -327,7 +327,7 @@ jobs:
         run: kill "$(cat "$RUNNER_TEMP/minio.pid")" 2>/dev/null || true
 
   release:
-    if: github.repository == 'liu1700/juicefs' && github.ref_type == 'tag'
+    if: github.repository == 'plori-ai/juicefs' && github.ref_type == 'tag'
     needs: verify
     runs-on: ubuntu-24.04
     permissions:
