@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -92,6 +93,8 @@ type Supervisor struct {
 	// did not already pay: before PLO-913 the stop could not even be noticed
 	// until the periodic barrier returned.
 	barrierMu sync.Mutex
+
+	admissionOutcomes [3]atomic.Uint64
 
 	mu              sync.Mutex
 	lastBarrier     BarrierResult
@@ -1966,6 +1969,13 @@ func (s *Supervisor) admissionBound() time.Duration {
 	return AdmissionRenewRounds * s.Spec.LeaseRenewInterval.D()
 }
 
+func admissionInterrupt(ctx context.Context) <-chan struct{} {
+	if request, ok := ctx.(interface{ PloriInterrupt() <-chan struct{} }); ok {
+		return request.PloriInterrupt()
+	}
+	return ctx.Done()
+}
+
 // Admit runs after the refused metadata transaction has returned. Cancellation
 // releases only this waiter; the shared allocation remains useful to others.
 //
@@ -1991,9 +2001,22 @@ func (s *Supervisor) admissionBound() time.Duration {
 // full account is the user buying disk, and only a renew carrying Grow will
 // notice that they did (TestAGrowTheAccountCannotFundIsAskedAgain), so refusing
 // must not also stop asking.
-func (s *Supervisor) Admit(ctx context.Context) syscall.Errno {
-	if ctx.Err() != nil {
+func (s *Supervisor) Admit(ctx context.Context) (result syscall.Errno) {
+	defer func() {
+		switch result {
+		case 0:
+			s.admissionOutcomes[0].Add(1)
+		case syscall.ENOSPC:
+			s.admissionOutcomes[1].Add(1)
+		case syscall.EINTR:
+			s.admissionOutcomes[2].Add(1)
+		}
+	}()
+	// FUSE Err is always EINTR; only the request cancel signal proves interruption.
+	select {
+	case <-admissionInterrupt(ctx):
 		return syscall.EINTR
+	default:
 	}
 	s.mu.Lock()
 	s.noteCeilingRefusedLocked()
@@ -2010,7 +2033,7 @@ func (s *Supervisor) Admit(ctx context.Context) syscall.Errno {
 	timer := time.NewTimer(bound)
 	defer timer.Stop()
 	select {
-	case <-ctx.Done():
+	case <-admissionInterrupt(ctx):
 		return syscall.EINTR
 	case <-f.done:
 		return f.result

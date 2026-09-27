@@ -641,6 +641,9 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	})
 	admittedMeta := meta.PloriWithQuotaAdmission(p.m)
 	meta.PloriSetQuotaAdmission(admittedMeta, p.quotaAdmission)
+	if collector, ok := p.quotaAdmission.(prometheus.Collector); ok {
+		p.reg.MustRegister(collector)
+	}
 	p.v = vfs.NewVFS(p.vfsConf, admittedMeta, p.store, p.reg, p.registry)
 	p.v.UpdateFormat = updateFormat(p.cli)
 	// plori-mount serves FUSE in this process instead of going through the

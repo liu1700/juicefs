@@ -347,3 +347,32 @@ drives a real AWS SDK client against an in-process shim that honours
 mounts it, writes a file, stops with SIGTERM and requires exit 0, then restores
 the replica into a fresh state directory under a new writer epoch and reads the
 same bytes back.
+
+## Quota refusal and interrupts
+
+A volume-ceiling refusal waits for a larger grant for at most three lease-renew
+intervals. Once growth is denied, subsequent refusals return `ENOSPC` immediately
+while still requesting growth. A closed FUSE request cancel channel returns
+`EINTR`; `fuseContext.Err()` alone does not indicate an interrupt. Quota admission
+reads this channel through `PloriInterrupt()`; upstream `Done()` behavior is
+unchanged. Other contexts use `Done()` for admission cancellation.
+
+The per-mount registry exports `juicefs_plori_quota_trips_total{outcome}`.
+Each completed `Supervisor.Admit` call increments `admitted` for a grant received
+in time, `refused` for `ENOSPC`, or `interrupted` for cancellation returning
+`EINTR`. A fenced mount returns `EROFS` and does not increment these outcomes.
+The registry wrapper adds the same constant labels as other JuiceFS metrics.
+
+The quota regression uses a local SQLite volume and a real FUSE mount. It needs
+Linux FUSE access, `fusermount`/`fusermount3`, and Python 3; it needs no S3 service
+or Litestream. This foreground command is suitable for a FUSE-enabled CI runner:
+
+```sh
+PLORI_QUOTA_FUSE_TEST=1 go test -count=1 -timeout 2m \
+  -tags "$(make -s plori.tags)" ./pkg/fuse -run '^TestPloriQuota' -v
+```
+
+Go `os.CreateTemp` and Python `open()` run in bounded subprocesses. The test
+requires `ENOSPC` and checks that each caller produces one to nine creates using
+`juicefs_fuse_ops_total{method="create"}`. Admission is bounded at 150 ms in this
+test, with a separate one-second process-start and scheduling allowance.
