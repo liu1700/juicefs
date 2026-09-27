@@ -630,7 +630,7 @@ func (m *kvMeta) doFlushStats() {
 			// the flushed delta in neither counter.
 			m.volMu.Lock()
 			atomic.AddInt64(&m.newSpace, -space)
-			runVolumeTestHook(&volumeTransferTestHook)
+			runVolumeTestHook(&m.volumeTransferTestHook)
 			atomic.StoreInt64(&m.usedSpace, v)
 			m.volMu.Unlock()
 		} else {

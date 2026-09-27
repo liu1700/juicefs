@@ -310,6 +310,11 @@ type baseMeta struct {
 	fsStatsLock sync.Mutex
 	*fsStat
 
+	// Test seams are client-local so background work on other clients cannot
+	// enter a test's critical-section callbacks. Nil outside tests.
+	volumeTransferTestHook atomic.Pointer[func()]
+	refreshUsageTestHook   atomic.Pointer[func()] // after the remote read
+
 	// volMu guards the volume reservations (volume_reservation.go) and makes
 	// every move between usedSpace, newSpace and the pending claims atomic for
 	// a reservation check. It is a leaf: nothing blocks while holding it.
@@ -1031,7 +1036,7 @@ func (m *baseMeta) refreshUsage() {
 	}
 	used, usedErr := m.en.getCounter(usedSpace)
 	inodes, inodesErr := m.en.getCounter(totalInodes)
-	runVolumeTestHook(&refreshUsageTestHook)
+	runVolumeTestHook(&m.refreshUsageTestHook)
 	m.volMu.Lock()
 	if usedErr == nil {
 		atomic.StoreInt64(&m.usedSpace, used)

@@ -1544,7 +1544,7 @@ func (m *dbMeta) doFlushStats() {
 			// the flushed delta in neither counter.
 			m.volMu.Lock()
 			atomic.AddInt64(&m.newSpace, -newSpace)
-			runVolumeTestHook(&volumeTransferTestHook)
+			runVolumeTestHook(&m.volumeTransferTestHook)
 			atomic.AddInt64(&m.usedSpace, newSpace)
 			atomic.AddInt64(&m.newInodes, -newInodes)
 			atomic.AddInt64(&m.usedInodes, newInodes)

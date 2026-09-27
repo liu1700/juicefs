@@ -65,13 +65,6 @@ func volumeReservationFrom(ctx Context) *volumeReservation {
 	return r
 }
 
-// Test seams, nil outside tests. They run inside the critical sections they
-// are named after so a test can prove what those sections exclude.
-var (
-	volumeTransferTestHook atomic.Pointer[func()]
-	refreshUsageTestHook   atomic.Pointer[func()] // after the remote read
-)
-
 func runVolumeTestHook(h *atomic.Pointer[func()]) {
 	if f := h.Load(); f != nil {
 		(*f)()

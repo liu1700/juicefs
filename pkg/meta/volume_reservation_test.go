@@ -628,6 +628,42 @@ func TestVolumeReservationLedgerRules(t *testing.T) {
 	}
 }
 
+func TestVolumeReservationHooksAreClientScoped(t *testing.T) {
+	for _, e := range volresEngines {
+		t.Run(e.name, func(t *testing.T) {
+			m, b := volresOpen(t, e, volresCapacity, 0)
+			other, otherBase := volresOpen(t, e, volresCapacity, 0)
+			volresNode(t, m, RootInode, "f", TypeFile)
+			volresNode(t, other, RootInode, "other", TypeFile)
+			var refreshes, transfers atomic.Int32
+			refreshHook := func() { refreshes.Add(1) }
+			transferHook := func() { transfers.Add(1) }
+			b.refreshUsageTestHook.Store(&refreshHook)
+			b.volumeTransferTestHook.Store(&transferHook)
+			t.Cleanup(func() {
+				b.refreshUsageTestHook.Store(nil)
+				b.volumeTransferTestHook.Store(nil)
+			})
+
+			// Model another client's background work while our hooks are installed.
+			otherBase.doFlushStats()
+			otherBase.refreshUsage()
+			if refreshes.Load() != 0 || transfers.Load() != 0 {
+				t.Fatalf("another client invoked hooks: refreshes=%d transfers=%d", refreshes.Load(), transfers.Load())
+			}
+			b.doFlushStats()
+			b.refreshUsage()
+			wantTransfers := int32(1)
+			if e.name == "redis" {
+				wantTransfers = 0
+			}
+			if refreshes.Load() != 1 || transfers.Load() != wantTransfers {
+				t.Fatalf("owner invoked hooks: refreshes=%d transfers=%d, want 1/%d", refreshes.Load(), transfers.Load(), wantTransfers)
+			}
+		})
+	}
+}
+
 // The flush moves its delta from newSpace to usedSpace in two steps. A
 // lock-free reader between them undercounts by the delta; the reservation
 // check is excluded from that interval by volMu. Redis has no such transfer:
@@ -649,8 +685,8 @@ func TestVolumeReservationFlushTransferIsAtomic(t *testing.T) {
 					excluded = true
 				}
 			}
-			volumeTransferTestHook.Store(&hook)
-			t.Cleanup(func() { volumeTransferTestHook.Store(nil) })
+			b.volumeTransferTestHook.Store(&hook)
+			t.Cleanup(func() { b.volumeTransferTestHook.Store(nil) })
 			b.doFlushStats()
 			if e.name == "redis" {
 				if invoked || atomic.LoadInt64(&b.newSpace) != 0 {
@@ -719,9 +755,9 @@ func TestVolumeReservationRefreshDoesNotOverwriteAFlush(t *testing.T) {
 				case <-time.After(20 * time.Millisecond):
 				}
 			}
-			refreshUsageTestHook.Store(&hook)
+			b.refreshUsageTestHook.Store(&hook)
 			b.refreshUsage()
-			refreshUsageTestHook.Store(nil)
+			b.refreshUsageTestHook.Store(nil)
 			<-flushed
 			if !excluded || early {
 				t.Fatalf("a flush can commit between refresh's read and store (excluded=%t early=%t)", excluded, early)
