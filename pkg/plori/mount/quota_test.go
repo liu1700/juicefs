@@ -31,6 +31,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // The grant conversation, from the supervisor's side. What the metadata engine
@@ -118,11 +120,14 @@ func countGrows(reqs []RenewRequest) int {
 type joinedAdmissionContext struct {
 	context.Context
 	joined chan struct{}
-	once   sync.Once
+	calls  int
 }
 
 func (c *joinedAdmissionContext) Done() <-chan struct{} {
-	c.once.Do(func() { close(c.joined) })
+	c.calls++
+	if c.calls == 2 {
+		close(c.joined)
+	}
 	return c.Context.Done()
 }
 
@@ -280,7 +285,7 @@ func TestQuotaFlightConcurrentWaitersShareOneRenew(t *testing.T) {
 	sup := newSup(t, testSpec(), &fakeFS{vol: healthyVolume()}, &fakeCP{}, &fakeReplicator{}, &fakeFencer{})
 	sup.admissionRenew = make(chan struct{}, 1)
 	results := make(chan syscall.Errno, 2)
-	// Admit evaluates Done only after it has released sup.mu and captured the
+	// Admit evaluates Done a second time after releasing sup.mu and capturing the
 	// shared flight. These notifications therefore prove both waiters joined
 	// before the test completes the flight.
 	newJoinedContext := func() *joinedAdmissionContext {
@@ -899,4 +904,91 @@ func settledGoroutines() int {
 		last, stable = n, 0
 	}
 	return last
+}
+
+func TestQuotaTripMetrics(t *testing.T) {
+	s := &Supervisor{Spec: &MountSpec{LeaseRenewInterval: Duration(100 * time.Millisecond)}, admissionRenew: make(chan struct{}, 1)}
+	registry := prometheus.NewRegistry()
+	reg := prometheus.WrapRegistererWithPrefix("juicefs_", prometheus.WrapRegistererWith(prometheus.Labels{"vol_name": "test"}, registry))
+	reg.MustRegister(s)
+	check := func(want map[string]float64) {
+		t.Helper()
+		families, err := registry.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(families) != 1 || families[0].GetName() != "juicefs_plori_quota_trips_total" {
+			t.Fatalf("unexpected metrics: %v", families)
+		}
+		got := map[string]float64{}
+		for _, metric := range families[0].Metric {
+			for _, label := range metric.Label {
+				if label.GetName() == "outcome" {
+					got[label.GetValue()] = metric.GetCounter().GetValue()
+				}
+				if label.GetName() == "vol_name" && label.GetValue() != "test" {
+					t.Fatal("constant label lost")
+				}
+			}
+		}
+		if len(got) != len(want) {
+			t.Fatalf("outcomes = %v", got)
+		}
+		for outcome, n := range want {
+			if got[outcome] != n {
+				t.Fatalf("%s = %v, want %v", outcome, got[outcome], n)
+			}
+		}
+	}
+	check(map[string]float64{"admitted": 0, "refused": 0, "interrupted": 0})
+	if st := s.Admit(context.Background()); st != syscall.ENOSPC {
+		t.Fatal(st)
+	}
+	s.growRefused()
+	if st := s.Admit(context.Background()); st != syscall.ENOSPC {
+		t.Fatal(st)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if st := s.Admit(ctx); st != syscall.EINTR {
+		t.Fatal(st)
+	}
+	s.mu.Lock()
+	s.growDenied = false
+	s.finishQuotaFlightLocked(0)
+	s.mu.Unlock()
+	<-s.admissionRenew
+	ctx, cancel = context.WithCancel(context.Background())
+	joined := &joinedAdmissionContext{Context: ctx, joined: make(chan struct{})}
+	result := make(chan syscall.Errno, 1)
+	go func() { result <- s.Admit(joined) }()
+	<-joined.joined
+	cancel()
+	if st := <-result; st != syscall.EINTR {
+		t.Fatal(st)
+	}
+	s.mu.Lock()
+	if s.quotaFlight == nil {
+		t.Fatal("interrupt canceled shared growth")
+	}
+	s.mu.Unlock()
+	joined = &joinedAdmissionContext{Context: context.Background(), joined: make(chan struct{})}
+	go func() { result <- s.Admit(joined) }()
+	<-joined.joined
+	s.mu.Lock()
+	s.finishQuotaFlightLocked(0)
+	s.mu.Unlock()
+	if st := <-result; st != 0 {
+		t.Fatal(st)
+	}
+	s.mu.Lock()
+	s.fenced = true
+	s.mu.Unlock()
+	if st := s.Admit(context.Background()); st != syscall.EROFS {
+		t.Fatal(st)
+	}
+	check(map[string]float64{"admitted": 1, "refused": 2, "interrupted": 2})
+	registry = prometheus.NewRegistry()
+	prometheus.WrapRegistererWithPrefix("juicefs_", registry).MustRegister(&Supervisor{})
+	check(map[string]float64{"admitted": 0, "refused": 0, "interrupted": 0})
 }

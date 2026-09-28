@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -90,6 +91,8 @@ type Supervisor struct {
 	// stop". It is what turns the write-stop margin from a constant into a
 	// bound (PLO-383).
 	drain *DrainModel
+
+	admissionOutcomes [3]atomic.Uint64
 
 	mu              sync.Mutex
 	lastBarrier     BarrierResult
@@ -2075,6 +2078,13 @@ func (s *Supervisor) admissionBound() time.Duration {
 	return AdmissionRenewRounds * s.Spec.LeaseRenewInterval.D()
 }
 
+func admissionInterrupt(ctx context.Context) <-chan struct{} {
+	if request, ok := ctx.(interface{ PloriInterrupt() <-chan struct{} }); ok {
+		return request.PloriInterrupt()
+	}
+	return ctx.Done()
+}
+
 // Admit runs after the refused metadata transaction has returned. Cancellation
 // releases only this waiter; the shared allocation remains useful to others.
 //
@@ -2100,20 +2110,37 @@ func (s *Supervisor) admissionBound() time.Duration {
 // full account is the user buying disk, and only a renew carrying Grow will
 // notice that they did (TestAGrowTheAccountCannotFundIsAskedAgain), so refusing
 // must not also stop asking.
-func (s *Supervisor) Admit(ctx context.Context) syscall.Errno {
-	// JuiceFS metadata contexts expose Canceled separately. In particular,
-	// fuseContext.Err always returns EINTR and its Done channel is nil, even
-	// before cancellation. Use its cancellation contract for admission waits.
-	canceled := func() bool { return ctx.Err() != nil }
+func (s *Supervisor) Admit(ctx context.Context) (result syscall.Errno) {
+	defer func() {
+		switch result {
+		case 0:
+			s.admissionOutcomes[0].Add(1)
+		case syscall.ENOSPC:
+			s.admissionOutcomes[1].Add(1)
+		case syscall.EINTR:
+			s.admissionOutcomes[2].Add(1)
+		}
+	}()
+	// Older metadata contexts expose cancellation without a Done channel.
+	// FUSE requests use PloriInterrupt directly and need no polling.
+	var canceled func() bool
 	var tick <-chan time.Time
-	if c, ok := ctx.(interface{ Canceled() bool }); ok {
-		canceled = c.Canceled
-		timer := time.NewTicker(100 * time.Millisecond)
-		defer timer.Stop()
-		tick = timer.C
+	if _, ok := ctx.(interface{ PloriInterrupt() <-chan struct{} }); !ok {
+		if c, ok := ctx.(interface{ Canceled() bool }); ok {
+			canceled = c.Canceled
+			poll := time.NewTicker(100 * time.Millisecond)
+			defer poll.Stop()
+			tick = poll.C
+		}
 	}
-	if canceled() {
+	if canceled != nil && canceled() {
 		return syscall.EINTR
+	}
+	// FUSE Err is always EINTR; only the request cancel signal proves interruption.
+	select {
+	case <-admissionInterrupt(ctx):
+		return syscall.EINTR
+	default:
 	}
 	s.mu.Lock()
 	s.noteCeilingRefusedLocked()
@@ -2131,15 +2158,20 @@ func (s *Supervisor) Admit(ctx context.Context) syscall.Errno {
 	defer timer.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-admissionInterrupt(ctx):
 			return syscall.EINTR
 		case <-tick:
 			if canceled() {
 				return syscall.EINTR
 			}
 		case <-f.done:
-			if canceled() {
+			if canceled != nil && canceled() {
 				return syscall.EINTR
+			}
+			select {
+			case <-admissionInterrupt(ctx):
+				return syscall.EINTR
+			default:
 			}
 			return f.result
 		case <-timer.C:

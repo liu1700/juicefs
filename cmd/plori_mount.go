@@ -704,6 +704,9 @@ func (p *ploriVolume) Serve(ctx context.Context) error {
 	p.m.OnReload(func(fmtp *meta.Format) {
 		p.store.UpdateLimit(fmtp.UploadLimit, fmtp.DownloadLimit)
 	})
+	if collector, ok := p.quotaAdmission.(prometheus.Collector); ok {
+		p.reg.MustRegister(collector)
+	}
 	p.v = vfs.NewVFS(p.vfsConf, admittedMeta, p.store, p.reg, p.registry)
 	p.v.UpdateFormat = updateFormat(p.cli)
 	// plori-mount serves FUSE in this process instead of going through the
