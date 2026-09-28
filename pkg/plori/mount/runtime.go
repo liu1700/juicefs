@@ -21,6 +21,7 @@ package mount
 
 import (
 	"context"
+	"errors"
 	"syscall"
 	"time"
 )
@@ -384,12 +385,33 @@ type ReplicationSupervisor interface {
 	// now. It must be cheap enough to run on every health tick and must not
 	// block on the object store, so it asks about the LOCAL replication
 	// machinery rather than about the replica's contents.
+	//
+	// A failure wraps ErrReplicatorGone when nothing is replicating and a
+	// Restart is the repair, and ErrReplicatorStarting while a replacement is
+	// still coming up. Any other error is a replicator that is present but did
+	// not answer in time or answered with an error; the supervisor restarts it
+	// only after ReplicationProbeFailuresBeforeRestart of those in a row.
 	Probe(ctx context.Context) error
 	// Restart puts replication back after Probe failed. The supervisor calls
-	// it from its own goroutine, so it never overlaps a barrier or a stop,
-	// and never more than once per uninterrupted failure.
+	// it from its own goroutine, so it never overlaps a barrier or a stop, and
+	// after one successful Restart it does not call it again for the same
+	// uninterrupted failure. Restart must not wait for the replacement to
+	// become ready: the goroutine that calls it also renews the lease and
+	// writes health.json (PLO-913, PLO-1172). Readiness is reported by the
+	// next Probe calls through ErrReplicatorStarting.
 	Restart(ctx context.Context) error
 }
+
+// ErrReplicatorGone marks a probe failure where nothing is replicating this
+// database: the child exited, was never started, or never opened its control
+// socket, or the node replicator has no registration for it. Restart is the
+// repair, so the supervisor attempts it on the first such failure.
+var ErrReplicatorGone = errors.New("replicator is not running")
+
+// ErrReplicatorStarting marks a probe made while a replacement started by
+// Restart has not yet opened its control socket. The replacement is left
+// alone until its own start deadline; killing it would only restart the wait.
+var ErrReplicatorStarting = errors.New("replicator is starting")
 
 // ReplicatorRestartCounter is optional because node-level replication does
 // not own a Litestream child for an individual mount. The per-mount

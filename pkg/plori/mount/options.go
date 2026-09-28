@@ -34,6 +34,33 @@ const (
 	// reads anything older than 60 s as degraded, so the worker rewrites it
 	// well inside that regardless of how long the renew interval is.
 	HealthWriteInterval = 10 * time.Second
+	// ReplicationRecoveryWindow is how long replication may stay failed
+	// before the mount takes the ordered replication-failed stop; the lease
+	// stop instant still caps it. It bounds how long metadata writes can go
+	// unreplicated. It is not a fence: the lease deadline guard, the metadata
+	// write gate and the per-generation replica prefix fence a stale writer.
+	//
+	// It is separate from the barrier interval (PLO-1172). Until then the
+	// window was the 5 s barrier period, which is shorter than one probe
+	// timeout plus one restart: in incident B a live Litestream under memory
+	// pressure missed one 5 s probe, was killed, and its replacement had no
+	// control socket when the window closed 7.7 s after the first failure, so
+	// the session was lost with a healthy lease. 30 s covers
+	// ReplicationProbeFailuresBeforeRestart timed-out probes (about 10 s of
+	// failure, since the first failure is recorded when the first probe
+	// returns) and leaves about 20 s for a replacement to open its socket and
+	// answer one probe.
+	ReplicationRecoveryWindow = 30 * time.Second
+	// ReplicationProbeFailuresBeforeRestart is how many consecutive probe
+	// failures a replicator that is still running gets before it is
+	// restarted. Each timed-out probe blocks for ProbeTimeout (5 s), and while
+	// replication is failed the one-second guard runs the next probe
+	// immediately, so the third failure lands about 10 s after the first is
+	// recorded. One or two slow answers are what memory pressure produces and
+	// a restart does not fix; three in a row over 15 s is a child that is not
+	// serving, and a restart at 10 s still leaves most of the window for the
+	// replacement.
+	ReplicationProbeFailuresBeforeRestart = 3
 	// AdmissionRenewRounds is how many lease-renew intervals a write refused by
 	// the volume ceiling may wait for an answer before it is given the
 	// ceiling's own errno. It is counted in renew intervals rather than set as
