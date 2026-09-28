@@ -269,6 +269,20 @@ jobs:
             -run '^(TestRestoreByTXIDMatchesTheDurablePointWhereATimestampDoesNot|TestRestoreTimestampFallsBehindAfterRealL0Retention|TestRealAbortResidualRestoresToTheRecordedPointOrRepairsTheLatest)$' \
             ./pkg/plori/mount/ ./pkg/plori/restore/
 
+      - name: Exercise plori-mount replication fault recovery
+        env:
+          AWS_ACCESS_KEY_ID: plori-ci
+          AWS_SECRET_ACCESS_KEY: plori-ci-secret
+          AWS_REGION: us-east-1
+          S3_ENDPOINT: http://127.0.0.1:9000
+          S3_BUCKET: plori-ci-mount
+          PLORI_E2E_SCENARIO: replication-faults
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+            -s hack/plori-mount-e2e -p '*_test.py' -v
+          PLORI_BIN=./juicefs.plori LITESTREAM_BIN="$RUNNER_TEMP/litestream" \
+            hack/plori-mount-e2e/run.sh
+
       - name: Clean up the plori-mount lifecycle test
         if: always()
         run: |

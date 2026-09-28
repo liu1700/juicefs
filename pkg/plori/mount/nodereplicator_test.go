@@ -322,6 +322,11 @@ func TestProbeFailsWhenTheDaemonForgotThisDatabaseAndRestartRegistersIt(t *testi
 	if !errors.As(err, &status) || status.Status != http.StatusNotFound {
 		t.Fatalf("probe error = %v, want a 404 the caller can tell apart", err)
 	}
+	// The 404 is the one failure that means "not registered", so it is the one
+	// the supervisor re-registers on at once (PLO-1172).
+	if !errors.Is(err, ErrReplicatorGone) {
+		t.Fatalf("probe error = %v, want it to wrap ErrReplicatorGone", err)
+	}
 
 	if err := n.Restart(context.Background()); err != nil {
 		t.Fatalf("restart: %v", err)
@@ -341,8 +346,14 @@ func TestProbeFailsWhenTheSocketIsGone(t *testing.T) {
 	}
 	f.srv.Close()
 	_ = os.Remove(f.socket)
-	if err := n.Probe(context.Background()); err == nil {
+	err := n.Probe(context.Background())
+	if err == nil {
 		t.Fatal("probe passed with no replicator listening")
+	}
+	// Registering fails too while no daemon listens, so this is counted, not
+	// treated as the lost registration a restart repairs.
+	if errors.Is(err, ErrReplicatorGone) {
+		t.Fatalf("probe error = %v, want a plain failure, not ErrReplicatorGone", err)
 	}
 }
 

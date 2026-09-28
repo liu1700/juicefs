@@ -310,10 +310,18 @@ func (n *NodeReplicator) Abort(ctx context.Context) error {
 // database. A 404 means it is not — the daemon restarted and lost every
 // registration, which is exactly the failure PLO-411 exists to notice — and
 // Restart re-registers.
+//
+// Only the 404 wraps ErrReplicatorGone. Any other failure (no socket while
+// the daemon restarts, a timeout, an error status) is counted by the
+// supervisor, and a daemon that comes back answers the next probe with the
+// 404 that triggers the re-registration.
 func (n *NodeReplicator) Probe(ctx context.Context) error {
 	probe, cancel := context.WithTimeout(ctx, ProbeTimeout)
 	defer cancel()
 	_, err := n.control(probe, "/sync", map[string]any{"path": n.DBPath, "wait": false})
+	if isNotRegistered(err) {
+		return fmt.Errorf("%w: %w", err, ErrReplicatorGone)
+	}
 	return err
 }
 

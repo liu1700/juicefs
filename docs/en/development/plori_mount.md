@@ -41,6 +41,13 @@ Without it, the worker execs a `litestream replicate` child of its own — the
 original topology, kept working so a plugin and a worker image can roll
 independently.
 
+When the worker runs its own `litestream replicate` child, it restarts that
+child at once when it has exited, and after 3 consecutive failed probes when it
+is still running (SIGTERM first, SIGKILL if it has not exited within 5 s). A
+replacement is never killed while it is still inside its own 30 s wait for the
+control socket. Replication that has not recovered within the 30 s replication
+recovery window, capped by the lease stop instant, stops the mount with exit 69.
+
 `litestream restore` is a one-shot process on both paths. It runs before the
 database exists, reads from a different prefix than the one this generation
 writes to, and is over in seconds, so its footprint is a cold-start cost rather
@@ -137,7 +144,7 @@ code never gets reused for a different meaning.
 | 66 | lease lost — renew returned `stale_epoch`/`lease_held`, the deadline passed, the fence marker was already held, or the FUSE session ended on its own. `E_FENCED_OUT_OF_BAND` is the same code with a distinct meaning: the epoch was taken away rather than allowed to run out, so this worker stopped **without** a barrier and without a final sync | unpublish; the abnormal-exit guard cancels the run |
 | 67 | restore failed: replica missing, corrupt, or failed its integrity check | fail publish; retryable only if the error JSON says so |
 | 68 | object store unreachable or credential rejected at startup | fail publish, retryable |
-| 69 | the stop did not finish inside the write-stop window — reported data loss, lease still released. `E_BARRIER_INCOMPLETE` is the local half (the barrier or the writeback drain), `E_REPLICATION_FAILED` the remote half (the final replica sync, or replication that stopped and did not recover within a barrier period) | unpublish; surface as a typed event |
+| 69 | the stop did not finish inside the write-stop window — reported data loss, lease still released. `E_BARRIER_INCOMPLETE` is the local half (the barrier or the writeback drain), `E_REPLICATION_FAILED` the remote half (the final replica sync, or replication that stopped and did not recover within the 30 s replication recovery window, capped by the lease stop instant) | unpublish; surface as a typed event |
 | 70 | `.control` would be Agent-writable, the cache dir holds another tenant's staging, or trash-days is 0 | fail publish, no retry |
 
 The last line on stderr is a single JSON object with a typed `error` field
