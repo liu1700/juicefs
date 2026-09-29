@@ -868,21 +868,15 @@ func (l *Litestream) logf(event string, kv ...any) {
 
 // Probe reports whether this child is still replicating (PLO-411).
 //
-// It answers two different deaths with one call. The cheap one is the process
-// itself: `done` is buffered and written by the reaper goroutine, so a
-// non-blocking read of it sees an exit that nothing else in this process was
-// watching — before PLO-411 that channel was read only by Stop and Abort, so
-// a Litestream that died on its own was noticed by nobody. The other is a
-// process that is alive but no longer serving, which only a round trip
-// finds; `/sync` without `wait` is the cheapest one Litestream has, because
-// it does the WAL-to-LTX step and leaves the upload to the replica monitor
-// (store.go:428-431).
+// Process exit wraps ErrReplicatorGone. A child still inside its control-socket
+// start deadline reports ErrReplicatorStarting. A running child's probe waits
+// for both WAL-to-LTX and remote replication: local sync alone succeeds even
+// when an upload is stalled. The existing ProbeTimeout bounds the entire call,
+// including response headers and body, below the replication recovery window.
+// An idle, caught-up replica completes without uploading new data.
 //
-// The two deaths wrap ErrReplicatorGone. A child that has not opened its
-// control socket yet, and is still inside its start deadline, is reported as
-// ErrReplicatorStarting and is not sent a request. A `/sync` that fails or
-// times out on a running child wraps neither: that child may only be slow,
-// and the supervisor decides how many of those to wait out (PLO-1172).
+// A failed or timed-out sync wraps neither lifecycle error: the supervisor
+// applies its recovery window and consecutive-failure restart policy.
 func (l *Litestream) Probe(ctx context.Context) error {
 	if l.cmd == nil || l.done == nil {
 		return fmt.Errorf("litestream is not running: %w", ErrReplicatorGone)
@@ -907,7 +901,7 @@ func (l *Litestream) Probe(ctx context.Context) error {
 	}
 	probe, cancel := context.WithTimeout(ctx, ProbeTimeout)
 	defer cancel()
-	_, err := l.controlSync(probe, false)
+	_, err := l.controlSync(probe, true)
 	return err
 }
 

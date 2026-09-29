@@ -48,3 +48,26 @@ bash -n hack/plori-mount-e2e/run.sh
 shellcheck hack/plori-mount-e2e/run.sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s hack/plori-mount-e2e -p '*_test.py' -v
 ```
+
+### Stalled S3 uploads
+
+The upload watchdog test starts an isolated local MinIO, a metadata-upload
+fault proxy, a fake control plane, and a real FUSE mount. It requires `boto3`,
+`fuse3`, and the three binaries below; it does not use external credentials or
+services. Build JuiceFS outside the repository and use the pinned Litestream
+v0.5.17-plori.3 binary.
+
+```sh
+CGO_ENABLED=1 go build -tags "$(make -s plori.tags)" -o /tmp/juicefs-watchdog .
+PYTHONDONTWRITEBYTECODE=1 python3 hack/plori-mount-e2e/upload_stall.py \
+  /tmp/juicefs-watchdog /path/to/litestream /path/to/minio /tmp/watchdog-evidence
+```
+
+Use a fresh output directory. The test verifies idle health, detection of a
+pending upload that receives no S3 acknowledgement, recovery after a short
+stall, and a persistent stall across a Litestream restart. It requires the
+30 s recovery window to close, lease renewals to stop, a write through an open
+FUSE descriptor to fail after the last granted lease expires, and exit 69.
+Clearing the fault after expiry must not revive the terminated mount. Logs and
+`receipt.json` retain the timing evidence. The test takes about three minutes;
+all fixture processes are stopped and reaped on completion.

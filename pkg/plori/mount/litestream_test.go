@@ -22,16 +22,19 @@ package mount
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -659,5 +662,64 @@ func TestRestartKillsAChildThatIgnoresSIGTERMWithinTheCap(t *testing.T) {
 	}
 	if ls.cmd.Process.Pid == old || ls.RestartCount() != 1 {
 		t.Fatalf("no replacement was started (pid %d, restarts %d)", ls.cmd.Process.Pid, ls.RestartCount())
+	}
+}
+
+// A responsive control socket is not proof of replication: local sync can
+// succeed while the replica monitor is blocked uploading pending data.
+func TestProbeWaitsForReplication(t *testing.T) {
+	dir, err := os.MkdirTemp("", "probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "ls.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pending atomic.Bool
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Wait bool `json:"wait"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Error(err)
+			return
+		}
+		if pending.Load() && req.Wait {
+			<-r.Context().Done()
+			return
+		}
+		_, _ = w.Write([]byte(`{"txid":1,"replicated_txid":1}`))
+	})}
+	go func() { _ = server.Serve(ln) }()
+	t.Cleanup(func() { _ = server.Close() })
+	ls := &Litestream{SocketPath: socket, DBPath: "meta.db", cmd: &exec.Cmd{}, done: make(chan error, 1)}
+	for _, tc := range []struct {
+		name    string
+		pending bool
+	}{
+		{"idle", false}, {"pending upload stalled", true}, {"recovered", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pending.Store(tc.pending)
+			start := time.Now()
+			err := ls.Probe(context.Background())
+			elapsed := time.Since(start)
+			if tc.pending {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("probe = %v, want deadline exceeded", err)
+				}
+				if errors.Is(err, ErrReplicatorGone) {
+					t.Fatalf("live child reported gone: %v", err)
+				}
+				if elapsed < ProbeTimeout || elapsed > ProbeTimeout+time.Second {
+					t.Fatalf("probe took %s, want %s", elapsed, ProbeTimeout)
+				}
+			} else if err != nil {
+				t.Fatalf("probe = %v", err)
+			}
+		})
 	}
 }

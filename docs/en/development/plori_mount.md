@@ -38,7 +38,10 @@ Without it, the worker starts its own `litestream replicate` child.
 
 When the worker runs its own `litestream replicate` child, it restarts that
 child at once when it has exited, and after 3 consecutive failed probes when it
-is still running (SIGTERM first, SIGKILL if it has not exited within 5 s). A
+is still running (SIGTERM first, SIGKILL if it has not exited within 5 s).
+Each probe waits for local WAL processing and remote replication, bounded by
+5 s; a responsive child whose upload stalls therefore fails its probe. An idle,
+caught-up replica remains healthy. A
 replacement is never killed while it is still inside its own 30 s wait for the
 control socket. Replication that has not recovered within the 30 s replication
 recovery window, capped by the lease stop instant, stops the mount with exit 69.

@@ -367,11 +367,21 @@ func TestProbeTimeoutsOnALiveChildWithinTheWindowDoNotRestart(t *testing.T) {
 	sup, _, clock := supWithWatchedReplicator(t, rep)
 	log := &capturedLog{}
 	sup.Deps.Log = log.fn
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("idle replicator stopped the mount: %v", f.Err)
+	}
+	if !sup.replicationFailureSince().IsZero() {
+		t.Fatal("idle replicator started a recovery window")
+	}
+	firstFailure := *clock
 	rep.fail(fmt.Errorf("litestream control /sync: %w", context.DeadlineExceeded))
 
 	for i := 0; i < 2; i++ {
 		if f := sup.checkReplication(context.Background()); f != nil {
 			t.Fatalf("timed-out probe %d stopped the mount: %v", i, f.Err)
+		}
+		if got := sup.replicationFailureSince(); !got.Equal(firstFailure) {
+			t.Fatalf("recovery window began at %s, want first failed probe at %s", got, firstFailure)
 		}
 		*clock = clock.Add(6 * time.Second)
 	}
