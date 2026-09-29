@@ -25,6 +25,8 @@ juicefs config META-URL --trash-days=0
 
 另外，回收站自动清理依赖 JuiceFS 客户端的后台任务，为了保证后台任务能够正常执行，需要至少 1 个在线的挂载点，并且在挂载文件系统时不可以使用 [`--no-bgjob`](../reference/command_reference.mdx#mount-metadata-options) 参数。
 
+符合条件的客户端会在会话启动时检查共享的清理时间戳，并在任务到期时清理已过期的回收站内容。之后每小时左右检查一次，带有随机抖动。客户端重启不会重置共享时间戳或缩短保留时长。
+
 ## 快速上手视频
 
 <div className="video-container">

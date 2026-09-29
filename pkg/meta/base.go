@@ -3305,11 +3305,17 @@ func (m *baseMeta) trashEntry(parent, inode Ino, name string) string {
 
 func (m *baseMeta) cleanupTrash(ctx Context) {
 	defer m.sessWG.Done()
-	for {
-		select {
-		case <-ctx.Done():
+	// Check the persisted gate at startup so frequent restarts cannot starve cleanup.
+	for first := true; ; first = false {
+		if !first {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(utils.JitterIt(time.Hour)):
+			}
+		}
+		if ctx.Canceled() {
 			return
-		case <-time.After(utils.JitterIt(time.Hour)):
 		}
 		if st := m.en.doGetAttr(ctx, TrashInode, nil); st != 0 {
 			if st != syscall.ENOENT {
