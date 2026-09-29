@@ -18,6 +18,7 @@ package meta
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -609,6 +610,7 @@ func TestLoadMetaV2DuplicateRecords(t *testing.T) {
 }
 
 func TestMySQLClientLoadMetaV2DuplicateRecords(t *testing.T) { //skip mutate
+	skipWithoutSQLDriver(t, "mysql")
 	client, err := newSQLMeta("mysql", "root:@/dev", testConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -622,6 +624,7 @@ func TestPostgreSQLClientLoadMetaV2DuplicateRecords(t *testing.T) { //skip mutat
 	if os.Getenv("SKIP_NON_CORE") == "true" {
 		t.Skipf("skip non-core test")
 	}
+	skipWithoutSQLDriver(t, "postgres")
 	client, err := newSQLMeta("postgres", "localhost:5432/test?sslmode=disable", testConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -980,3 +983,15 @@ func BenchmarkLoadDumpV2(b *testing.B) {
 	}
 }
 */
+
+// skipWithoutSQLDriver skips a server-engine test in builds that exclude the
+// driver (the Plori release profile builds with nomysql and nopg).
+func skipWithoutSQLDriver(t *testing.T, name string) {
+	t.Helper()
+	for _, driver := range sql.Drivers() {
+		if driver == name {
+			return
+		}
+	}
+	t.Skipf("%s driver is not compiled into this build", name)
+}

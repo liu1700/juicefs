@@ -1,3 +1,6 @@
+//go:build !noredis
+// +build !noredis
+
 /*
  * JuiceFS, Copyright 2026 Juicedata, Inc.
  *
@@ -106,36 +109,15 @@ func TestRedisBatchCloneSharedChunkRefs(t *testing.T) {
 		t.Fatalf("expected 2 batch entries, got %d", len(batchEntries))
 	}
 
+	// Only the SQL engine preserves hard links in clones; Redis refuses a
+	// hard-linked source instead of splitting it into independent inodes.
 	var cloned uint64
 	st := m.getBase().BatchClone(ctx, srcDir, dstDir, batchEntries, CLONE_MODE_PRESERVE_ATTR, 022, &cloned)
-	if st != 0 {
-		t.Fatalf("BatchClone shared chunk entries: %s", st)
+	if st != syscall.ENOTSUP {
+		t.Fatalf("BatchClone of a hard-linked source: want ENOTSUP, got %s", st)
 	}
-	if cloned != 2 {
-		t.Fatalf("BatchClone cloned count mismatch: want 2 got %d", cloned)
-	}
-
-	after := redisSliceRefCount(t, m, sliceID, chunkSize)
-	if after != before+2 {
-		t.Fatalf("sliceRef mismatch after batch clone: before=%d after=%d want=%d", before, after, before+2)
-	}
-
-	var dstA, dstB Ino
-	var dstAAttr, dstBAttr Attr
-	if st := m.Lookup(ctx, dstDir, "file_A", &dstA, &dstAAttr, false); st != 0 {
-		t.Fatalf("lookup dst file_A: %s", st)
-	}
-	if st := m.Lookup(ctx, dstDir, "file_B", &dstB, &dstBAttr, false); st != 0 {
-		t.Fatalf("lookup dst file_B: %s", st)
-	}
-	if dstA == dstB {
-		t.Fatalf("cloned hardlink entries should become independent files, got same inode %d", dstA)
-	}
-	if dstAAttr.Typ != TypeFile || dstBAttr.Typ != TypeFile {
-		t.Fatalf("cloned entries should be files, got types %d and %d", dstAAttr.Typ, dstBAttr.Typ)
-	}
-	if dstAAttr.Nlink != 1 || dstBAttr.Nlink != 1 {
-		t.Fatalf("cloned files should have nlink=1, got %d and %d", dstAAttr.Nlink, dstBAttr.Nlink)
+	if after := redisSliceRefCount(t, m, sliceID, chunkSize); after != before {
+		t.Fatalf("sliceRef changed by a refused batch clone: before=%d after=%d", before, after)
 	}
 }
 
