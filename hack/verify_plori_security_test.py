@@ -99,6 +99,11 @@ class SbomTest(unittest.TestCase):
         document["packages"].append({"name": "org.apache.hadoop:hadoop-client"})
         self.assertEqual(sbom.verify(document)[1], ["org.apache.hadoop:hadoop-client"])
 
+    def test_redis_client_is_excluded(self):
+        document = self.valid_document()
+        document["packages"].append({"name": "github.com/redis/go-redis/v9"})
+        self.assertEqual(sbom.verify(document)[1], ["github.com/redis/go-redis/v9"])
+
     def test_jar_file_is_rejected(self):
         document = self.valid_document()
         document["files"].append({"fileName": "/opt/juicefs/juicefs-hadoop.jar"})
