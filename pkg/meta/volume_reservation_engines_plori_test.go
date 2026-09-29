@@ -19,5 +19,5 @@
 
 package meta
 
-// The release profile excludes memkv. SQLite and Redis remain required.
+// The release profile excludes memkv. Tests retain Redis for upstream shared helpers.
 var volresEngines = []volresEngine{volresSQLiteEngine, volresRedisEngine}

@@ -5,14 +5,13 @@ title: Plori 最小构建配置
 `plori` 配置是 Plori runtime 和 Orlop 专用的 JuiceFS 客户端。它只保留当前
 部署契约需要的能力：
 
-- 通过 `redis` 驱动使用兼容 Redis 的元数据服务（共享卷）；
 - 通过 `sqlite3` 驱动使用 SQLite 元数据，元数据是一个本地文件，用于按 Agent
   独立的卷（PLO-319）；
 - 通过 `s3` 驱动使用 S3 或兼容 S3 的对象存储；
 - FUSE 客户端，以及格式化、挂载、卸载、状态检查、`durability` 远端持久化
   屏障和目录配额管理所需的运维命令。
 
-MySQL、PostgreSQL 和 KV 元数据引擎、S3 gateway、WebDAV、本地和内存对象存储，
+Redis、MySQL、PostgreSQL 和 KV 元数据引擎、S3 gateway、WebDAV、本地和内存对象存储，
 以及非 S3 对象存储均不会编入此产物。不要把它当作通用 Community Edition
 发行版使用。
 
@@ -53,7 +52,7 @@ make test.plori.security
 hack/verify-plori-binary.sh ./juicefs.plori
 ```
 
-如果运行时注册了 Redis 和 SQLite 以外的元数据引擎，或 S3 以外的远端对象存储，
+如果运行时注册了 SQLite 以外的元数据引擎，或 S3 以外的远端对象存储，
 `make test.plori.profile` 会失败。本地 `file` 后端是有意保留的：
 `vfs.Backup` 的每次 `--backup-meta` 元数据备份都要先经它落盘再上传，
 `juicefs sync` 的本地路径也依赖它（issue #27）。二进制验证脚本还会拒绝被裁剪后端家族的依赖。
@@ -92,7 +91,7 @@ hack/verify-plori-csi-image.sh juicefs-plori:dev
 - 记录源码版本、Go 版本、构建标签、镜像名、不可变镜像摘要和机器可读支持策略的
   `build-info.json`。
 
-流水线会验证 Redis + S3 格式化与挂载、FUSE I/O 和远端持久化屏障，还会跑一遍
+流水线会验证 SQLite + S3 格式化与挂载、FUSE I/O 和远端持久化屏障，还会跑一遍
 完整的 SQLite 生命周期：格式化、挂载、目录配额、`fsck`、`durability`、
 `dump`/`load`，以及强杀进程后重新挂载并要求数据可恢复。它同时拒绝可达的 Go
 漏洞以及镜像中已有修复的 HIGH/CRITICAL 漏洞。
@@ -101,9 +100,7 @@ hack/verify-plori-csi-image.sh juicefs-plori:dev
 必须精确匹配一个产物和一个漏洞 ID，并包含到期日和原因。过期、重复、未使用
 或范围过宽的豁免都会导致构建失败。
 
-生产部署必须使用 `build-info.json` 中的镜像摘要，不能使用可变标签。替换
-Community Edition mount 镜像时，应保持现有 Redis 元数据 URL、S3 bucket URL、
-凭据、挂载参数和挂载路径不变。
+生产部署必须使用 `build-info.json` 中的镜像摘要，不能使用可变标签。此产物仅支持 SQLite 元数据，不能替换使用 Redis 元数据 URL 的客户端。
 
 新卷和灰度验证请使用 [Plori 不可变 chunk 配置](./plori_tuning.md)。它会明确记录
 block size 决策；任何候选变更都只能用于新格式化的卷。

@@ -86,9 +86,10 @@ jobs:
           make test.plori.profile
           make test.plori.benchmark
           make test.plori.sqlite
+          # Reject Redis/TKV engines in the stripped release artifact.
           hack/verify-plori-binary.sh ./juicefs.plori
 
-      - name: Unit tests for ./pkg/meta under the release tag set
+      - name: Metadata tests with upstream Redis helpers enabled
         run: make test.plori.meta
 
       - name: Unit tests for ./pkg/chunk, ./pkg/vfs and ./pkg/plori under the release tag set
@@ -135,17 +136,17 @@ jobs:
           cat "$RUNNER_TEMP/minio.log"
           exit 1
 
-      - name: Exercise Redis, S3, FUSE, and durability barrier
+      - name: Exercise SQLite, S3, FUSE, and durability barrier
         env:
           AWS_ACCESS_KEY_ID: plori-ci
           AWS_SECRET_ACCESS_KEY: plori-ci-secret
           AWS_REGION: us-east-1
         run: |
           ./juicefs.plori format --storage s3 --bucket http://127.0.0.1:9000/plori-ci \
-            redis://127.0.0.1:6379/0 plori-ci
+            "sqlite3://$RUNNER_TEMP/plori-durability.db" plori-ci
           sudo install -d -m 0755 /mnt/plori-ci
           sudo --preserve-env=AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_REGION \
-            ./juicefs.plori mount -d redis://127.0.0.1:6379/0 /mnt/plori-ci \
+            ./juicefs.plori mount -d "sqlite3://$RUNNER_TEMP/plori-durability.db" /mnt/plori-ci \
             --cache-dir "$RUNNER_TEMP/jfs-cache" --writeback --no-usage-report
           echo durable | sudo tee /mnt/plori-ci/probe >/dev/null
           sudo ./juicefs.plori durability --timeout 2m /mnt/plori-ci
@@ -292,7 +293,7 @@ jobs:
 
       - name: Regression - metadata backup under the plori profile
         env:
-          PLORI_TEST_META_URL: redis://127.0.0.1:6379/2
+          PLORI_TEST_META_URL: sqlite3://${{ runner.temp }}/plori-backup.db
           PLORI_TEST_BLOB_URL: http://127.0.0.1:9000/plori-ci-backup
           AWS_ACCESS_KEY_ID: plori-ci
           AWS_SECRET_ACCESS_KEY: plori-ci-secret

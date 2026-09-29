@@ -27,9 +27,9 @@ EXPECTED_DOCKERIGNORE = {
 }
 EXPECTED_POLICY = {
     "schemaVersion": 1,
-    "profile": "redis-sqlite3-s3-fuse",
+    "profile": "sqlite3-s3-fuse",
     "supportedInterfaces": ["fuse"],
-    "supportedMetadataEngines": ["redis", "sqlite3"],
+    "supportedMetadataEngines": ["sqlite3"],
     "supportedObjectStores": ["s3"],
     "excludedSecurityDomains": ["hadoop-java-sdk", "ranger-authorization"],
 }
@@ -48,6 +48,7 @@ REQUIRED_TAGS = {"plori", "nohdfs", "sqlite_omit_load_extension"}
 FORBIDDEN_TAGS = {"nosqlite"}
 # Metadata engine -> the build tag that removes it.
 ENGINE_EXCLUSION_TAG = {
+    "redis": "noredis",
     "sqlite3": "nosqlite",
     "mysql": "nomysql",
     "postgres": "nopg",
@@ -127,7 +128,7 @@ def verify(root: pathlib.Path) -> list[str]:
     policy_path = root / ".github/security/plori-support-policy.json"
     policy = json.loads(policy_path.read_text(encoding="utf-8"))
     if policy != EXPECTED_POLICY:
-        errors.append("Plori support policy differs from the audited Redis + SQLite + S3 + FUSE contract")
+        errors.append("Plori support policy differs from the audited SQLite + S3 + FUSE contract")
 
     dockerfile_path = root / "Dockerfile.plori"
     context_sources, stage_copies, docker_errors = copied_sources(dockerfile_path)
@@ -219,7 +220,7 @@ def main() -> int:
         for error in errors:
             print(f"Plori scope verification failed: {error}", file=sys.stderr)
         return 1
-    print("Plori support scope verified (Redis + SQLite + S3 + FUSE; Hadoop/Java excluded)")
+    print("Plori support scope verified (SQLite + S3 + FUSE; Hadoop/Java excluded)")
     return 0
 
 

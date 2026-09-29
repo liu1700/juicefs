@@ -10,9 +10,20 @@ fi
 build_info=$(go version -m "$binary")
 printf '%s\n' "$build_info" | grep -q -- '-tags=plori,'
 
-denied_modules='google.golang.org/grpc|github.com/tikv/|go.etcd.io/etcd|github.com/google/btree|github.com/go-sql-driver/mysql|github.com/jackc/pgx|modernc.org/sqlite|github.com/pkg/sftp|golang.org/x/net/webdav|github.com/minio/minio-go|github.com/coredns/coredns|github.com/prometheus/prometheus|cloud.google.com/go/storage|github.com/Azure/azure-sdk-for-go'
+denied_modules='github.com/redis/go-redis|github.com/go-redis/redis|google.golang.org/grpc|github.com/tikv/|go.etcd.io/etcd|github.com/google/btree|github.com/go-sql-driver/mysql|github.com/jackc/pgx|modernc.org/sqlite|github.com/pkg/sftp|golang.org/x/net/webdav|github.com/minio/minio-go|github.com/coredns/coredns|github.com/prometheus/prometheus|cloud.google.com/go/storage|github.com/Azure/azure-sdk-for-go'
 if printf '%s\n' "$build_info" | grep -E "$denied_modules"; then
     echo "Plori binary contains a forbidden backend or service dependency" >&2
+    exit 1
+fi
+
+# Go retains fully qualified function names in pclntab even with -s -w.
+# Require a known SQL method so a binary without readable Go names fails closed.
+if ! LC_ALL=C grep -aFq 'github.com/juicedata/juicefs/pkg/meta.(*dbMeta).doCloneEntry' "$binary"; then
+    echo "Cannot verify metadata engine functions in Plori binary" >&2
+    exit 1
+fi
+if LC_ALL=C grep -aEq 'github.com/juicedata/juicefs/pkg/meta\.\(\*(redisMeta|kvMeta)\)' "$binary"; then
+    echo "Plori binary contains Redis or TKV metadata engine functions" >&2
     exit 1
 fi
 

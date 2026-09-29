@@ -5,14 +5,13 @@ title: Plori build profile
 The `plori` profile is the supported JuiceFS client for the Plori runtime and
 Orlop. It intentionally supports only the deployment contract used there:
 
-- Redis-compatible metadata through the `redis` driver, for the shared volume;
 - SQLite metadata through the `sqlite3` driver, for a per-Agent volume whose
   metadata is a local file (PLO-319);
 - S3 and S3-compatible object storage through the `s3` driver;
 - the FUSE client and the operational commands needed to format, mount,
   unmount, inspect, fence writes with `durability`, and manage directory quotas.
 
-MySQL, PostgreSQL and the KV metadata engines, the S3 gateway, WebDAV, local and
+Redis, MySQL, PostgreSQL and the KV metadata engines, the S3 gateway, WebDAV, local and
 in-memory object stores, and non-S3 object storage providers are excluded. Do not
 use this artifact as a general-purpose replacement for a Community Edition
 release.
@@ -61,13 +60,16 @@ make test.plori.security
 hack/verify-plori-binary.sh ./juicefs.plori
 ```
 
-`make test.plori.profile` fails if any metadata engine other than Redis and
-SQLite, or any remote object storage driver other than S3, is registered. The local `file`
+`make test.plori.profile` fails if any metadata engine other than SQLite, or any
+remote object storage driver other than S3, is registered. The local `file`
 backend stays registered on purpose: `vfs.Backup` stages every `--backup-meta`
 metadata dump through it before uploading, and `juicefs sync` resolves local
 paths with it (issue #27). The binary verifier also
-rejects dependencies belonging to excluded backend families. The binary
-verifier also fails when SQLite is *absent*: the support policy promises a
+rejects dependencies belonging to excluded backend families and Redis/TKV
+method names retained in stripped Go binaries. Shared metadata tests retain
+Redis because upstream test helpers reference its concrete type; release builds
+and the runtime profile probe use the full exclusion tags. The verifier also
+fails when SQLite is *absent*: the support policy promises a
 `sqlite3` engine, so a binary built without cgo, without
 `sqlite_omit_load_extension`, or with `nosqlite` re-added is rejected rather than
 shipped as a valid Plori version. The security test verifies the restricted
@@ -106,7 +108,7 @@ release publishes:
 - `build-info.json`, which records the source revision, Go version, build tags,
   image name, immutable image digest, and the machine-readable support policy.
 
-The workflow tests Redis + S3 format and mount, FUSE I/O, and the remote
+The workflow tests SQLite + S3 format and mount, FUSE I/O, and the remote
 durability barrier, and runs a full SQLite lifecycle: format, mount, directory
 quota, `fsck`, `durability`, `dump`/`load`, and an abrupt kill followed by a
 remount that must recover the data. It rejects reachable Go vulnerabilities and fixed HIGH or
@@ -118,8 +120,8 @@ artifact and vulnerability ID exactly and include an expiration date and a
 reason. Expired, duplicate, unused, or overly broad exceptions fail the build.
 
 Production manifests must use the image digest from `build-info.json`, not a
-mutable tag. Keep the existing Redis metadata URL, S3 bucket URL, credentials,
-mount flags, and mount path when replacing the Community Edition mount image.
+mutable tag. This artifact requires SQLite metadata; it cannot replace a client
+using a Redis metadata URL.
 
 Use the [Plori immutable-chunk profile](./plori_tuning.md) for new volumes and
 canary validation. It makes the block-size decision explicit; any candidate

@@ -101,6 +101,7 @@ var _ Meta = (*redisMeta)(nil)
 var _ engine = (*redisMeta)(nil)
 
 func init() {
+	redisNil = redis.Nil
 	Register("redis", newRedisMeta)
 	Register("rediss", newRedisMeta)
 	Register("unix", newRedisMeta)

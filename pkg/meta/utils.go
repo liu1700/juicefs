@@ -33,7 +33,6 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
-	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -135,6 +134,9 @@ func (qm *queryMap) pop(key string) string {
 	return qm.Get(key)
 }
 
+// Set by the Redis backend at initialization; nil when it is compiled out.
+var redisNil error
+
 func errno(err error) syscall.Errno {
 	if err == nil {
 		return 0
@@ -148,7 +150,7 @@ func errno(err error) syscall.Errno {
 	if eno, ok := err.(syscall.Errno); ok {
 		return eno
 	}
-	if err == redis.Nil {
+	if err == redisNil {
 		return syscall.ENOENT
 	}
 	if strings.HasPrefix(err.Error(), "OOM") {

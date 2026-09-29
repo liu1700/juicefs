@@ -50,8 +50,7 @@ func defaultTestMetaURI() string {
 // SQL engine.
 func testMetaEngines() map[string]string {
 	return map[string]string{
-		"db":    "sqlite3://:memory:",
-		"redis": "redis://127.0.0.1:6379/2",
+		"db": "sqlite3://:memory:",
 	}
 }
 

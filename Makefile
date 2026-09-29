@@ -5,15 +5,19 @@ all: juicefs
 REVISION := $(shell git rev-parse --short HEAD 2>/dev/null)
 REVISIONDATE := $(shell git log -1 --pretty=format:'%cd' --date short 2>/dev/null)
 PKG := github.com/juicedata/juicefs/pkg/version
-# The Plori profile keeps two metadata engines: `redis` (shared volume) and
-# `sqlite3` (per-Agent volume, PLO-319). `sqlite_omit_load_extension` is a
+# The Plori profile keeps only SQLite metadata. `sqlite_omit_load_extension` is a
 # mattn/go-sqlite3 tag that compiles the amalgamation with
 # -DSQLITE_OMIT_LOAD_EXTENSION, removing `sqlite3_enable_load_extension` and the
 # `load_extension()` SQL function, so a metadata DB cannot load a shared object.
-PLORI_TAGS := plori,sqlite_omit_load_extension,nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,nostorj,noqiniu,notos,noks3
+PLORI_TAGS := plori,noredis,sqlite_omit_load_extension,nogateway,nowebdav,nocos,nobos,nohdfs,noibmcos,noobs,nooss,noqingstor,nosftp,noswift,noazure,nogs,noufile,nob2,nonfs,nodragonfly,nomysql,nopg,notikv,nobadger,noetcd,nocifs,nostorj,noqiniu,notos,noks3
 # SQLite is cgo. Set it explicitly so a toolchain that defaults CGO_ENABLED to 0
 # fails the build instead of silently producing a binary without SQLite.
 PLORI_CGO := CGO_ENABLED=1
+# Upstream shared metadata tests refer directly to redisMeta, even for SQLite
+# cases. Keep Redis available to tests; the release binary and profile probe
+# use PLORI_TAGS unchanged and verify that Redis is absent.
+PLORI_TEST_TAGS = $(subst noredis$(comma),,$(PLORI_TAGS))
+comma := ,
 GCFLAGS =
 LDFLAGS =
 BUILD ?= release
@@ -82,7 +86,7 @@ test.plori.backup:
 test.plori.sqlite:
 	$(PLORI_CGO) go test -count=1 -v ./pkg/meta/ -run TestSQLitePragma
 
-# ./pkg/meta under the exact tag set the release binary is built with, so the
+# ./pkg/meta under the test tag set (Redis retained for upstream helpers), so the
 # SQLite engine is exercised by the metadata engine's own shared test body
 # (testMeta) and not only by the CI lifecycle smoke.
 #
@@ -101,7 +105,7 @@ test.plori.sqlite:
 # the wrong one: SKIP_NON_CORE and the -skip regex above name ./pkg/meta tests.
 test.plori.meta:
 	SKIP_NON_CORE=true $(PLORI_CGO) go test -count=1 -timeout 20m \
-		-tags "$(PLORI_TAGS)" -skip '^TestLoadDump$$|^TestLoadDumpV2$$' ./pkg/meta/
+		-tags "$(PLORI_TEST_TAGS)" -skip '^TestLoadDump$$|^TestLoadDumpV2$$' ./pkg/meta/
 
 # ./pkg/chunk and ./pkg/vfs under the release tag set: the writeback store, the
 # durability barrier and the VFS the plori-mount supervisor is built on.
@@ -182,6 +186,7 @@ test.plori.unit:
 # The rest of ./pkg/plori matches no packages at all without the tag and runs in
 # test.plori.unit.
 #
+# Needs a Redis server on 127.0.0.1:6379 for the Redis half of the suite.
 # SKIP_NON_CORE is upstream's gate for the cases that need a KeyDB or a Redis
 # cluster. ./pkg/object's remote backends skip themselves when their credentials
 # are absent (38 of them).

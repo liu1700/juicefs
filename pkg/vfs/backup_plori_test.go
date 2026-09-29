@@ -31,7 +31,7 @@ import (
 )
 
 // TestBackupPloriProfile runs a full metadata-backup cycle with only the plori
-// profile's backends: Redis metadata and S3 object storage. TestBackup cannot
+// profile's backends: SQLite metadata and S3 object storage. TestBackup cannot
 // stand in for it — it uses memkv meta and mem object storage, both excluded
 // under the plori tag, so it only ever runs in untagged builds where
 // register_default.go registers the `file` backend and hides a profile
@@ -43,7 +43,7 @@ import (
 //
 // Requires live services and skips without them:
 //
-//	PLORI_TEST_META_URL  e.g. redis://127.0.0.1:6379/2
+//	PLORI_TEST_META_URL  e.g. sqlite3:///tmp/plori-backup.db
 //	PLORI_TEST_BLOB_URL  e.g. http://127.0.0.1:9000/plori-ci-backup (S3/MinIO)
 //	AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for the blob endpoint
 func TestBackupPloriProfile(t *testing.T) {
