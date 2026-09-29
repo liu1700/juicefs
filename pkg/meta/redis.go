@@ -5375,9 +5375,8 @@ func (m *redisMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name strin
 			attr.Mtimensec = uint32(now.Nanosecond())
 			attr.Ctimensec = uint32(now.Nanosecond())
 		}
-		// TODO: preserve hardlink
-		if attr.Typ == TypeFile && attr.Nlink > 1 {
-			attr.Nlink = 1
+		if attr.Typ != TypeDirectory && attr.Nlink > 1 {
+			return syscall.ENOTSUP
 		}
 		srcXattr, err := tx.HGetAll(ctx, m.xattrKey(srcIno)).Result()
 		if err != nil {
@@ -5717,8 +5716,8 @@ func (m *redisMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entr
 					info.dstAttr.Mtimensec = uint32(now.Nanosecond())
 					info.dstAttr.Ctimensec = uint32(now.Nanosecond())
 				}
-				if info.dstAttr.Typ == TypeFile && info.dstAttr.Nlink > 1 {
-					info.dstAttr.Nlink = 1
+				if info.dstAttr.Nlink > 1 {
+					return syscall.ENOTSUP
 				}
 				info.xattr = sd.xattr
 				if info.dstAttr.Typ == TypeFile {

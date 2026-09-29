@@ -595,6 +595,7 @@ func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 		},
 	}
 	m.en = m
+	m.cloneHardlinks = true
 	return m, nil
 }
 
@@ -5623,6 +5624,39 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 		if !ok {
 			return syscall.ENOENT
 		}
+		if reused, _ := ctx.Value(cloneLinkKey{}).(bool); reused {
+			var sourceAttr Attr
+			m.parseAttr(&n, &sourceAttr)
+			if st := m.Access(ctx, srcIno, MODE_MASK_R, &sourceAttr); st != 0 {
+				return st
+			}
+			dst := node{Inode: ino}
+			if ok, err := s.ForUpdate().Get(&dst); err != nil {
+				return err
+			} else if !ok {
+				return syscall.ENOENT
+			}
+			if dst.Type == TypeDirectory {
+				return syscall.EPERM
+			}
+			if _, err := m.validateCloneTarget(ctx, s, parent); err != nil {
+				return err
+			}
+			if err := mustInsert(s, &edge{Parent: parent, Name: []byte(name), Inode: ino, Type: dst.Type}); err != nil {
+				if isDuplicateEntryErr(err) {
+					return syscall.EEXIST
+				}
+				return err
+			}
+			dst.Nlink++
+			dst.Parent = 0
+			if _, err := s.Cols("nlink", "parent").Update(&dst, &node{Inode: ino}); err != nil {
+				return err
+			}
+			m.parseAttr(&dst, attr)
+			m.genLog(ctx, s, time.Now().UnixNano(), "LINK(%d,%d,%s,%t):%d", ino, parent, logEncode2(name), false, dst.Nlink)
+			return nil
+		}
 		n.Inode = ino
 		n.Parent = parent
 		now := time.Now()
@@ -5644,8 +5678,8 @@ func (m *dbMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			n.setMtime(ns)
 			n.setCtime(ns)
 		}
-		// TODO: preserve hardlink
-		if n.Type == TypeFile && n.Nlink > 1 {
+		// A clone only includes names encountered inside its source subtree.
+		if n.Type != TypeDirectory {
 			n.Nlink = 1
 		}
 
@@ -5827,8 +5861,10 @@ func (m *dbMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 				info.dstNode.setMtime(nowNano)
 				info.dstNode.setCtime(nowNano)
 			}
-			if sn.Type == TypeFile && sn.Nlink > 1 {
-				info.dstNode.Nlink = 1
+			if sn.Nlink > 1 {
+				// Native Clone routes hard links through doCloneEntry. Refuse a
+				// source that gained links after preflight instead of splitting it.
+				return syscall.ENOTSUP
 			}
 
 			nodesIns = append(nodesIns, &info.dstNode)

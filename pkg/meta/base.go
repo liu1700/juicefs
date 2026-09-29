@@ -347,6 +347,8 @@ type baseMeta struct {
 	// ploriReleasing counts the shadowed-slice release jobs that are running.
 	ploriReleasing atomic.Int64
 
+	cloneHardlinks bool // set by engines that can attach names to a cloned inode
+
 	parentMu        sync.Mutex        // protect dirParents
 	quotaMu         sync.RWMutex      // protect dirQuotas
 	quotasFlushLock sync.Mutex        // prevent concurrent doFlushQuotas
@@ -2004,6 +2006,30 @@ func (m *baseMeta) BatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 	if len(entries) == 0 {
 		return 0
 	}
+	// Keep the batch path for ordinary files. Hard-linked files use the
+	// shared map and the single-entry transaction, including across batches.
+	if links := cloneLinksFrom(ctx); len(links) != 0 {
+		ordinary := make([]*Entry, 0, len(entries))
+		for _, e := range entries {
+			if links[e.Inode] == nil {
+				ordinary = append(ordinary, e)
+				continue
+			}
+			var ino Ino
+			if st := m.cloneEntry(ctx, e.Inode, dstParent, string(e.Name), &ino, cmode, cumask, count, false, nil); st != 0 {
+				return st
+			}
+			var attr Attr
+			if st := m.en.doGetAttr(cloneAccountingContext(ctx), ino, &attr); st != 0 {
+				return st
+			}
+			m.updateDirQuota(cloneAccountingContext(ctx), dstParent, align4K(attr.Length), 1)
+		}
+		entries = ordinary
+		if len(entries) == 0 {
+			return m.cloneAllowed(ctx)
+		}
+	}
 	var r batchCloneResult
 	st := m.en.doBatchClone(ctx, srcParent, dstParent, entries, cmode, cumask, &r)
 	if st != 0 && len(r.chargeKeys) > 0 && volumeReservationFrom(ctx) != nil {
@@ -3599,18 +3625,17 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 	} else if eno != syscall.ENOENT {
 		return eno
 	}
-	var sum Summary
-	// With a volume reservation every clone transaction is charged before it
-	// commits, so the preflight claim only decides whether the clone can be
-	// refused up front instead of midway. A strict walk sizes it from the same
-	// attributes the clone transactions copy, rather than from directory
-	// statistics that can drift.
-	strict := volumeReservationFrom(ctx) != nil
-	eno = m.GetSummary(ctx, srcIno, &sum, true, strict)
-	if eno != 0 {
+	var sum, unique Summary
+	links := make(cloneLinks)
+	if eno = m.cloneSummary(ctx, srcIno, &attr, &sum, &unique, links); eno != 0 {
 		return eno
 	}
-	if err := m.checkQuota(ctx, int64(sum.Size), int64(sum.Dirs)+int64(sum.Files), ctx.Uid(), ctx.Gid(), parent); err != 0 {
+	ctx = ctx.WithValue(cloneLinksKey{}, links)
+	// Directory quotas count every name; volume and owner quotas count inodes.
+	if m.getFormat().DirStats && m.checkDirQuota(ctx, parent, int64(sum.Size), int64(sum.Dirs+sum.Files)) {
+		return syscall.EDQUOT
+	}
+	if err := m.checkQuota(ctx, int64(unique.Size), int64(unique.Dirs+unique.Files), ctx.Uid(), ctx.Gid()); err != 0 {
 		return err
 	}
 	*total = sum.Dirs + sum.Files
@@ -3626,7 +3651,7 @@ func (m *baseMeta) Clone(ctx Context, srcParentIno, srcIno, parent Ino, name str
 			}
 		}
 		if eno != 0 && dstIno != 0 && m.cloneAllowed(ctx) == 0 {
-			if eno := m.en.doCleanupDetachedNode(ctx, dstIno); eno != 0 {
+			if eno := m.en.doCleanupDetachedNode(ctx.WithValue(cloneDetachedRootKey{}, dstIno), dstIno); eno != 0 {
 				logger.Errorf("remove detached tree (%d): %s", dstIno, eno)
 			}
 		}
@@ -3667,21 +3692,39 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	if st := m.cloneAllowed(ctx); st != 0 {
 		return st
 	}
-	ino, err := m.nextInode()
-	if err != nil {
-		return errno(err)
+	link := cloneLinksFrom(ctx)[srcIno]
+	var ino Ino
+	if link != nil {
+		link.Lock()
+		defer link.Unlock()
+		ino = link.ino
+	}
+	reused := ino != 0
+	if !reused {
+		var err error
+		ino, err = m.nextInode()
+		if err != nil {
+			return errno(err)
+		}
 	}
 	if dstIno != nil {
 		*dstIno = ino
 	}
 	var attr Attr
-	eno := m.en.doCloneEntry(ctx, srcIno, parent, name, ino, &attr, cmode, cumask, top)
+	eno := m.en.doCloneEntry(ctx.WithValue(cloneLinkKey{}, reused), srcIno, parent, name, ino, &attr, cmode, cumask, top)
 	if eno != 0 {
 		return eno
 	}
-	m.commitVolume(ctx, []Ino{ino}, align4K(attr.Length), 1)
-	atomic.AddUint64(count, 1)
-	m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, align4K(attr.Length), 1)
+	if !reused {
+		if link != nil {
+			link.ino = ino
+		}
+		m.commitVolume(ctx, []Ino{ino}, align4K(attr.Length), 1)
+		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, align4K(attr.Length), 1)
+	}
+	if count != nil {
+		atomic.AddUint64(count, 1)
+	}
 	if attr.Typ != TypeDirectory {
 		// The top-level caller accounts the published entry before reporting
 		// cancellation or authority loss. No further clone work starts here.
@@ -3689,6 +3732,10 @@ func (m *baseMeta) cloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 	}
 	if eno = m.cloneAllowed(ctx); eno != 0 {
 		return eno
+	}
+	// A detached tree is accounted to its ancestors only when attached.
+	if top {
+		ctx = ctx.WithValue(cloneDetachedRootKey{}, ino)
 	}
 	// Use DirHandler for batch processing to avoid loading all entries at once
 	handler, eno := m.NewDirHandler(ctx, srcIno, true, nil)

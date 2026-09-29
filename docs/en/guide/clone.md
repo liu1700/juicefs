@@ -24,6 +24,10 @@ juicefs clone /mnt/jfs/file1 /mnt/jfs/file2
 juicefs clone /mnt/jfs/dir1 /mnt/jfs/dir2
 ```
 
+With SQL metadata engines (SQLite, MySQL, and PostgreSQL), hard-linked names inside one cloned subtree share one new destination inode. Links outside the subtree are excluded. Writing through one cloned name changes its cloned siblings but leaves the source unchanged. Each independent clone creates its own inode group. Directory statistics and directory quotas count each name; volume usage, inode reservations, owner quotas, and slice references count each new inode once. In Plori's `slice_data` quota mode, cloning existing slices adds no physical data usage.
+
+Redis and TKV metadata engines return `ENOTSUP` when a source contains hard links. Keep the source tree unchanged during clone for a consistent result; a file that gains hard links after the initial scan can cause the operation to fail.
+
 ## Consistency {#consistency}
 
 In terms of transaction consistency, cloning behaves as follows:

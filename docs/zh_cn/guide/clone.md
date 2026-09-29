@@ -21,6 +21,10 @@ juicefs clone /mnt/jfs/file1 /mnt/jfs/file2
 juicefs clone /mnt/jfs/dir1 /mnt/jfs/dir2
 ```
 
+使用 SQL 元数据引擎（SQLite、MySQL 和 PostgreSQL）时，同一次克隆中，源子树内指向同一 inode 的硬链接名称会共享一个新的目标 inode。源子树外的硬链接不会包含在克隆中。通过任意克隆名称写入，会改变同组的其他克隆名称所读取的内容，但不会改变源文件。不同克隆操作会创建独立的 inode。目录统计和目录配额按名称计数；卷用量、inode 预留、用户和用户组配额以及 slice 引用按新的 inode 计数。Plori 的 `slice_data` 配额模式下，克隆已有 slice 不增加物理数据用量。
+
+Redis 和 TKV 元数据引擎在克隆包含硬链接的源时返回 `ENOTSUP`。为获得一致的结果，克隆期间应保持源目录树不变；初始扫描后新增硬链接可能导致克隆失败。
+
 ## 一致性 {#consistency}
 
 在事务一致性方面，克隆的行为如下：

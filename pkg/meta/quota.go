@@ -501,6 +501,9 @@ func (m *baseMeta) updateDirQuota(ctx Context, inode Ino, space, inodes int64) {
 	var q *Quota
 	var st syscall.Errno
 	for {
+		if root, _ := ctx.Value(cloneDetachedRootKey{}).(Ino); root != 0 && inode == root {
+			return
+		}
 		m.quotaMu.RLock()
 		q = m.dirQuotas[uint64(inode)]
 		m.quotaMu.RUnlock()

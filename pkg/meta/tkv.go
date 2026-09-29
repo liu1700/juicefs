@@ -4493,9 +4493,8 @@ func (m *kvMeta) doCloneEntry(ctx Context, srcIno Ino, parent Ino, name string, 
 			attr.Mtimensec = uint32(now.Nanosecond())
 			attr.Ctimensec = uint32(now.Nanosecond())
 		}
-		// TODO: preserve hardlink
-		if attr.Typ == TypeFile && attr.Nlink > 1 {
-			attr.Nlink = 1
+		if attr.Typ != TypeDirectory && attr.Nlink > 1 {
+			return syscall.ENOTSUP
 		}
 
 		if top {
@@ -4710,8 +4709,8 @@ func (m *kvMeta) doBatchClone(ctx Context, srcParent Ino, dstParent Ino, entries
 				attr.Mtimensec = uint32(now.Nanosecond())
 				attr.Ctimensec = uint32(now.Nanosecond())
 			}
-			if attr.Typ == TypeFile && attr.Nlink > 1 {
-				attr.Nlink = 1
+			if attr.Nlink > 1 {
+				return syscall.ENOTSUP
 			}
 
 			// check entry does not exist

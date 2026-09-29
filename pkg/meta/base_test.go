@@ -4378,6 +4378,18 @@ func testClone(t *testing.T, m Meta) {
 		t.Fatalf("hardlink: %s", eno)
 	}
 
+	// Engines without hard-link clone support must reject the tree. Continue
+	// their ordinary clone coverage after removing the additional name.
+	_, preservesLinks := m.(*dbMeta)
+	if !preservesLinks {
+		var count, total uint64
+		if st := m.Clone(Background(), cloneDir, dir1, cloneDir, "unsupported", CLONE_MODE_PRESERVE_ATTR, 0, 4, &count, &total); st != syscall.ENOTSUP {
+			t.Fatalf("hard-link clone: %s", st)
+		}
+		if st := m.Unlink(Background(), dir2, "file2Hardlink", true); st != 0 {
+			t.Fatal(st)
+		}
+	}
 	var attr Attr
 	attr.Mtime = 1
 	m.SetAttr(Background(), cloneDir, SetAttrMtime, 0, &attr)
@@ -4428,14 +4440,14 @@ func testClone(t *testing.T, m Meta) {
 		t.Fatalf("mtime of rootDir is not updated")
 	}
 	m.StatFS(Background(), cloneDir, &totalspace, &availspace, &iused, &iavail)
-	if totalspace-availspace-space != 268451840 {
+	if totalspace-availspace-space != 201342976 {
 		time.Sleep(time.Second * 2)
 		m.StatFS(Background(), cloneDir, &totalspace, &availspace, &iused, &iavail)
-		if totalspace-availspace-space != 268451840 {
+		if totalspace-availspace-space != 201342976 {
 			t.Logf("warning: added space: %d", totalspace-availspace-space)
 		}
 	}
-	if iused-iused2 != 8 {
+	if iused-iused2 != 7 {
 		t.Fatalf("added inodes: %d", iused-iused2)
 	}
 	if eno := m.Clone(Background(), RootInode, dir1, cloneDir, "no_preserve", 0, 022, 4, &count, &total); eno != 0 {
@@ -4682,10 +4694,10 @@ func checkEntry(t *testing.T, m Meta, srcEntry, dstEntry *Entry, dstParentIno In
 	}
 	srcAttr := srcEntry.Attr
 	dstAttr := dstEntry.Attr
-	if dstAttr.Parent != dstParentIno {
+	if dstAttr.Parent != dstParentIno && !(dstAttr.Nlink > 1 && dstAttr.Parent == 0) {
 		t.Fatalf("unmatched parent: %d, %d", dstAttr.Parent, dstParentIno)
 	}
-	if srcAttr.Typ == TypeFile && dstAttr.Nlink != 1 || srcAttr.Typ != TypeFile && srcAttr.Nlink != dstAttr.Nlink {
+	if srcAttr.Nlink != dstAttr.Nlink {
 		t.Fatalf("nlink not correct: srcType:%d,srcNlink:%d,dstType:%d,dstNlink:%d", srcAttr.Typ, srcAttr.Nlink, dstAttr.Typ, dstAttr.Nlink)
 	}
 
