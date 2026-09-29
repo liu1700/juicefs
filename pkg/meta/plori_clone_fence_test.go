@@ -375,8 +375,10 @@ func TestPloriWorkspaceRepairRefusesFencedMetadataMutation(t *testing.T) {
 	repair.Nlink = before.Nlink + 10
 
 	fenceForTest(t)
-	if st := m.doRepair(ctx, inode, &repair); st != syscall.EROFS {
-		t.Fatalf("repair after fence = %s, want EROFS", st)
+	for _, trustNlink := range []bool{false, true} {
+		if st := m.doRepair(ctx, inode, &repair, trustNlink); st != syscall.EROFS {
+			t.Fatalf("repair after fence (trustNlink=%t) = %s, want EROFS", trustNlink, st)
+		}
 	}
 	var after Attr
 	if st := m.GetAttr(ctx, inode, &after); st != 0 {
@@ -399,8 +401,10 @@ func TestPloriWorkspaceRepairRefusesCanceledMetadataMutation(t *testing.T) {
 	ctx := Background()
 	ctx.Cancel()
 
-	if st := m.doRepair(ctx, inode, &repair); st != syscall.EINTR {
-		t.Fatalf("repair after cancellation = %s, want EINTR", st)
+	for _, trustNlink := range []bool{false, true} {
+		if st := m.doRepair(ctx, inode, &repair, trustNlink); st != syscall.EINTR {
+			t.Fatalf("repair after cancellation (trustNlink=%t) = %s, want EINTR", trustNlink, st)
+		}
 	}
 	var after Attr
 	if st := m.GetAttr(setup, inode, &after); st != 0 {

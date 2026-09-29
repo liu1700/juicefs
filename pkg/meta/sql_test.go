@@ -18,6 +18,9 @@
 package meta
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/url"
 	"path"
 	"strings"
@@ -26,8 +29,146 @@ import (
 	"testing"
 	"time"
 
+	aclAPI "github.com/juicedata/juicefs/pkg/acl"
+	"xorm.io/xorm"
 	xormlog "xorm.io/xorm/log"
 )
+
+func TestSQLACLTransactionRollback(t *testing.T) {
+	for _, retry := range []bool{true, false} {
+		t.Run(fmt.Sprintf("retry=%v", retry), func(t *testing.T) {
+			raw, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "acl.db"), testConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			m := raw.(*dbMeta)
+			t.Cleanup(func() { _ = m.Shutdown() })
+			format := testFormat()
+			format.EnableACL = true
+			if err := m.Init(format, true); err != nil {
+				t.Fatal(err)
+			}
+			ctx := Background()
+			var inode Ino
+			if st := m.Create(ctx, RootInode, "child", 0666, 022, 0, &inode, nil); st != 0 {
+				t.Fatal(st)
+			}
+			rule := &aclAPI.Rule{Owner: 6, Group: 5, Mask: 4, Other: 0, NamedUsers: []aclAPI.Entry{{Id: 1001, Perm: 4}}}
+			attempts := 0
+			var id uint32
+			setACL := func(s *xorm.Session) error {
+				attempts++
+				var err error
+				id, err = m.insertACL(s, rule)
+				if err != nil {
+					return err
+				}
+				if m.aclCache.GetId(rule) != aclAPI.None {
+					t.Error("uncommitted ACL is visible to other transactions")
+				}
+				if _, err := s.Cols("access_acl_id").Update(&node{AccessACLId: id}, &node{Inode: inode}); err != nil {
+					return err
+				}
+				if attempts == 1 {
+					if retry {
+						return errBusy
+					}
+					return syscall.EIO
+				}
+				return nil
+			}
+			err = m.txn(setACL, inode)
+			if !retry {
+				if err != syscall.EIO {
+					t.Fatalf("first transaction: %v", err)
+				}
+				err = m.txn(setACL, inode)
+			}
+			if err != nil || attempts != 2 {
+				t.Fatalf("transaction: %v, attempts: %d", err, attempts)
+			}
+			if m.aclCache.GetId(rule) != id {
+				t.Fatal("committed ACL was not cached")
+			}
+			m.aclCache.Clear()
+			var attr Attr
+			if st := m.GetAttr(ctx, inode, &attr); st != 0 || attr.AccessACL != id {
+				t.Fatalf("getattr: %s, ACL: %d, want %d", st, attr.AccessACL, id)
+			}
+			var got aclAPI.Rule
+			if st := m.GetFacl(ctx, inode, aclAPI.TypeAccess, &got); st != 0 {
+				t.Fatalf("getfacl after rollback and cache clear: %s", st)
+			}
+			if !got.IsEqual(rule) {
+				t.Fatalf("ACL: %s, want %s", &got, rule)
+			}
+		})
+	}
+}
+
+func TestSQLACLCacheMissingRecord(t *testing.T) {
+	raw, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "acl.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := raw.(*dbMeta)
+	t.Cleanup(func() { _ = m.Shutdown() })
+	if err := m.Init(testFormat(), true); err != nil {
+		t.Fatal(err)
+	}
+	rule := &aclAPI.Rule{Owner: 6, Group: 5, Mask: 4, Other: 0, NamedUsers: []aclAPI.Entry{{Id: 1001, Perm: 4}}}
+	// ACL IDs can commit out of order across concurrent transactions.
+	val := newSQLAcl(rule)
+	val.Id = 2
+	if _, err := m.db.Insert(val); err != nil {
+		t.Fatal(err)
+	}
+	m.aclCache.Put(val.Id, rule)
+	if err := m.txn(m.tryLoadMissACLs); err != nil {
+		t.Fatal(err)
+	}
+	if m.aclCache.Get(1) != nil {
+		t.Error("missing ACL was cached before it committed")
+	}
+	val = newSQLAcl(rule)
+	val.Id = 1
+	if _, err := m.db.Insert(val); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.txn(func(s *xorm.Session) error {
+		got, err := m.getACL(s, 1)
+		if err == nil && !got.IsEqual(rule) {
+			t.Errorf("ACL: %s, want %s", got, rule)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSQLQueryBatch(t *testing.T) {
+	queryErr := errors.New("query failed")
+	for _, threads := range []int{1, 4} {
+		for _, wantErr := range []error{nil, queryErr} {
+			t.Run(fmt.Sprintf("threads=%d/error=%v", threads, wantErr), func(t *testing.T) {
+				var completed atomic.Int64
+				err := sqlQueryBatch(Background(), &DumpOption{Threads: threads}, 3*uint64(sqlDumpBatchSize), func(ctx context.Context, start, end uint64) (int, error) {
+					completed.Add(1)
+					if start == 3*uint64(sqlDumpBatchSize) {
+						return 7, wantErr
+					}
+					return 7, nil
+				})
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("query error: got %v, want %v", err, wantErr)
+				}
+				if got := completed.Load(); got != 4 {
+					t.Fatalf("completed queries: got %d, want 4", got)
+				}
+			})
+		}
+	}
+}
 
 func TestSQLiteClient(t *testing.T) {
 	m, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-unit-test.db"), testConfig())
@@ -184,6 +325,17 @@ func TestSQLiteSessionUsageInitializationFailsBeforeStartingSession(t *testing.T
 	}
 }
 
+func TestSQLiteRenameOverRelinkedHardlink(t *testing.T) {
+	m, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-rename-relink.db"), testConfig())
+	if err != nil || m.Name() != "sqlite3" {
+		t.Fatalf("create meta: %s", err)
+	}
+	if err := m.Reset(); err != nil {
+		t.Fatalf("reset meta: %s", err)
+	}
+	testRenameOverRelinkedHardlink(t, m)
+}
+
 type commitOnSQLiteBusyLogger struct {
 	xormlog.ContextLogger
 	commit    func() error
@@ -269,6 +421,81 @@ func TestSQLiteBatchUnlinkRetryDiscardsFailedAttemptDeletes(t *testing.T) {
 	m.Unlock()
 	if removed {
 		t.Fatalf("live inode %d retained delete state from failed transaction attempt", inode)
+	}
+}
+
+func TestSQLiteUnlinkRetryResetsTrash(t *testing.T) {
+	metaClient, err := newSQLMeta("sqlite3", path.Join(t.TempDir(), "jfs-unlink-trash-retry.db")+"?_timeout=1", testConfig())
+	if err != nil {
+		t.Fatalf("create meta: %s", err)
+	}
+	m := metaClient.(*dbMeta)
+	t.Cleanup(func() { _ = m.Shutdown() })
+	if err := m.Reset(); err != nil {
+		t.Fatalf("reset meta: %s", err)
+	}
+	format := testFormat()
+	format.TrashDays = 1
+	if err := m.Init(format, true); err != nil {
+		t.Fatalf("init meta: %s", err)
+	}
+
+	ctx := Background()
+	var trash Ino
+	if st := m.checkTrash(ctx, RootInode, &trash); st != 0 {
+		t.Fatalf("check trash: %s", st)
+	}
+
+	var inode Ino
+	var attr Attr
+	if st := m.Mknod(ctx, RootInode, "victim", TypeFile, 0644, 022, 0, "", &inode, &attr); st != 0 {
+		t.Fatalf("mknod victim: %s", st)
+	}
+	saved := node{Inode: inode}
+	if ok, err := m.db.Get(&saved); err != nil || !ok {
+		t.Fatalf("get victim node: ok=%t err=%v", ok, err)
+	}
+	if n, err := m.db.Delete(&node{Inode: inode}); err != nil || n != 1 {
+		t.Fatalf("delete victim node: rows=%d err=%v", n, err)
+	}
+
+	// The first unlink attempt sees the missing node and disables trash, then
+	// hits SQLITE_BUSY. Its retry sees the node restored by this transaction.
+	writer := m.db.NewSession()
+	t.Cleanup(func() { _ = writer.Close() })
+	if err := writer.Begin(); err != nil {
+		t.Fatalf("begin concurrent writer: %s", err)
+	}
+	t.Cleanup(func() { _ = writer.Rollback() })
+	if _, err := writer.Insert(&saved); err != nil {
+		t.Fatalf("restore victim node: %s", err)
+	}
+
+	retryLogger := &commitOnSQLiteBusyLogger{
+		ContextLogger: m.db.Logger(),
+		commit:        writer.Commit,
+	}
+	m.db.SetLogger(retryLogger)
+	m.db.ShowSQL(true)
+
+	if st := m.Unlink(ctx, RootInode, "victim"); st != 0 {
+		t.Fatalf("unlink after retry: %s", st)
+	}
+	if !retryLogger.committed {
+		t.Fatal("expected SQLite BUSY retry was not triggered")
+	}
+	if retryLogger.commitErr != nil {
+		t.Fatalf("commit concurrent node restore: %s", retryLogger.commitErr)
+	}
+
+	var got Ino
+	var gotAttr Attr
+	trashName := m.trashEntry(RootInode, inode, "victim")
+	if st := m.Lookup(ctx, trash, trashName, &got, &gotAttr, false); st != 0 {
+		t.Fatalf("lookup victim in trash: %s", st)
+	}
+	if got != inode {
+		t.Fatalf("victim in trash: inode=%d, want %d", got, inode)
 	}
 }
 

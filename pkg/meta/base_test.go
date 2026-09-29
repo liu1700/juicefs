@@ -174,6 +174,7 @@ func testMeta(t *testing.T, m Meta) {
 	testMetaClient(t, m)
 	testTruncateAndDelete(t, m)
 	testTrash(t, m)
+	testRenameOverRelinkedHardlink(t, m)
 	testParents(t, m)
 	testRemove(t, m)
 	testResolve(t, m)
@@ -207,6 +208,7 @@ func testMeta(t *testing.T, m Meta) {
 	testRenameDirStat(t, m)
 	testRenameDirStatWithTrash(t, m)
 	testClone(t, m)
+	testCleanupDetachedNodes(t, m)
 	testBatchClone(t, m)
 	testACL(t, m)
 	testKerberosToken(t, m)
@@ -290,6 +292,16 @@ func testAccess(t *testing.T, m Meta) {
 	ctx = NewContext(1, 2, []uint32{2})
 	st = m.Access(ctx, testNode, MODE_MASK_R|MODE_MASK_W, attr)
 	assert.Equal(t, syscall.Errno(0), st)
+}
+
+type aclCacheWithMissCount struct {
+	aclAPI.Cache
+	missCalls int
+}
+
+func (c *aclCacheWithMissCount) GetMissIds() []uint32 {
+	c.missCalls++
+	return c.Cache.GetMissIds()
 }
 
 func testACL(t *testing.T, m Meta) {
@@ -412,6 +424,7 @@ func testACL(t *testing.T, m Meta) {
 	assert.True(t, rule3.IsEqual(rule2))
 
 	// subdir access acl
+	m.getBase().aclCache.Clear()
 	rule3 = &aclAPI.Rule{}
 	if st := m.GetFacl(ctx, subDirIno, aclAPI.TypeAccess, rule3); st != 0 {
 		t.Fatalf("getfacl error: %s", st)
@@ -420,6 +433,46 @@ func testACL(t *testing.T, m Meta) {
 	rule2.Mask &= (mode >> 3) & 7
 	rule2.Other &= mode & 7
 	assert.True(t, rule3.IsEqual(rule2))
+
+	t.Run("ACLCacheHitWithGaps", func(t *testing.T) {
+		base := m.getBase()
+		cache := &aclCacheWithMissCount{Cache: base.aclCache}
+		base.aclCache = cache
+		defer func() { base.aclCache = cache.Cache }()
+		require.NotEmpty(t, cache.Cache.GetMissIds())
+		aclID := cache.GetId(rule3)
+		require.NotEqual(t, uint32(aclAPI.None), aclID)
+
+		for i := 0; i < 2; i++ {
+			require.Zero(t, m.SetFacl(ctx, subDirIno, aclAPI.TypeAccess, rule3.Dup()))
+			var attr Attr
+			require.Zero(t, m.GetAttr(ctx, subDirIno, &attr))
+			assert.Equal(t, aclID, attr.AccessACL)
+			assert.Zero(t, cache.missCalls, "cached setfacl should not load missing ACLs")
+
+			name := fmt.Sprintf("acl-cache-%d", i)
+			var inode Ino
+			require.Zero(t, m.Mknod(ctx, testDirIno, name, TypeFile, mode, 0022, 0, "", &inode, &attr))
+			defer m.Unlink(ctx, testDirIno, name)
+			assert.Equal(t, aclID, attr.AccessACL)
+			assert.Equal(t, mode, attr.Mode)
+			assert.Zero(t, cache.missCalls, "cached inherited ACL should not load missing ACLs")
+		}
+
+		uncached := rule3.Dup()
+		uncached.NamedUsers = aclAPI.Entries{{Id: 1002, Perm: 4}}
+		require.Equal(t, uint32(aclAPI.None), cache.GetId(uncached))
+		require.Zero(t, m.SetFacl(ctx, subDirIno, aclAPI.TypeAccess, uncached))
+		assert.Positive(t, cache.missCalls, "uncached ACL should still load missing ACLs")
+		var attr Attr
+		require.Zero(t, m.GetAttr(ctx, subDirIno, &attr))
+		assert.NotEqual(t, aclID, attr.AccessACL)
+		assert.Equal(t, mode, attr.Mode)
+		cache.Clear()
+		var got aclAPI.Rule
+		require.Zero(t, m.GetFacl(ctx, subDirIno, aclAPI.TypeAccess, &got))
+		assert.True(t, got.IsEqual(uncached))
+	})
 
 	// case: set minimal default acl
 	rule = &aclAPI.Rule{
@@ -1971,7 +2024,10 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 	_ = m.Write(ctx, inode, 0, uint32(0), Slice{Id: sliceId, Size: 1 << 20, Len: 64 << 10}, time.Now())
 	m.NewSlice(ctx, &sliceId)
 	_ = m.Write(ctx, inode, 0, uint32(128<<10), Slice{Id: sliceId, Size: 2 << 20, Len: 128 << 10}, time.Now())
-	_ = m.Write(ctx, inode, 0, uint32(0), Slice{Id: 0, Size: 1 << 20, Len: 1 << 20}, time.Now())
+	m.NewSlice(ctx, &sliceId)
+	if st := m.Write(ctx, inode, 0, uint32(0), Slice{Id: sliceId, Size: 1 << 20, Len: 1 << 20}, time.Now()); st != 0 {
+		t.Fatalf("write 0: %s", st)
+	}
 	if c, ok := m.(compactor); ok {
 		c.compactChunk(inode, 0, false, true, 0)
 	}
@@ -2089,6 +2145,109 @@ func testConcurrentWrite(t *testing.T, m Meta) {
 func testRace(t *testing.T, m Meta) {
 	t.Run("TrashSliceClaim", func(t *testing.T) {
 		testTrashSliceClaimRace(t, m)
+	})
+	t.Run("SQLExactEdgeCAS", func(t *testing.T) {
+		db, ok := m.(*dbMeta)
+		if !ok {
+			t.Skip("SQL transaction invariant")
+		}
+		testSQLExactEdgeCAS(t, db)
+	})
+}
+
+func testSQLExactEdgeCAS(t *testing.T, m *dbMeta) {
+	insert := func(e *edge) {
+		t.Helper()
+		if _, err := m.db.Insert(e); err != nil {
+			t.Fatalf("insert edge %q: %s", e.Name, err)
+		}
+		if e.Id == 0 {
+			t.Fatalf("insert edge %q returned zero id", e.Name)
+		}
+	}
+	remove := func(id int64) {
+		t.Helper()
+		if _, err := m.db.ID(id).Delete(&edge{}); err != nil {
+			t.Errorf("remove edge %d: %s", id, err)
+		}
+	}
+	get := func(id int64) edge {
+		t.Helper()
+		var e edge
+		ok, err := m.db.ID(id).Get(&e)
+		if err != nil {
+			t.Fatalf("get edge %d: %s", id, err)
+		}
+		if !ok {
+			t.Fatalf("edge %d not found", id)
+		}
+		return e
+	}
+
+	t.Run("DeleteRejectsChangedIdentity", func(t *testing.T) {
+		original := edge{Parent: RootInode, Name: []byte("sql-c05-changed"), Inode: 101, Type: TypeFile}
+		insert(&original)
+		defer remove(original.Id)
+		stale := get(original.Id)
+		if n, err := m.db.ID(original.Id).Cols("inode", "type").Update(&edge{Inode: 102, Type: TypeSymlink}); err != nil || n != 1 {
+			t.Fatalf("replace edge identity: rows=%d err=%v", n, err)
+		}
+
+		_, err := m.db.Transaction(func(s *xorm.Session) (interface{}, error) { return nil, deleteEdge(s, &stale) })
+		if !errors.Is(err, errEdgeChanged) {
+			t.Fatalf("delete stale edge: got %v, want %v", err, errEdgeChanged)
+		}
+		current := get(original.Id)
+		if current.Inode != 102 || current.Type != TypeSymlink {
+			t.Fatalf("replacement edge changed: inode=%d type=%d", current.Inode, current.Type)
+		}
+	})
+
+	t.Run("UpdateRejectsABAIdentity", func(t *testing.T) {
+		original := edge{Parent: RootInode, Name: []byte("sql-c05-aba"), Inode: 201, Type: TypeFile}
+		insert(&original)
+		stale := get(original.Id)
+		if n, err := m.db.ID(original.Id).Delete(&edge{}); err != nil || n != 1 {
+			t.Fatalf("delete original edge: rows=%d err=%v", n, err)
+		}
+		replacement := edge{Parent: original.Parent, Name: original.Name, Inode: original.Inode, Type: original.Type}
+		insert(&replacement)
+		defer remove(replacement.Id)
+
+		_, err := m.db.Transaction(func(s *xorm.Session) (interface{}, error) {
+			return nil, updateEdge(s, &stale, &edge{Inode: 202, Type: TypeSymlink})
+		})
+		if !errors.Is(err, errEdgeChanged) {
+			t.Fatalf("update ABA edge: got %v, want %v", err, errEdgeChanged)
+		}
+		current := get(replacement.Id)
+		if current.Inode != original.Inode || current.Type != original.Type {
+			t.Fatalf("ABA replacement changed: inode=%d type=%d", current.Inode, current.Type)
+		}
+	})
+
+	t.Run("BatchAffectedRowsRollback", func(t *testing.T) {
+		first := edge{Parent: RootInode, Name: []byte("sql-c05-batch-first"), Inode: 301, Type: TypeFile}
+		second := edge{Parent: RootInode, Name: []byte("sql-c05-batch-second"), Inode: 302, Type: TypeFile}
+		insert(&first)
+		defer remove(first.Id)
+		insert(&second)
+		defer remove(second.Id)
+		stale := []edge{get(first.Id), get(second.Id)}
+		if n, err := m.db.ID(second.Id).Cols("inode").Update(&edge{Inode: 303}); err != nil || n != 1 {
+			t.Fatalf("replace batch edge identity: rows=%d err=%v", n, err)
+		}
+
+		_, err := m.db.Transaction(func(s *xorm.Session) (interface{}, error) { return nil, deleteEdges(s, stale) })
+		if !errors.Is(err, errEdgeChanged) {
+			t.Fatalf("delete stale edge batch: got %v, want %v", err, errEdgeChanged)
+		}
+		if current := get(first.Id); current.Inode != first.Inode {
+			t.Fatalf("first edge deletion was not rolled back: inode=%d", current.Inode)
+		}
+		if current := get(second.Id); current.Inode != 303 {
+			t.Fatalf("second replacement changed: inode=%d", current.Inode)
+		}
 	})
 }
 
@@ -2759,6 +2918,61 @@ func testTrash(t *testing.T, m Meta) {
 	}
 }
 
+func testRenameOverRelinkedHardlink(t *testing.T, m Meta) {
+	format := testFormat()
+	format.TrashDays = 1
+	if err := m.Init(format, false); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer func() {
+		if err := m.Init(testFormat(), false); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+	}()
+	ctx := Background()
+	var file1, file2, ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "rl_file1", 0644, 022, 0, &file1, &attr); st != 0 {
+		t.Fatalf("create rl_file1: %s", st)
+	}
+	if st := m.Link(ctx, file1, RootInode, "rl_link", &attr); st != 0 {
+		t.Fatalf("link rl_file1 -> rl_link: %s", st)
+	}
+	if st := m.Unlink(ctx, RootInode, "rl_link"); st != 0 {
+		t.Fatalf("unlink rl_link: %s", st)
+	}
+	if st := m.Create(ctx, RootInode, "rl_file2", 0644, 022, 0, &file2, &attr); st != 0 {
+		t.Fatalf("create rl_file2: %s", st)
+	}
+	if st := m.Link(ctx, file1, RootInode, "rl_link", &attr); st != 0 {
+		t.Fatalf("relink rl_file1 -> rl_link: %s", st)
+	}
+	if st := m.Rename(ctx, RootInode, "rl_file2", RootInode, "rl_link", 0, &ino, &attr); st != 0 {
+		t.Fatalf("rename rl_file2 -> rl_link: %s", st)
+	}
+	if st := m.Lookup(ctx, RootInode, "rl_link", &ino, &attr, true); st != 0 {
+		t.Fatalf("lookup rl_link: %s", st)
+	}
+	if ino != file2 {
+		t.Fatalf("rl_link inode: expect %d, got %d", file2, ino)
+	}
+	if st := m.Lookup(ctx, RootInode, "rl_file1", &ino, &attr, true); st != 0 {
+		t.Fatalf("lookup rl_file1: %s", st)
+	}
+	if ino != file1 {
+		t.Fatalf("rl_file1 inode: expect %d, got %d", file1, ino)
+	}
+	if attr.Nlink != 2 {
+		t.Fatalf("rl_file1 nlink: expect 2 (original + trash), got %d", attr.Nlink)
+	}
+	if st := m.Unlink(ctx, RootInode, "rl_file1"); st != 0 {
+		t.Fatalf("unlink rl_file1: %s", st)
+	}
+	if st := m.Unlink(ctx, RootInode, "rl_link"); st != 0 {
+		t.Fatalf("unlink rl_link: %s", st)
+	}
+}
+
 func testParents(t *testing.T, m Meta) {
 	ctx := Background()
 	var inode, parent Ino
@@ -3287,6 +3501,28 @@ func testCheckAndRepair(t *testing.T, m Meta) {
 			t.Fatalf("d4Inode  attr: %+v", *dirAttr)
 		}
 	}
+
+	// doRepair should keep the given nlink when trustNlink is set
+	var before Attr
+	if st := m.GetAttr(Background(), d4Inode, &before); st != 0 {
+		t.Fatalf("getattr: %s", st)
+	}
+	fixed := before
+	fixed.Nlink = before.Nlink + 5
+	if st := m.getBase().en.doRepair(Background(), d4Inode, &fixed, true); st != 0 {
+		t.Fatalf("repair nlink of d4Inode: %s", st)
+	}
+	var after Attr
+	if st := m.GetAttr(Background(), d4Inode, &after); st != 0 {
+		t.Fatalf("getattr: %s", st)
+	}
+	if after.Nlink != before.Nlink+5 {
+		t.Fatalf("d4Inode nlink should be %d, but got %d", before.Nlink+5, after.Nlink)
+	}
+	after.Nlink = before.Nlink
+	if after != before {
+		t.Fatalf("d4Inode attr should not be changed: %+v -> %+v", before, after)
+	}
 }
 
 func testDirStat(t *testing.T, m Meta) {
@@ -3409,6 +3645,85 @@ func testDirStat(t *testing.T, m Meta) {
 		return m.GetDirStat(Background(), testInode)
 	}); err != nil {
 		t.Fatalf("test dir usage rmdir: %v", err)
+	}
+
+	// test BatchUnlink with duplicate hardlink names
+	dupFileName := "batch-dup-file"
+	dupLinkName := "batch-dup-link"
+	dupFileLength := uint64(4097)
+	var dupInode Ino
+	if st := m.Create(Background(), testInode, dupFileName, 0640, 022, 0, &dupInode, nil); st != 0 {
+		t.Fatalf("create duplicate batch file: %s", st)
+	}
+	if st := m.Fallocate(Background(), dupInode, 0, 0, dupFileLength, nil); st != 0 {
+		t.Fatalf("fallocate duplicate batch file: %s", st)
+	}
+	if st := m.Link(Background(), dupInode, testInode, dupLinkName, nil); st != 0 {
+		t.Fatalf("link duplicate batch file: %s", st)
+	}
+	if err := waitCheckResult(m, dirStat{2 * int64(dupFileLength), 2 * align4K(dupFileLength), 2}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage duplicate batch link: %v", err)
+	}
+
+	var dupLinkInode Ino
+	var dupLinkAttr Attr
+	if st := m.Lookup(Background(), testInode, dupLinkName, &dupLinkInode, &dupLinkAttr, false); st != 0 {
+		t.Fatalf("lookup duplicate batch link: %s", st)
+	}
+	if dupLinkInode != dupInode || dupLinkAttr.Nlink != 2 {
+		t.Fatalf("duplicate batch link attr: inode %d attr %+v", dupLinkInode, dupLinkAttr)
+	}
+	dupEntries := []*Entry{
+		{Inode: dupInode, Name: []byte(dupLinkName), Attr: &dupLinkAttr},
+		{Inode: dupInode, Name: []byte(dupLinkName), Attr: &dupLinkAttr},
+	}
+	var dupCount uint64
+	if st := m.getBase().BatchUnlink(Background(), testInode, dupEntries, &dupCount, true); st != 0 {
+		t.Fatalf("batch unlink duplicate hardlink: %s", st)
+	}
+	if dupCount != uint64(len(dupEntries)) {
+		t.Fatalf("batch unlink duplicate count: expect %d, got %d", len(dupEntries), dupCount)
+	}
+	if err := waitCheckResult(m, dirStat{int64(dupFileLength), align4K(dupFileLength), 1}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage duplicate batch unlink: %v", err)
+	}
+
+	var remainingInode Ino
+	var remainingAttr Attr
+	if st := m.Lookup(Background(), testInode, dupFileName, &remainingInode, &remainingAttr, false); st != 0 {
+		t.Fatalf("lookup remaining hardlink after duplicate batch unlink: %s", st)
+	}
+	if remainingInode != dupInode || remainingAttr.Nlink != 1 {
+		t.Fatalf("remaining hardlink attr: inode %d attr %+v", remainingInode, remainingAttr)
+	}
+	var removedInode Ino
+	var removedAttr Attr
+	if st := m.Lookup(Background(), testInode, dupLinkName, &removedInode, &removedAttr, false); st != syscall.ENOENT {
+		t.Fatalf("lookup removed duplicate hardlink: %s", st)
+	}
+	deleted := false
+	if err := m.ScanDeletedObject(Background(), nil, nil, nil, func(ino Ino, size uint64, ts int64) (bool, error) {
+		if ino == dupInode {
+			deleted = true
+		}
+		return false, nil
+	}); err != nil {
+		t.Fatalf("scan pending deleted files: %s", err)
+	}
+	if deleted {
+		t.Fatalf("inode %d was queued for deletion after duplicate batch unlink", dupInode)
+	}
+	if st := m.Unlink(Background(), testInode, dupFileName); st != 0 {
+		t.Fatalf("unlink duplicate batch file: %s", st)
+	}
+	if err := waitCheckResult(m, dirStat{0, 0, 0}, func() (*dirStat, syscall.Errno) {
+		return m.GetDirStat(Background(), testInode)
+	}); err != nil {
+		t.Fatalf("test dir usage duplicate batch cleanup: %v", err)
 	}
 }
 
@@ -4257,6 +4572,81 @@ func testClone(t *testing.T, m Meta) {
 	}
 	if eno := m.Clone(Background(), TrashInode+1, 1000, cloneDir, "xxx", 0, 022, 4, &count, &total); !errors.Is(eno, syscall.EPERM) {
 		t.Fatalf("cloning files in the trash is not supported")
+	}
+}
+
+func testCleanupDetachedNodes(t *testing.T, m Meta) {
+	ctx := Background()
+	var srcDir, srcSub, srcFile Ino
+	if eno := m.Mkdir(ctx, RootInode, "detachedSrc", 0777, 022, 0, &srcDir, nil); eno != 0 {
+		t.Fatalf("mkdir detachedSrc: %s", eno)
+	}
+	if eno := m.Mkdir(ctx, srcDir, "sub", 0777, 022, 0, &srcSub, nil); eno != 0 {
+		t.Fatalf("mkdir sub: %s", eno)
+	}
+	if eno := m.Mknod(ctx, srcSub, "immutable", TypeFile, 0777, 022, 0, "", &srcFile, nil); eno != 0 {
+		t.Fatalf("mknod immutable: %s", eno)
+	}
+	if eno := m.SetAttr(ctx, srcFile, SetAttrFlag, 0, &Attr{Flags: FlagImmutable}); eno != 0 {
+		t.Fatalf("setattr immutable: %s", eno)
+	}
+	if eno := m.SetAttr(ctx, srcSub, SetAttrFlag, 0, &Attr{Flags: FlagAppend}); eno != 0 {
+		t.Fatalf("setattr sub: %s", eno)
+	}
+
+	// an interrupted clone leaves a detached tree behind: the entries are copied,
+	// but the top directory is never attached to its parent
+	var dstIno Ino
+	var count uint64
+	if eno := m.getBase().cloneEntry(ctx, srcDir, RootInode, "detachedDst", &dstIno, CLONE_MODE_PRESERVE_ATTR, 022, &count, true, make(chan struct{}, 4)); eno != 0 {
+		t.Fatalf("clone entry: %s", eno)
+	}
+	var dstSub, dstFile Ino
+	var dstAttr Attr
+	if eno := m.Lookup(ctx, dstIno, "sub", &dstSub, &dstAttr, false); eno != 0 {
+		t.Fatalf("lookup sub: %s", eno)
+	}
+	if eno := m.Lookup(ctx, dstSub, "immutable", &dstFile, &dstAttr, false); eno != 0 {
+		t.Fatalf("lookup immutable: %s", eno)
+	}
+	if dstAttr.Flags&FlagImmutable == 0 {
+		t.Fatalf("clone should copy attr flags, or the detached tree is reapable anyway")
+	}
+
+	edge := time.Now().Add(time.Minute)
+	detached := func() bool {
+		for _, ino := range m.(engine).doFindDetachedNodes(edge) {
+			if ino == dstIno {
+				return true
+			}
+		}
+		return false
+	}
+	if !detached() {
+		t.Fatalf("detached node %d not found", dstIno)
+	}
+	m.CleanupDetachedNodesBefore(ctx, edge, nil)
+	if detached() {
+		t.Fatalf("detached tree %d should be cleaned up", dstIno)
+	}
+	for _, ino := range []Ino{dstIno, dstSub, dstFile} {
+		if eno := m.GetAttr(ctx, ino, &dstAttr); eno != syscall.ENOENT {
+			t.Fatalf("inode %d of the detached tree should be removed: %s", ino, eno)
+		}
+	}
+
+	// removing a reachable immutable file is still not allowed
+	if eno := m.Remove(ctx, RootInode, "detachedSrc", false, RmrDefaultThreads, nil); eno != syscall.EPERM {
+		t.Fatalf("remove immutable file: %s", eno)
+	}
+	if eno := m.SetAttr(ctx, srcFile, SetAttrFlag, 0, &Attr{}); eno != 0 {
+		t.Fatalf("setattr immutable: %s", eno)
+	}
+	if eno := m.SetAttr(ctx, srcSub, SetAttrFlag, 0, &Attr{}); eno != 0 {
+		t.Fatalf("setattr sub: %s", eno)
+	}
+	if eno := m.Remove(ctx, RootInode, "detachedSrc", false, RmrDefaultThreads, nil); eno != 0 {
+		t.Fatalf("remove detachedSrc: %s", eno)
 	}
 }
 

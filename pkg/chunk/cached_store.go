@@ -800,7 +800,7 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 		res = tmp
 	}
 	logRequest("GET", key, fmt.Sprintf("RANGE(%d,%d) ", off, len(p)), res.reqID, err, used)
-	if errors.Is(err, context.Canceled) || errors.Is(err, utils.ErrFuncTimeout) {
+	if errors.Is(err, context.Canceled) {
 		return 0, err
 	}
 	store.objectDataBytes.WithLabelValues("GET", res.sc).Add(float64(res.n))
@@ -810,6 +810,9 @@ func (store *cachedStore) loadRange(ctx context.Context, key string, page *Page,
 		return res.n, nil
 	}
 	store.objectReqErrors.Add(1)
+	if errors.Is(err, utils.ErrFuncTimeout) {
+		return 0, err
+	}
 	// fall back to full read
 	return 0, errTryFullRead
 }
@@ -929,6 +932,9 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		}
 	}
 	store.bcache = newCacheManager(&config, reg, func(key, fpath string, force bool) bool {
+		if !store.conf.Writeback {
+			return false
+		}
 		if fi, err := os.Stat(fpath); err == nil {
 			return store.addDelayedStaging(key, fpath, fi.ModTime(), force)
 		} else {
@@ -937,23 +943,24 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		}
 	})
 
-	go func() {
-		for {
-			if store.bcache.isEmpty() {
-				logger.Warn("cache store is empty, use memory cache")
-				config.CacheSize = 100 << 20
-				config.CacheDir = "memory"
-				previous := store.bcache
-				store.bcache = newMemStore(&config, previous.getMetrics())
-				previous.stop()
+	if mgr, ok := store.bcache.(*cacheManager); ok {
+		fallbackConfig := config
+		fallbackConfig.CacheSize = 100 << 20
+		fallbackConfig.CacheDir = "memory"
+
+		go func() {
+			for !mgr.isEmpty() {
+				select {
+				case <-store.closed:
+					return
+				case <-time.After(time.Second):
+				}
 			}
-			select {
-			case <-store.closed:
-				return
-			case <-time.After(time.Second):
-			}
-		}
-	}()
+			logger.Warn("cache store is empty, use memory cache")
+			store.bcache = newMemStore(&fallbackConfig, mgr.getMetrics())
+			mgr.stop()
+		}()
+	}
 
 	if !config.CacheEnabled() {
 		config.Prefetch = 0 // disable prefetch if cache is disabled

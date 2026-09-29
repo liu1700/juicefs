@@ -342,10 +342,10 @@ require (
 	storj.io/eventkit v0.0.0-20250410172343-61f26d3de156 // indirect
 	storj.io/infectious v0.0.2 // indirect
 	storj.io/picobuf v0.0.4 // indirect
-	xorm.io/builder v0.3.7 // indirect
+	xorm.io/builder v0.3.13 // indirect
 )
 
-replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260515071949-69a6cfc9da65
+replace github.com/minio/minio v0.0.0-20210206053228-97fe57bba92c => github.com/juicedata/minio v0.0.0-20260915033819-47296b1b89b0
 
 replace github.com/hanwen/go-fuse/v2 v2.1.1-0.20210611132105-24a1dfe6b4f8 => github.com/juicedata/go-fuse/v2 v2.1.1-0.20260819084346-22b3157c2d7f
 
@@ -353,7 +353,7 @@ replace github.com/dgrijalva/jwt-go v3.2.0+incompatible => github.com/golang-jwt
 
 replace github.com/vbauerster/mpb/v7 v7.0.3 => github.com/juicedata/mpb/v7 v7.0.4-0.20231024073412-2b8d31be510b
 
-replace xorm.io/xorm v1.0.7 => gitea.com/davies/xorm v1.0.8-0.20220528043536-552d84d1b34a
+replace xorm.io/xorm v1.0.7 => github.com/juicedata/xorm v1.4.2-0.20260909084754-f6c8d2b84ec2
 
 replace github.com/huaweicloud/huaweicloud-sdk-go-obs v3.21.12+incompatible => github.com/juicedata/huaweicloud-sdk-go-obs v3.22.12-0.20230228031208-386e87b5c091+incompatible
 
