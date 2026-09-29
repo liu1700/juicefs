@@ -120,8 +120,14 @@ type Litestream struct {
 	// (litestream_metrics.go).
 	child litestreamChildState
 
-	cmd                 *exec.Cmd
-	done                chan error
+	cmd  *exec.Cmd
+	done chan error
+	// startBy is when the current child must have opened its control socket.
+	// It is set when the child is spawned and cleared once the socket exists.
+	// Until then Probe reports the child as starting rather than as failed,
+	// so a child that is slow to start is not killed and started again
+	// (PLO-1172).
+	startBy             time.Time
 	lastRestoreAttempts []string
 
 	spec     *MountSpec
@@ -515,8 +521,45 @@ func restoreLatestArgs(configPath, dbPath, outPath string) []string {
 	return []string{"restore", "-config", configPath, "-o", outPath, "-integrity-check", "full", dbPath}
 }
 
+// litestreamStartTimeout is how long a new child has to open its control
+// socket before it is treated as failed.
+const litestreamStartTimeout = 30 * time.Second
+
 // Start launches continuous replication and waits for the control socket.
+//
+// If ctx ends first the child is left running: it is still inside its own
+// start deadline, and Probe reports it as starting until that passes.
 func (l *Litestream) Start(ctx context.Context) error {
+	if err := l.spawn(); err != nil {
+		return err
+	}
+	for {
+		if _, err := os.Stat(l.SocketPath); err == nil {
+			l.startBy = time.Time{}
+			return nil
+		}
+		select {
+		case err := <-l.done:
+			l.done = nil
+			return fmt.Errorf("litestream exited during startup: %w", err)
+		case <-ctx.Done():
+			l.child.invalidate()
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+		if time.Now().After(l.startBy) {
+			l.child.invalidate()
+			return fmt.Errorf("litestream control socket did not appear within %s", litestreamStartTimeout)
+		}
+	}
+}
+
+// spawn starts one `litestream replicate` child and returns without waiting
+// for its control socket.
+//
+// The old socket is removed first, so a socket that exists afterwards was
+// created by this child.
+func (l *Litestream) spawn() error {
 	_ = os.Remove(l.SocketPath)
 	cmd := exec.Command(l.Bin, "replicate", "-config", l.ConfigPath)
 	cmd.Stdout = os.Stderr // one stream; the plugin reads the last stderr line
@@ -546,6 +589,7 @@ func (l *Litestream) Start(ctx context.Context) error {
 	}
 	l.cmd = cmd
 	l.done = make(chan error, 1)
+	l.startBy = time.Now().Add(litestreamStartTimeout)
 	if l.MetricsAddr != "" {
 		// Before the reaper starts: an unreaped child keeps its PID, so the
 		// kernel identity captured here is this child's.
@@ -560,25 +604,7 @@ func (l *Litestream) Start(ctx context.Context) error {
 		done <- err
 	}()
 
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if _, err := os.Stat(l.SocketPath); err == nil {
-			return nil
-		}
-		select {
-		case err := <-l.done:
-			l.done = nil
-			return fmt.Errorf("litestream exited during startup: %w", err)
-		case <-ctx.Done():
-			l.child.invalidate()
-			return ctx.Err()
-		case <-time.After(50 * time.Millisecond):
-		}
-		if time.Now().After(deadline) {
-			l.child.invalidate()
-			return errors.New("litestream control socket did not appear within 30s")
-		}
-	}
+	return nil
 }
 
 // syncResponse is v0.5.17's `POST /sync` body (`server.go:566-571`). Both ids
@@ -851,18 +877,33 @@ func (l *Litestream) logf(event string, kv ...any) {
 // finds; `/sync` without `wait` is the cheapest one Litestream has, because
 // it does the WAL-to-LTX step and leaves the upload to the replica monitor
 // (store.go:428-431).
+//
+// The two deaths wrap ErrReplicatorGone. A child that has not opened its
+// control socket yet, and is still inside its start deadline, is reported as
+// ErrReplicatorStarting and is not sent a request. A `/sync` that fails or
+// times out on a running child wraps neither: that child may only be slow,
+// and the supervisor decides how many of those to wait out (PLO-1172).
 func (l *Litestream) Probe(ctx context.Context) error {
 	if l.cmd == nil || l.done == nil {
-		return errors.New("litestream is not running")
+		return fmt.Errorf("litestream is not running: %w", ErrReplicatorGone)
 	}
 	select {
 	case err := <-l.done:
 		l.done = nil
 		if err == nil {
-			return errors.New("litestream exited on its own with status 0")
+			return fmt.Errorf("litestream exited on its own with status 0: %w", ErrReplicatorGone)
 		}
-		return fmt.Errorf("litestream exited on its own: %w", err)
+		return fmt.Errorf("litestream exited on its own: %w: %w", err, ErrReplicatorGone)
 	default:
+	}
+	if !l.startBy.IsZero() {
+		if _, err := os.Stat(l.SocketPath); err != nil {
+			if time.Now().Before(l.startBy) {
+				return fmt.Errorf("litestream has not opened its control socket yet: %w", ErrReplicatorStarting)
+			}
+			return fmt.Errorf("litestream control socket did not appear within %s: %w", litestreamStartTimeout, ErrReplicatorGone)
+		}
+		l.startBy = time.Time{}
 	}
 	probe, cancel := context.WithTimeout(ctx, ProbeTimeout)
 	defer cancel()
@@ -877,23 +918,92 @@ func (l *Litestream) Probe(ctx context.Context) error {
 // so it compares local state against the replica and continues. The reap is
 // unconditional because starting a second replicator on one database is the
 // one outcome worse than a lagging replica.
+//
+// It returns once the replacement is spawned, without waiting for its control
+// socket. The supervisor's replication lane can then resume probing while the
+// replacement starts. Probe reports it as starting until the socket appears.
+// The stop of the old child is bounded by ProbeTimeout; see stopForRestart.
 func (l *Litestream) Restart(ctx context.Context) error {
 	l.child.invalidate()
 	if l.cmd != nil && l.done != nil {
-		_ = l.cmd.Process.Kill()
-		select {
-		case <-l.done:
-		case <-ctx.Done():
-			return fmt.Errorf("previous litestream did not exit, so a new one was NOT started: %w", ctx.Err())
+		reap, cancel := context.WithTimeout(ctx, ProbeTimeout)
+		err := l.stopForRestart(reap)
+		cancel()
+		if err != nil {
+			return err
 		}
-		l.done = nil
 	}
 	l.cmd = nil
-	if err := l.Start(ctx); err != nil {
+	if err := l.spawn(); err != nil {
 		return err
 	}
 	l.restarts.Add(1)
 	return nil
+}
+
+// restartKillReserve is the part of the restart's reap budget kept back for
+// SIGKILL after the SIGTERM grace ends.
+const restartKillReserve = time.Second
+
+// stopForRestart ends a child that Probe has not seen exit, within reap.
+//
+// A running child gets one SIGTERM first, because that is what makes
+// `litestream replicate` run its shutdown. In the pinned build
+// (plori-ai/litestream v0.5.17-plori.4, same code as upstream v0.5.17 on this
+// path) SIGTERM is caught (cmd/litestream/main_notwindows.go:22-24), the
+// replicate case calls ReplicateCommand.Close on it (cmd/litestream/main.go:166,
+// :189), which closes the Store (replicate.go:433), and DB.Close runs a final
+// WAL-to-LTX sync and a replica sync with retries (db.go:834, :842) before the
+// process exits. A SIGKILL skips that, so LTX not yet written or uploaded is
+// left for the replacement to redo. If the child has not exited by
+// restartKillReserve before reap's deadline it gets SIGKILL: the shutdown sync
+// may retry for up to 30 s (db.go:39), a child that could not answer three
+// probes may not handle a signal either, and the supervisor goroutine cannot
+// wait longer. Only one SIGTERM is ever sent, because a second one closes the
+// done channel that interrupts the shutdown sync (cmd/litestream/main.go:183-184).
+func (l *Litestream) stopForRestart(reap context.Context) error {
+	pid := l.cmd.Process.Pid
+	select {
+	case err := <-l.done:
+		// It exited after the last probe; there is nothing to signal.
+		l.done = nil
+		l.logf("litestream_restart_reaped", "pid", pid, "status", exitStatus(err))
+		return nil
+	default:
+	}
+	grace := reap
+	if deadline, ok := reap.Deadline(); ok {
+		var cancel context.CancelFunc
+		grace, cancel = context.WithDeadline(reap, deadline.Add(-restartKillReserve))
+		defer cancel()
+	}
+	l.logf("litestream_restart_signal", "pid", pid, "signal", "SIGTERM")
+	_ = l.cmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case err := <-l.done:
+		l.done = nil
+		l.logf("litestream_restart_reaped", "pid", pid, "status", exitStatus(err))
+		return nil
+	case <-grace.Done():
+	}
+	l.logf("litestream_restart_signal", "pid", pid, "signal", "SIGKILL")
+	_ = l.cmd.Process.Kill()
+	select {
+	case err := <-l.done:
+		l.done = nil
+		l.logf("litestream_restart_reaped", "pid", pid, "status", exitStatus(err))
+		return nil
+	case <-reap.Done():
+		return fmt.Errorf("previous litestream did not exit, so a new one was NOT started: %w", reap.Err())
+	}
+}
+
+// exitStatus is a child's wait result as a log field.
+func exitStatus(err error) string {
+	if err == nil {
+		return "exit status 0"
+	}
+	return err.Error()
 }
 
 // RestartCount is the number of replacement children this Litestream started

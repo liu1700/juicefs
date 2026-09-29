@@ -17,6 +17,8 @@
 #   S3_ENDPOINT       e.g. http://127.0.0.1:9000
 #   S3_BUCKET         bucket that already exists
 #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION
+#   PLORI_E2E_SCENARIO=replication-faults runs only the PLO-1172 scenario.
+#   PLORI_E2E_LONG_PAUSE=1 also stops every replacement past the 30 s window.
 set -euo pipefail
 
 PLORI_BIN=${PLORI_BIN:-./juicefs.plori}
@@ -151,6 +153,28 @@ await_ready() {
   done
   return 1
 }
+
+if [ "${PLORI_E2E_SCENARIO:-lifecycle}" = replication-faults ]; then
+  echo "== PLO-1172: real-process replication faults =="
+  write_spec 1 "$WORK/spec1.json" ""
+  run_worker "$WORK/spec1.json" "$WORK/mnt" "$WORK/state" "$WORK/cache" "$WORK/faults.log"
+  await_ready "$WORK/state" || { command cat "$WORK/faults.log"; fail "fault worker never reported ready"; }
+  python3 "$HERE/replication_faults.py" "$WORKER_PID" "$WORK/mnt" "$WORK/state" "$WORK/faults.log" \
+    || { command cat "$WORK/faults.log"; fail "replication fault injection failed (artifacts: $WORK)"; }
+  if [ "${PLORI_E2E_LONG_PAUSE:-0}" = 1 ]; then
+    expected_exit=69
+  else
+    expected_exit=0
+    kill -TERM -- "-$WORKER_PID" 2>/dev/null || kill -TERM "$WORKER_PID"
+  fi
+  worker_exit=0
+  wait "$WORKER_PID" || worker_exit=$?
+  WORKER_PID=""
+  [ "$worker_exit" -eq "$expected_exit" ] \
+    || { command cat "$WORK/faults.log"; fail "fault worker exited $worker_exit, want $expected_exit"; }
+  echo "plori-mount replication fault injection verified (artifacts: $WORK)"
+  exit 0
+fi
 
 echo "== generation 1: format, mount, write, stop =="
 write_spec 1 "$WORK/spec1.json" ""

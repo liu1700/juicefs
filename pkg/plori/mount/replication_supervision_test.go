@@ -6,8 +6,11 @@ package mount
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -25,6 +28,10 @@ type watchedReplicator struct {
 	// healAfterRestart makes Restart clear the failure, which is the
 	// difference between a replicator that comes back and one that does not.
 	healAfterRestart bool
+	// afterRestart, when set, becomes the probe result after a successful
+	// Restart: ErrReplicatorStarting models a replacement that has not opened
+	// its control socket yet.
+	afterRestart error
 }
 
 func (r *watchedReplicator) Probe(context.Context) error {
@@ -43,6 +50,9 @@ func (r *watchedReplicator) Restart(context.Context) error {
 	}
 	if r.healAfterRestart {
 		r.probeErr = nil
+	}
+	if r.afterRestart != nil {
+		r.probeErr = r.afterRestart
 	}
 	return nil
 }
@@ -103,11 +113,11 @@ func supWithWatchedReplicator(t *testing.T, rep *watchedReplicator) (*Supervisor
 	vol := healthyVolume()
 	sup := newSup(t, testSpec(), &fakeFS{vol: vol}, &fakeCP{}, &rep.fakeReplicator, &fakeFencer{})
 	sup.Deps.Replicator = rep
-	// A real barrier interval, not the 30 ms the shared harness uses: the whole
-	// rule under test is "failed for longer than a barrier period", and a
-	// period shorter than one tick of the test clock makes every failure
-	// terminal on its first tick.
-	sup.Options.BarrierInterval = time.Minute
+	// The production barrier interval, not the 30 ms the shared harness uses.
+	// The recovery window no longer derives from it (PLO-1172), and keeping the
+	// real value here is what shows a failure longer than one barrier period
+	// does not stop the mount.
+	sup.Options.BarrierInterval = DefaultBarrierInterval
 	now := time.Now().UTC()
 	clock := &now
 	sup.Deps.Now = func() time.Time { return *clock }
@@ -136,7 +146,7 @@ func TestADeadReplicatorShowsUpInHealthOnTheNextTick(t *testing.T) {
 		t.Fatal("replication_failed was true while the replicator was healthy")
 	}
 
-	rep.fail(errors.New("litestream exited on its own: signal: killed"))
+	rep.fail(fmt.Errorf("litestream exited on its own: signal: killed: %w", ErrReplicatorGone))
 	if f := sup.checkReplication(context.Background()); f != nil {
 		t.Fatalf("the first failing tick must repair, not stop: %v", f.Err)
 	}
@@ -151,7 +161,7 @@ func TestADeadReplicatorShowsUpInHealthOnTheNextTick(t *testing.T) {
 func TestTheRepairIsAttemptedOncePerFailure(t *testing.T) {
 	rep := &watchedReplicator{}
 	sup, _, clock := supWithWatchedReplicator(t, rep)
-	rep.fail(errors.New("gone"))
+	rep.fail(fmt.Errorf("litestream exited on its own: %w", ErrReplicatorGone))
 
 	for i := 0; i < 3; i++ {
 		if f := sup.checkReplication(context.Background()); f != nil {
@@ -179,7 +189,7 @@ func TestARecoveredReplicatorClearsTheFlagAndRearmsTheRepair(t *testing.T) {
 	rep := &watchedReplicator{healAfterRestart: true}
 	sup, _, clock := supWithWatchedReplicator(t, rep)
 
-	rep.fail(errors.New("gone"))
+	rep.fail(fmt.Errorf("litestream exited on its own: %w", ErrReplicatorGone))
 	if f := sup.checkReplication(context.Background()); f != nil {
 		t.Fatalf("unexpected stop: %v", f.Err)
 	}
@@ -193,7 +203,7 @@ func TestARecoveredReplicatorClearsTheFlagAndRearmsTheRepair(t *testing.T) {
 	}
 
 	// Second, independent failure: repaired again.
-	rep.fail(errors.New("gone again"))
+	rep.fail(fmt.Errorf("litestream exited on its own again: %w", ErrReplicatorGone))
 	*clock = clock.Add(time.Second)
 	if f := sup.checkReplication(context.Background()); f != nil {
 		t.Fatalf("unexpected stop on the second failure: %v", f.Err)
@@ -203,22 +213,23 @@ func TestARecoveredReplicatorClearsTheFlagAndRearmsTheRepair(t *testing.T) {
 	}
 }
 
-// The point of the whole issue: replication must never be silently off. Past a
-// barrier period with no replica, the mount stops — ORDERED, so the barrier and
-// the final sync still run — and reports the loss with its own identifier.
+// The point of the whole issue: replication must never be silently off. Past
+// the recovery window with no replica, the mount stops — ORDERED, so the
+// barrier and the final sync still run — and reports the loss with its own
+// identifier.
 func TestReplicationThatStaysDeadStopsTheMountWithItsOwnCode(t *testing.T) {
 	rep := &watchedReplicator{restartErr: errors.New("still gone")}
 	sup, vol, clock := supWithWatchedReplicator(t, rep)
-	rep.fail(errors.New("litestream exited on its own: signal: killed"))
+	rep.fail(fmt.Errorf("litestream exited on its own: signal: killed: %w", ErrReplicatorGone))
 
 	if f := sup.checkReplication(context.Background()); f != nil {
-		t.Fatalf("stopped before a barrier period had passed: %v", f.Err)
+		t.Fatalf("stopped before the recovery window had passed: %v", f.Err)
 	}
-	*clock = clock.Add(sup.barrierInterval() + time.Second)
+	*clock = clock.Add(ReplicationRecoveryWindow + time.Second)
 
 	f := sup.checkReplication(context.Background())
 	if f == nil {
-		t.Fatal("replication has been off for longer than a barrier period and the mount is still running")
+		t.Fatal("replication has been off for longer than the recovery window and the mount is still running")
 	}
 	if f.Exit != CodeBarrierIncomplete {
 		t.Errorf("exit = %d, want %d (the reported-data-loss class)", f.Exit, CodeBarrierIncomplete)
@@ -262,9 +273,9 @@ func TestReplicationThatStaysDeadStopsTheMountWithItsOwnCode(t *testing.T) {
 func TestTheVerdictIsPublishedBeforeTheStopBegins(t *testing.T) {
 	rep := &watchedReplicator{restartErr: errors.New("still gone")}
 	sup, _, clock := supWithWatchedReplicator(t, rep)
-	rep.fail(errors.New("gone"))
+	rep.fail(fmt.Errorf("litestream exited on its own: %w", ErrReplicatorGone))
 	_ = sup.checkReplication(context.Background())
-	*clock = clock.Add(sup.barrierInterval() + time.Second)
+	*clock = clock.Add(ReplicationRecoveryWindow + time.Second)
 	_ = sup.checkReplication(context.Background())
 
 	if !readHealth(t, sup).ReplicationFailed {
@@ -286,12 +297,11 @@ func TestAReplicatorThatCannotBeProbedIsNotTreatedAsFailed(t *testing.T) {
 
 // A node-replicator replacement can make the first repair race a missing socket.
 // That failed call must not consume recovery: the guard tick gets another bounded
-// chance to register with the fresh, empty daemon before the barrier window ends.
-func TestFailedReplicationRepairRetriesBeforeBarrierDeadline(t *testing.T) {
+// chance to register with the fresh, empty daemon before the recovery window ends.
+func TestFailedReplicationRepairRetriesBeforeRecoveryDeadline(t *testing.T) {
 	rep := &watchedReplicator{restartErr: errors.New("replicator socket unavailable")}
 	sup, _, clock := supWithWatchedReplicator(t, rep)
-	sup.Options.BarrierInterval = 5 * time.Second
-	rep.fail(errors.New("database not found"))
+	rep.fail(fmt.Errorf("litestream control /sync: status 404: database not found: %w", ErrReplicatorGone))
 
 	if f := sup.checkReplication(context.Background()); f != nil {
 		t.Fatalf("first failed repair stopped the worker: %v", f.Err)
@@ -329,7 +339,6 @@ func TestAProbeThatConsumesTheLeaseBudgetDoesNotStartRestart(t *testing.T) {
 	rep := &slowProbeReplicator{}
 	sup, _, _ := supWithWatchedReplicator(t, &watchedReplicator{})
 	sup.Deps.Replicator = rep
-	sup.Options.BarrierInterval = 200 * time.Millisecond
 	now := time.Now()
 	sup.Deps.Now = time.Now
 	sup.deadline = NewDeadline(now.UTC().Add(40*time.Millisecond), 0, now)
@@ -344,6 +353,265 @@ func TestAProbeThatConsumesTheLeaseBudgetDoesNotStartRestart(t *testing.T) {
 	}
 	if f == nil {
 		t.Fatal("probe that exhausted the lease stop budget did not stop")
+	}
+}
+
+// PLO-1172 (incident B). A probe that times out against a child that is still
+// alive is not a reason to kill it: under memory pressure `/sync` can take
+// longer than ProbeTimeout, and the SIGKILL the old code sent on the first such
+// timeout threw away the child's shutdown sync and left a socket-less
+// replacement. Short runs of timeouts are waited out, and the recovery is
+// logged when the probe answers again.
+func TestProbeTimeoutsOnALiveChildWithinTheWindowDoNotRestart(t *testing.T) {
+	rep := &watchedReplicator{}
+	sup, _, clock := supWithWatchedReplicator(t, rep)
+	log := &capturedLog{}
+	sup.Deps.Log = log.fn
+	rep.fail(fmt.Errorf("litestream control /sync: %w", context.DeadlineExceeded))
+
+	for i := 0; i < 2; i++ {
+		if f := sup.checkReplication(context.Background()); f != nil {
+			t.Fatalf("timed-out probe %d stopped the mount: %v", i, f.Err)
+		}
+		*clock = clock.Add(6 * time.Second)
+	}
+	rep.fail(nil)
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("a probe that answered stopped the mount: %v", f.Err)
+	}
+	if got := rep.RestartCount(); got != 0 {
+		t.Fatalf("RestartCount() = %d, want 0: a live child whose probe timed out must be kept", got)
+	}
+	if !strings.Contains(log.all(), "replication_recovered") {
+		t.Fatalf("no replication_recovered event after the probe answered again:\n%s", log.all())
+	}
+	if !sup.replicationFailureSince().IsZero() {
+		t.Fatal("replication is still marked failed after a successful probe")
+	}
+}
+
+// A running replicator that keeps failing its probe is restarted, but only on
+// the ReplicationProbeFailuresBeforeRestart-th failure in a row, and only once
+// for that uninterrupted failure.
+func TestConsecutiveProbeFailuresRestartARunningReplicatorOnce(t *testing.T) {
+	rep := &watchedReplicator{}
+	sup, _, clock := supWithWatchedReplicator(t, rep)
+	log := &capturedLog{}
+	sup.Deps.Log = log.fn
+	rep.fail(fmt.Errorf("litestream control /sync: %w", context.DeadlineExceeded))
+
+	for i := 1; i <= ReplicationProbeFailuresBeforeRestart+2; i++ {
+		if f := sup.checkReplication(context.Background()); f != nil {
+			t.Fatalf("probe failure %d stopped the mount inside the window: %v", i, f.Err)
+		}
+		want := 0
+		if i >= ReplicationProbeFailuresBeforeRestart {
+			want = 1
+		}
+		if _, restarts := rep.counts(); restarts != want {
+			t.Fatalf("after %d consecutive failures restarts = %d, want %d", i, restarts, want)
+		}
+		*clock = clock.Add(5 * time.Second)
+	}
+	if !strings.Contains(log.all(), "replication_restarted reason probe_failures") {
+		t.Fatalf("restart was not logged with its reason:\n%s", log.all())
+	}
+}
+
+// A replicator that exited is restarted on the first probe that sees it, and
+// the replacement is left alone while it starts: no second restart, no stop,
+// and the recovery is reported once it answers.
+func TestAnExitedReplicatorIsRestartedOnceAndLeftAloneWhileItStarts(t *testing.T) {
+	rep := &watchedReplicator{afterRestart: fmt.Errorf("litestream has not opened its control socket yet: %w", ErrReplicatorStarting)}
+	sup, _, clock := supWithWatchedReplicator(t, rep)
+	log := &capturedLog{}
+	sup.Deps.Log = log.fn
+	rep.fail(fmt.Errorf("litestream exited on its own: signal: killed: %w", ErrReplicatorGone))
+
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("an exited replicator stopped the mount instead of being restarted: %v", f.Err)
+	}
+	if got := rep.RestartCount(); got != 1 {
+		t.Fatalf("RestartCount() after the exit = %d, want 1", got)
+	}
+	// The replacement takes most of the window to open its socket. One probe a
+	// second, as the guard runs them while replication is failed.
+	for i := 0; i < 20; i++ {
+		*clock = clock.Add(time.Second)
+		if f := sup.checkReplication(context.Background()); f != nil {
+			t.Fatalf("stopped while the replacement was starting (%d s): %v", i+1, f.Err)
+		}
+	}
+	if got := rep.RestartCount(); got != 1 {
+		t.Fatalf("RestartCount() while the replacement started = %d, want 1: a starting child must not be killed", got)
+	}
+	rep.fail(nil)
+	*clock = clock.Add(time.Second)
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("a replacement that answered stopped the mount: %v", f.Err)
+	}
+	if !strings.Contains(log.all(), "replication_restarted reason gone") ||
+		!strings.Contains(log.all(), "replication_recovered") {
+		t.Fatalf("missing replication_restarted/replication_recovered events:\n%s", log.all())
+	}
+}
+
+// The window is ReplicationRecoveryWindow, not the barrier interval: a failure
+// just inside it keeps the mount, one just past it takes the replication stop.
+func TestReplicationFailureStopsOnlyPastTheRecoveryWindow(t *testing.T) {
+	rep := &watchedReplicator{}
+	sup, _, clock := supWithWatchedReplicator(t, rep)
+	rep.fail(errors.New("litestream control /sync: status 500"))
+	start := *clock
+
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("first failure stopped the mount: %v", f.Err)
+	}
+	*clock = start.Add(ReplicationRecoveryWindow - time.Second)
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("stopped %s into a %s window: %v", ReplicationRecoveryWindow-time.Second, ReplicationRecoveryWindow, f.Err)
+	}
+	*clock = start.Add(ReplicationRecoveryWindow)
+	f := sup.checkReplication(context.Background())
+	if f == nil {
+		t.Fatal("replication failed for the whole recovery window and the mount is still running")
+	}
+	if f.ErrCode != ErrCodeReplicationFailed {
+		t.Fatalf("error code = %s, want %s", f.ErrCode, ErrCodeReplicationFailed)
+	}
+}
+
+// The lease stop instant still caps the window: a failure that is well inside
+// ReplicationRecoveryWindow stops once the ordered lease stop is due, and no
+// probe or restart runs past it.
+func TestReplicationRecoveryNeverRunsPastTheLeaseStopInstant(t *testing.T) {
+	rep := &watchedReplicator{}
+	sup, _, clock := supWithWatchedReplicator(t, rep)
+	sup.deadline = NewDeadline(clock.Add(10*time.Second), 0, time.Now())
+	rep.fail(fmt.Errorf("litestream exited on its own: %w", ErrReplicatorGone))
+	rep.restartErr = errors.New("spawn failed")
+
+	if f := sup.checkReplication(context.Background()); f != nil {
+		t.Fatalf("first failure stopped the mount: %v", f.Err)
+	}
+	*clock = clock.Add(11 * time.Second)
+	probesBefore, restartsBefore := rep.counts()
+	f := sup.checkReplication(context.Background())
+	if f == nil {
+		t.Fatal("replication recovery continued past the lease stop instant")
+	}
+	if f.ErrCode != ErrCodeReplicationFailed {
+		t.Fatalf("error code = %s, want %s", f.ErrCode, ErrCodeReplicationFailed)
+	}
+	if probes, restarts := rep.counts(); probes != probesBefore || restarts != restartsBefore {
+		t.Fatalf("probe/restart ran past the lease stop instant: probes %d->%d, restarts %d->%d",
+			probesBefore, probes, restartsBefore, restarts)
+	}
+}
+
+// litestreamChildReplicator is the fake replicator lifecycle with a real
+// Litestream child behind Probe and Restart, so the run loop drives the same
+// process handling production does.
+type litestreamChildReplicator struct {
+	fakeReplicator
+	ls *Litestream
+}
+
+func (r *litestreamChildReplicator) Probe(ctx context.Context) error   { return r.ls.Probe(ctx) }
+func (r *litestreamChildReplicator) Restart(ctx context.Context) error { return r.ls.Restart(ctx) }
+func (r *litestreamChildReplicator) RestartCount() uint64              { return r.ls.RestartCount() }
+
+// PLO-1172 item 3. Restart used to wait up to 30 s for the replacement's
+// control socket on the supervisor's goroutine, which is the goroutine that
+// renews the lease and writes health.json (the PLO-913 stall, reached through
+// the replicator instead of the barrier). The replacement here opens its
+// socket 3 s after it is spawned; renewals must keep arriving the whole time.
+// Renewals stand for every branch of the run loop's select, as in
+// TestAPeriodicBarrierDoesNotStopTheRunLoop.
+func TestTheRunLoopKeepsRenewingWhileAReplacementLitestreamStarts(t *testing.T) {
+	child := &fakeChild{}
+	ls := newFakeLitestream(t, child)
+	if err := ls.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = ls.Abort(context.Background()) })
+	child.set(3*time.Second, "ok")
+	if err := ls.cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill the first child: %v", err)
+	}
+
+	rep := &litestreamChildReplicator{ls: ls}
+	cp := &fakeCP{}
+	sup := newSup(t, testSpec(), &fakeFS{vol: healthyVolume()}, cp, &rep.fakeReplicator, &fakeFencer{})
+	sup.Deps.Replicator = rep
+	events := make(chan string, 256)
+	sup.Deps.Log = func(event string, kv ...any) {
+		if strings.HasPrefix(event, "replication_") {
+			select {
+			case events <- event:
+			default:
+			}
+		}
+	}
+	// Enter the loop with the failure already recorded, so the one-second
+	// guard probes right away instead of the test waiting for the 10 s health
+	// tick to notice the dead child.
+	sup.replFailedSince = time.Now()
+
+	stop := make(chan os.Signal, 1)
+	done := make(chan *Fatal, 1)
+	go func() { done <- sup.Run(context.Background(), stop) }()
+
+	var restarted, recovered bool
+	var maxGap time.Duration
+	lastCount, lastChange := 0, time.Now()
+	deadline := time.Now().Add(20 * time.Second)
+	for !recovered {
+		select {
+		case e := <-events:
+			switch e {
+			case "replication_restarted":
+				restarted = true
+			case "replication_recovered":
+				recovered = true
+			case "replication_failed_stop", "replication_restart_failed":
+				t.Fatalf("unexpected %s while the replacement started", e)
+			}
+		case got := <-done:
+			t.Fatalf("the supervisor exited during the restart: exit %d (%v)", got.Exit, got.Err)
+		case <-time.After(10 * time.Millisecond):
+		}
+		if n := len(cp.renewRequests()); n != lastCount {
+			if gap := time.Since(lastChange); lastCount > 0 && gap > maxGap {
+				maxGap = gap
+			}
+			lastCount, lastChange = n, time.Now()
+		}
+		if time.Now().After(deadline) {
+			stop <- syscall.SIGTERM
+			t.Fatalf("no replication_recovered within 20 s (restarted=%v)", restarted)
+		}
+	}
+	stop <- syscall.SIGTERM
+	select {
+	case got := <-done:
+		if got.Exit != CodeOK {
+			t.Fatalf("stop exit = %d (%v), want a clean stop", got.Exit, got.Err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stop never finished")
+	}
+
+	if !restarted {
+		t.Fatal("recovered without a replication_restarted event: the dead child was not replaced")
+	}
+	if got := rep.RestartCount(); got != 1 {
+		t.Fatalf("RestartCount() = %d, want 1: the starting replacement must not be killed and started again", got)
+	}
+	// The spec renews every 50 ms. A loop blocked on the replacement's socket
+	// would show a gap of about 3 s.
+	if maxGap > time.Second {
+		t.Fatalf("longest gap between renewals was %s while the replacement started, want under 1 s", maxGap)
 	}
 }
 
@@ -378,7 +646,7 @@ func TestHealthStampsTheObservationAndTheLastReplicationCheck(t *testing.T) {
 		t.Errorf("observed_at = %s, want %s: a snapshot is taken whether or not a probe ran since", h.ObservedAt, *clock)
 	}
 
-	rep.fail(errors.New("litestream exited on its own: signal: killed"))
+	rep.fail(fmt.Errorf("litestream exited on its own: signal: killed: %w", ErrReplicatorGone))
 	*clock = clock.Add(time.Second)
 	if f := sup.checkReplication(context.Background()); f != nil {
 		t.Fatalf("the first failing probe must repair, not stop: %v", f.Err)

@@ -190,7 +190,7 @@ func TestAStalledReplicatorStopsTheMountWithoutStarvingTheLease(t *testing.T) {
 
 	done := make(chan *Fatal, 1)
 	go func() { done <- sup.Run(context.Background(), make(chan os.Signal)) }()
-	f := waitFatal(t, done, 15*time.Second, "a stalled replicator never stopped the mount")
+	f := waitFatal(t, done, ReplicationRecoveryWindow+15*time.Second, "a stalled replicator never stopped the mount")
 
 	if f.Exit != CodeBarrierIncomplete || f.ErrCode != ErrCodeReplicationFailed {
 		t.Fatalf("exit = %d/%s (%v), want %d/%s: the stall must stop the mount as a replication failure, not starve the lease into a lease loss",
@@ -217,7 +217,7 @@ func TestAStalledReplicatorStopsTheMountWithoutStarvingTheLease(t *testing.T) {
 		t.Error("a stop whose final sync never answered wrote the clean marker")
 	}
 	if _, registers, probes := daemon.counts(); probes == 0 || registers < 2 {
-		t.Errorf("probes = %d, registrations = %d, want a probe and a re-registration after the first", probes, registers)
+		t.Errorf("probes = %d, registrations = %d, want probes and a re-registration after repeated failures", probes, registers)
 	}
 	waitFor(t, 2*time.Second, func() bool {
 		active, _, _ := daemon.counts()
@@ -840,9 +840,8 @@ func (v ledgerVolume) Close() error {
 
 type ledgerReplicator struct {
 	fakeReplicator
-	ledger         *overlapLedger
-	failFirstProbe bool
-	probes         atomic.Int32
+	ledger     *overlapLedger
+	failProbes bool
 }
 
 // heldReloadReplicator deliberately violates ReplicatorReloader's cancellation
@@ -923,7 +922,7 @@ func (r *ledgerReplicator) Abort(ctx context.Context) error {
 func (r *ledgerReplicator) Probe(ctx context.Context) error {
 	defer r.ledger.enter("probe", ledgerLifecycle...)()
 	ledgerJitter(ctx)
-	if r.probes.Add(1) == 1 && r.failFirstProbe {
+	if r.failProbes {
 		return errors.New("litestream stopped answering")
 	}
 	return nil
@@ -986,7 +985,7 @@ func TestNoLoopWorkOverlapsTheStopOrOutlivesIt(t *testing.T) {
 			ledger := newOverlapLedger()
 			vol := ledgerVolume{fakeVolume: healthyVolume(), ledger: ledger}
 			vol.setUsage(Usage{Bytes: 1 << 20, Inodes: 3}, nil)
-			rep := &ledgerReplicator{ledger: ledger, failFirstProbe: mode == 1}
+			rep := &ledgerReplicator{ledger: ledger, failProbes: mode == 1}
 			cp := &ledgerCP{fakeCP: &fakeCP{}, ledger: ledger}
 			if mode == 2 {
 				cp.staleAfter = int32(3 + rand.Intn(10))
@@ -1007,7 +1006,7 @@ func TestNoLoopWorkOverlapsTheStopOrOutlivesIt(t *testing.T) {
 				time.Sleep(time.Duration(rand.Intn(400)) * time.Millisecond)
 				stop <- syscall.SIGTERM
 			}
-			f := waitFatal(t, done, 15*time.Second, "the supervisor did not stop")
+			f := waitFatal(t, done, ReplicationRecoveryWindow+15*time.Second, "the supervisor did not stop")
 
 			switch mode {
 			case 0:

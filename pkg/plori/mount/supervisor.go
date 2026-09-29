@@ -148,14 +148,19 @@ type Supervisor struct {
 	// backlogCap is the staging cap currently pushed down to the chunk store.
 	backlogCap int64
 	// replFailedSince is when the replication probe first failed without a
-	// success since. Zero means replication is believed healthy. It is the
-	// only state PLO-411 needs: one instant answers both "is health.json's
-	// replication_failed true" and "has this outlasted a barrier period".
+	// success since. Zero means replication is believed healthy. One instant
+	// answers both "is health.json's replication_failed true" and "has this
+	// outlasted ReplicationRecoveryWindow".
 	replFailedSince time.Time
 	// replRestarted records that the one repair attempt for the current
 	// failure has been made, so a replicator that cannot be revived is not
 	// restarted every health tick until the stop trips.
 	replRestarted bool
+	// replProbeFailures counts consecutive failed probes of a replicator that
+	// is still running (neither ErrReplicatorGone nor ErrReplicatorStarting).
+	// It reaching ReplicationProbeFailuresBeforeRestart is the only reason a
+	// running replicator is restarted (PLO-1172).
+	replProbeFailures int
 	// replCheckedAt is when the last replication probe returned, pass or fail.
 	replCheckedAt  time.Time
 	restoreContext restoreContext
@@ -1555,16 +1560,14 @@ func (s *Supervisor) reloadReplicatorCredentials(ctx context.Context) {
 }
 
 // checkReplication asks the replicator whether it is still replicating this
-// worker's database, retries repair within the failure window, and stops the mount if it stays dead.
+// worker's database, repairs it when a restart can help, and stops the mount if
+// replication stays failed for longer than ReplicationRecoveryWindow.
 //
-// The rule is one instant, not a state machine: replFailedSince is set by the
-// first failing probe and cleared by the first succeeding one. From it come
-// both the health field the plugin republishes and the stop, which trips when
-// replication has been off for longer than a barrier period — the same window
-// the barrier itself would have exposed the failure in, had anything on that
-// path checked. Before this existed nothing did: the replicator's exit was
-// read only by Stop and Abort, so a Litestream that died on its own left a
-// mount serving writes with no metadata replica and a green health file.
+// replFailedSince is set by the first failing probe and cleared by the first
+// succeeding one. From it come both the health field the plugin republishes
+// and the stop. Before PLO-411 nothing read the replicator's exit outside Stop
+// and Abort, so a Litestream that died on its own left a mount serving writes
+// with no metadata replica and a green health file.
 //
 // Stopping is the right answer rather than an over-reaction. ADR B1 makes
 // Litestream the metadata backup: a mount replicating nothing is accumulating
@@ -1572,7 +1575,22 @@ func (s *Supervisor) reloadReplicatorCredentials(ctx context.Context) {
 // invisibly. The stop is ORDERED — barrier, unmount, lease released — so the
 // Agent loses its session and nothing else, and the exit is the same
 // data-loss-reported class a missed barrier gets (69), because that is what
-// it is.
+// it is. The window bounds unreplicated writes; it fences nothing. The lease
+// deadline guard, the metadata write gate and the per-generation replica
+// prefix are the fences, and this function changes none of them.
+//
+// When to restart depends on what the probe saw (PLO-1172):
+//   - ErrReplicatorGone: nothing is replicating, so restart at once.
+//   - ErrReplicatorStarting: a replacement is coming up; leave it alone.
+//   - any other error: the replicator is running but did not answer. A
+//     restart may need SIGKILL, which skips its shutdown sync, and a
+//     replacement started under the same memory pressure is slower to come up
+//     than the old one is to answer. So it is restarted only after
+//     ReplicationProbeFailuresBeforeRestart such failures in a row.
+//
+// At most one restart succeeds per uninterrupted failure. Restart does not
+// wait for the replacement's control socket. The replication lane reports
+// observations while the run loop continues renewals and health writes.
 func (s *Supervisor) checkReplication(ctx context.Context) *Fatal {
 	stop, _ := s.superviseReplication(ctx, ctx)
 	if stop == nil {
@@ -1626,7 +1644,7 @@ func (s *Supervisor) superviseReplication(ctx, repairCtx context.Context) (stop 
 	if err == nil {
 		s.mu.Lock()
 		wasFailing := !s.replFailedSince.IsZero()
-		s.replFailedSince, s.replRestarted = time.Time{}, false
+		s.replFailedSince, s.replRestarted, s.replProbeFailures = time.Time{}, false, 0
 		s.replCheckedAt = s.now()
 		s.mu.Unlock()
 		if wasFailing {
@@ -1635,6 +1653,8 @@ func (s *Supervisor) superviseReplication(ctx, repairCtx context.Context) (stop 
 		return nil, wasFailing
 	}
 
+	gone := errors.Is(err, ErrReplicatorGone)
+	starting := errors.Is(err, ErrReplicatorStarting)
 	// Probe may consume its whole budget. Record the failure and calculate any
 	// next call from the time it returned, never from the time it began.
 	now := s.now()
@@ -1644,31 +1664,45 @@ func (s *Supervisor) superviseReplication(ctx, repairCtx context.Context) (stop 
 		s.replFailedSince = now
 	}
 	s.replCheckedAt = now
-	since, restarted := s.replFailedSince, s.replRestarted
+	if !gone && !starting {
+		s.replProbeFailures++
+	}
+	since, restarted, failures := s.replFailedSince, s.replRestarted, s.replProbeFailures
 	s.mu.Unlock()
-	if now.Sub(since) >= s.barrierInterval() {
+	restart, cancel, canRecover := s.replicationRecoveryContext(repairCtx, now, since)
+	if !canRecover {
 		return &replicationStop{err: err, at: now, since: since}, changed
 	}
+	defer cancel()
 
-	s.log("replication_probe_failed", "error", err.Error(), "failed_for", now.Sub(since).String())
-	if restarted {
-		return nil, changed
+	state := "running"
+	switch {
+	case gone:
+		state = "gone"
+	case starting:
+		state = "starting"
 	}
-	restartNow := s.now()
-	restart, cancel, canRestart := s.replicationRecoveryContext(repairCtx, restartNow, since)
-	if !canRestart {
-		return &replicationStop{err: err, at: restartNow, since: since}, changed
+	s.log("replication_probe_failed", "error", err.Error(), "failed_for", now.Sub(since).String(),
+		"replicator", state, "probe_failures", failures)
+	var reason string
+	switch {
+	case restarted || starting:
+		return nil, changed
+	case gone:
+		reason = "gone"
+	case failures >= ReplicationProbeFailuresBeforeRestart:
+		reason = "probe_failures"
+	default:
+		return nil, changed
 	}
 	if rerr := sup.Restart(restart); rerr != nil {
-		cancel()
-		s.log("replication_restart_failed", "error", rerr.Error())
+		s.log("replication_restart_failed", "error", rerr.Error(), "reason", reason)
 		return nil, changed
 	}
-	cancel()
 	s.mu.Lock()
 	s.replRestarted = true
 	s.mu.Unlock()
-	s.log("replication_restarted")
+	s.log("replication_restarted", "reason", reason)
 	return nil, changed
 }
 
@@ -1678,10 +1712,10 @@ func (s *Supervisor) replicationFailureSince() time.Time {
 	return s.replFailedSince
 }
 
-// replicationRecoveryContext limits a probe or re-registration to both the
-// remaining replication-failure window and the time before ordered lease stop.
+// replicationRecoveryContext limits a probe or restart to both the remaining
+// replication recovery window and the time before the ordered lease stop.
 func (s *Supervisor) replicationRecoveryContext(parent context.Context, now, since time.Time) (context.Context, context.CancelFunc, bool) {
-	window := s.barrierInterval()
+	window := ReplicationRecoveryWindow
 	if !since.IsZero() {
 		window -= now.Sub(since)
 	}
@@ -2556,7 +2590,7 @@ func (s *Supervisor) shutdown(ctx context.Context, reason string) *Fatal {
 		// already routes 69 to "unpublish and surface a typed event", which
 		// is the handling this needs (PLO-411).
 		return fatalf(CodeBarrierIncomplete, ErrCodeReplicationFailed, false,
-			"metadata replication stopped and did not recover within a barrier period; stopped after a final barrier and sync")
+			"metadata replication stopped and did not recover within the replication recovery window; stopped after a final barrier and sync")
 	}
 	// The marker is written last and only here, so its absence at the next
 	// start is exactly "the previous generation did not finish its stop".
