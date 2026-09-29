@@ -1025,7 +1025,12 @@ func testReaddirCache(t *testing.T, metaUri string, typ string, batchNum int) {
 }
 
 func TestVFSReadDirSort(t *testing.T) {
-	for _, metaUri := range []string{"", testSQLiteURI(), "redis://127.0.0.1:6379/2"} {
+	uris := []string{"", testSQLiteURI()}
+	// The Plori release profile has no Redis engine; testMetaEngines lists what this build carries.
+	if redis, ok := testMetaEngines()["redis"]; ok {
+		uris = append(uris, redis)
+	}
+	for _, metaUri := range uris {
 		testVFSReadDirSort(t, metaUri)
 	}
 }
